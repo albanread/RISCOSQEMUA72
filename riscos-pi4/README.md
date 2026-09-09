@@ -4,8 +4,11 @@
 
 > [!CAUTION]
 > **RECENT EXPERIMENT.** Days old, everything in flux, and nothing here is
-> finished. It boots to a prompt; it has no keyboard and no disc. This notice
-> changes when something useful appears.
+> finished. It boots to a prompt; it has no keyboard and no disc.
+>
+> The badge goes green when this is the fastest RISC OS A72 emulator there is,
+> with an integrated debugging environment — and it works. Until then, treat
+> everything below as a progress report rather than a product.
 
 
 A QEMU fork that boots **RISC OS 5.30 on an emulated Cortex-A72 in 32-bit
