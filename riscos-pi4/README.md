@@ -1,5 +1,13 @@
 # RISC OS 5 on an emulated Raspberry Pi 4
 
+![RECENT EXPERIMENT](https://img.shields.io/badge/RECENT_EXPERIMENT-c1121f?style=for-the-badge&labelColor=c1121f)
+
+> [!CAUTION]
+> **RECENT EXPERIMENT.** Days old, everything in flux, and nothing here is
+> finished. It boots to a prompt; it has no keyboard and no disc. This notice
+> changes when something useful appears.
+
+
 A QEMU fork that boots **RISC OS 5.30 on an emulated Cortex-A72 in 32-bit
 mode** — `-M raspi4b` with the CPU in AArch32 — far enough to reach its
 supervisor prompt with a framebuffer on screen.
