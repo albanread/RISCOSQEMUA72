@@ -50,6 +50,45 @@ static void bcm2835_i2c_update_interrupt(BCM2835I2CState *s)
     qemu_set_irq(s->irq, do_interrupt);
 }
 
+/* TXD is "space available", TXE is "empty" -- both describe the TX FIFO */
+static void bcm2835_i2c_update_tx_status(BCM2835I2CState *s)
+{
+    if (fifo8_is_full(&s->tx_fifo)) {
+        s->s &= ~BCM2835_I2C_S_TXD;
+    } else {
+        s->s |= BCM2835_I2C_S_TXD;
+    }
+
+    if (fifo8_is_empty(&s->tx_fifo)) {
+        s->s |= BCM2835_I2C_S_TXE;
+    } else {
+        s->s &= ~BCM2835_I2C_S_TXE;
+    }
+}
+
+static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s);
+
+/*
+ * Push whatever the guest has put in the TX FIFO out onto the bus, for as
+ * long as there is a transfer to carry it and DLEN bytes still to send.
+ */
+static void bcm2835_i2c_tx_drain(BCM2835I2CState *s)
+{
+    while ((s->s & BCM2835_I2C_S_TA) && s->dlen > 0 &&
+           !fifo8_is_empty(&s->tx_fifo)) {
+        if (i2c_send(s->bus, fifo8_pop(&s->tx_fifo))) {
+            s->s |= BCM2835_I2C_S_ERR;
+        }
+        s->dlen -= 1;
+    }
+
+    bcm2835_i2c_update_tx_status(s);
+
+    if ((s->s & BCM2835_I2C_S_TA) && s->dlen == 0) {
+        bcm2835_i2c_finish_transfer(s);
+    }
+}
+
 static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
 {
     int direction = s->c & BCM2835_I2C_C_READ;
@@ -62,6 +101,8 @@ static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
         s->s |= BCM2835_I2C_S_RXR | BCM2835_I2C_S_RXD;
     } else {
         s->s |= BCM2835_I2C_S_TXW;
+        /* A guest may have filled the FIFO before setting ST */
+        bcm2835_i2c_tx_drain(s);
     }
 }
 
@@ -79,6 +120,7 @@ static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s)
      */
     i2c_end_transfer(s->bus);
     s->s |= BCM2835_I2C_S_DONE;
+    fifo8_reset(&s->tx_fifo);
 
     /* Ensure RXD is cleared, otherwise the driver registers an error */
     s->s &= ~(BCM2835_I2C_S_TA | BCM2835_I2C_S_RXR |
@@ -143,8 +185,19 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
         /* ST is a one-shot operation; it must read back as 0 */
         s->c = writeval & ~BCM2835_I2C_C_ST;
 
-        /* Start transfer */
-        if (writeval & (BCM2835_I2C_C_ST | BCM2835_I2C_C_I2CEN)) {
+        if (writeval & BCM2835_I2C_C_CLEAR) {
+            fifo8_reset(&s->tx_fifo);
+            bcm2835_i2c_update_tx_status(s);
+        }
+
+        /*
+         * Only ST starts a transfer. I2CEN merely enables the controller, and
+         * treating it as a start makes a mess of the documented sequence --
+         * set A, set DLEN, fill the FIFO, then set ST -- because the enable
+         * writes that precede it each begin (and, with DLEN still zero,
+         * immediately end) a transfer of their own.
+         */
+        if ((writeval & BCM2835_I2C_C_ST) && (writeval & BCM2835_I2C_C_I2CEN)) {
             bcm2835_i2c_begin_transfer(s);
             /*
              * Handle special case where transfer starts with zero data length.
@@ -175,20 +228,15 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
         s->a = writeval;
         break;
     case BCM2835_I2C_FIFO:
-        /* We send I2C messages directly instead of using FIFOs */
-        if (s->s & BCM2835_I2C_S_TA) {
-            if (s->s & BCM2835_I2C_S_TXD) {
-                if (!i2c_send(s->bus, writeval & 0xff)) {
-                    s->dlen -= 1;
-                } else {
-                    s->s |= BCM2835_I2C_S_ERR;
-                }
-            }
-
-            if (s->dlen == 0) {
-                bcm2835_i2c_finish_transfer(s);
-            }
+        /*
+         * Buffer the byte and let the drain decide whether it can go out yet.
+         * A guest may write here either side of setting ST, and both orders
+         * have to work.
+         */
+        if (!fifo8_is_full(&s->tx_fifo)) {
+            fifo8_push(&s->tx_fifo, writeval & 0xff);
         }
+        bcm2835_i2c_tx_drain(s);
         bcm2835_i2c_update_interrupt(s);
         break;
     case BCM2835_I2C_DIV:
@@ -231,6 +279,8 @@ static void bcm2835_i2c_realize(DeviceState *dev, Error **errp)
     BCM2835I2CState *s = BCM2835_I2C(dev);
     s->bus = i2c_init_bus(dev, NULL);
 
+    fifo8_create(&s->tx_fifo, BCM2835_I2C_FIFO_SIZE);
+
     memory_region_init_io(&s->iomem, OBJECT(dev), &bcm2835_i2c_ops, s,
                           TYPE_BCM2835_I2C, 0x24);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
@@ -242,6 +292,7 @@ static void bcm2835_i2c_reset(DeviceState *dev)
     BCM2835I2CState *s = BCM2835_I2C(dev);
 
     /* Reset values according to BCM2835 Peripheral Documentation */
+    fifo8_reset(&s->tx_fifo);
     s->c = 0x0;
     s->s = BCM2835_I2C_S_TXD | BCM2835_I2C_S_TXE;
     s->dlen = 0x0;
@@ -253,8 +304,8 @@ static void bcm2835_i2c_reset(DeviceState *dev)
 
 static const VMStateDescription vmstate_bcm2835_i2c = {
     .name = TYPE_BCM2835_I2C,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(c, BCM2835I2CState),
         VMSTATE_UINT32(s, BCM2835I2CState),
@@ -264,6 +315,7 @@ static const VMStateDescription vmstate_bcm2835_i2c = {
         VMSTATE_UINT32(del, BCM2835I2CState),
         VMSTATE_UINT32(clkt, BCM2835I2CState),
         VMSTATE_UINT32(last_dlen, BCM2835I2CState),
+        VMSTATE_FIFO8(tx_fifo, BCM2835I2CState),
         VMSTATE_END_OF_LIST()
     }
 };

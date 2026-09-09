@@ -26,6 +26,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/i2c/i2c.h"
+#include "qemu/fifo8.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_I2C "bcm2835-i2c"
@@ -77,4 +78,15 @@ struct BCM2835I2CState {
     uint32_t clkt;
 
     uint32_t last_dlen;
+
+    /*
+     * The hardware has a 16-byte FIFO shared between transmit and receive.
+     * Only the transmit side needs buffering here: a guest is entitled to
+     * fill it before setting C.ST, so the bytes have to be held until there
+     * is a transfer to send them on. Receives are pulled from the bus as the
+     * guest reads them.
+     */
+    Fifo8 tx_fifo;
 };
+
+#define BCM2835_I2C_FIFO_SIZE 16
