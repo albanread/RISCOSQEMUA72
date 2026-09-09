@@ -108,6 +108,10 @@ static void raspi_peripherals_base_init(Object *obj)
     object_property_add_const_link(OBJECT(&s->mboxes), "mbox-mr",
                                    OBJECT(&s->mbox_mr));
 
+    /* Power management channel */
+    object_initialize_child(obj, "mbox-power", &s->mbox_power,
+                            TYPE_BCM2835_MBOX_POWER);
+
     /* Framebuffer */
     object_initialize_child(obj, "fb", &s->fb, TYPE_BCM2835_FB);
     object_property_add_alias(obj, "vcram-size", OBJECT(&s->fb), "vcram-size");
@@ -381,6 +385,17 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->fb), 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->fb), 0,
                        qdev_get_gpio_in(DEVICE(&s->mboxes), MBOX_CHAN_FB));
+
+    /* Power management channel */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mbox_power), errp)) {
+        return;
+    }
+
+    memory_region_add_subregion(&s->mbox_mr,
+                MBOX_CHAN_POWER << MBOX_AS_CHAN_SHIFT,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->mbox_power), 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->mbox_power), 0,
+                       qdev_get_gpio_in(DEVICE(&s->mboxes), MBOX_CHAN_POWER));
 
     /* OTP */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->otp), errp)) {
