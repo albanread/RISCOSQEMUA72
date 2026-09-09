@@ -183,6 +183,50 @@ static void write_board_setup(ARMCPU *cpu, const struct arm_boot_info *info)
     arm_write_secure_board_setup_dummy_smc(cpu, info, MVBAR_ADDR);
 }
 
+/*
+ * The AArch32 secondary boot stub for a BCM2837/BCM2838 booting a 32-bit
+ * kernel. Same protocol as write_smpboot() -- spin on this core's local
+ * mailbox 3 and jump to whatever is written there -- but without the
+ * board-setup trampoline, which only exists on BCM2835/BCM2836, and with the
+ * local peripheral base passed in, since the BCM2711 moved it to 0xff800000.
+ */
+static void write_smpboot32(ARMCPU *cpu, const struct arm_boot_info *info,
+                            uint32_t mbox3_base)
+{
+    static const ARMInsnFixup smpboot[] = {
+        { 0xee100fb0 }, /*    mrc     p15, 0, r0, c0, c0, 5 ;get core ID */
+        { 0xe7e10050 }, /*    ubfx    r0, r0, #0, #2        ;extract LSB */
+        { 0xe59f5014 }, /*    ldr     r5, [pc, #20]         ;load mbox base */
+        { 0xe320f001 }, /* 1: yield */
+        { 0xe7953200 }, /*    ldr     r3, [r5, r0, lsl #4]  ;read our mbox */
+        { 0xe3530000 }, /*    cmp     r3, #0                ;spin while zero */
+        { 0x0afffffb }, /*    beq     1b */
+        { 0xe7853200 }, /*    str     r3, [r5, r0, lsl #4]  ;clear mbox */
+        { 0xe12fff13 }, /*    bx      r3                    ;jump to target */
+        { 0, FIXUP_BOOTREG }, /* (constant: mailbox 3 read/clear base) */
+        { 0, FIXUP_TERMINATOR }
+    };
+    uint32_t fixupcontext[FIXUP_MAX] = { 0 };
+
+    fixupcontext[FIXUP_BOOTREG] = mbox3_base;
+
+    /* check that we don't overrun board setup vectors */
+    QEMU_BUILD_BUG_ON(SMPBOOT_ADDR + sizeof(smpboot) > MVBAR_ADDR);
+
+    arm_write_bootloader("raspi_smpboot32", arm_boot_address_space(cpu, info),
+                         info->smp_loader_start, smpboot, fixupcontext);
+}
+
+static void write_smpboot32_2837(ARMCPU *cpu, const struct arm_boot_info *info)
+{
+    write_smpboot32(cpu, info, 0x400000cc);
+}
+
+static void write_smpboot32_2838(ARMCPU *cpu, const struct arm_boot_info *info)
+{
+    write_smpboot32(cpu, info, 0xff8000cc);
+}
+
 static void reset_secondary(ARMCPU *cpu, const struct arm_boot_info *info)
 {
     CPUState *cs = CPU(cpu);
@@ -216,8 +260,20 @@ static void setup_boot(MachineState *machine, ARMCPU *cpu,
         s->binfo.smp_loader_start = SMPBOOT_ADDR;
         if (processor_id == PROCESSOR_ID_BCM2836) {
             s->binfo.write_secondary_boot = write_smpboot;
-        } else {
+        } else if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
             s->binfo.write_secondary_boot = write_smpboot64;
+        } else {
+            /*
+             * A 32-bit guest on a 64-bit capable SoC (aarch64=off). The
+             * primary loader already follows the AArch32 boot protocol, but
+             * the AArch64 secondary stub would be fetched as ARM instructions
+             * and executed as garbage, so the secondaries never park on their
+             * mailbox and never answer. Give them the AArch32 stub, with the
+             * local-peripheral base this SoC actually has.
+             */
+            s->binfo.write_secondary_boot = processor_id == PROCESSOR_ID_BCM2838
+                                          ? write_smpboot32_2838
+                                          : write_smpboot32_2837;
         }
         s->binfo.secondary_cpu_reset_hook = reset_secondary;
     }
