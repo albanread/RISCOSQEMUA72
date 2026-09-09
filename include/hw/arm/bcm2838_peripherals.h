@@ -55,6 +55,14 @@
 #define GPU_INTERRUPT_DMA14     28
 #define GPU_INTERRUPT_DMA15     31
 
+/*
+ * The PCIe root complex, in the low peripheral range. Not modelled: this is
+ * only here so that a guest probing for it is told "no link" instead of
+ * taking an external abort on unmapped memory.
+ */
+#define BCM2838_PCIE_OFFSET     0x1500000
+#define BCM2838_PCIE_SIZE       0x100000
+
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
 
@@ -70,6 +78,8 @@ struct BCM2838PeripheralState {
     MemoryRegion peri_low_mr;
     MemoryRegion peri_low_mr_alias;
     MemoryRegion mphi_mr_alias;
+
+    UnimplementedDeviceState pcie;
 
     SDHCIState emmc2;
     BCM2838GpioState gpio;

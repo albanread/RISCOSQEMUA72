@@ -8,6 +8,8 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/misc/unimp.h"
 #include "qemu/module.h"
 #include "hw/arm/raspi_platform.h"
 #include "hw/arm/bcm2838_peripherals.h"
@@ -171,6 +173,22 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                         qdev_get_gpio_in_named(DEVICE(&s_base->ic),
                                                BCM2835_IC_GPU_IRQ,
                                                GPU_INTERRUPT_DMA15));
+
+    /*
+     * The PCIe root complex is not modelled. RISC OS runs its PCI_Init only on
+     * a Pi 4, where it pokes the root complex looking for the VL805 xHCI
+     * behind it; against unmapped memory those accesses come back as external
+     * aborts and the guest reports a data abort on screen. An unimplemented
+     * device reads as zero, which the guest reads as "link down" and gives up
+     * on quietly.
+     */
+    object_initialize_child(OBJECT(s), "bcm2838-pcie", &s->pcie,
+                            TYPE_UNIMPLEMENTED_DEVICE);
+    qdev_prop_set_string(DEVICE(&s->pcie), "name", "bcm2838-pcie");
+    qdev_prop_set_uint64(DEVICE(&s->pcie), "size", BCM2838_PCIE_SIZE);
+    sysbus_realize(SYS_BUS_DEVICE(&s->pcie), &error_fatal);
+    memory_region_add_subregion_overlap(&s->peri_low_mr, BCM2838_PCIE_OFFSET,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pcie), 0), -1000);
 
     /* Map MPHI to BCM2838 memory map */
     mphi_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s_base->mphi), 0);
