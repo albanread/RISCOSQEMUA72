@@ -304,6 +304,43 @@ static const USBDesc desc_net = {
 };
 
 /*
+ * The same device offering only its CDC Ethernet configuration. A host
+ * stack that announces a device to its drivers in the configuration it
+ * chose at enumeration -- RISC OS's USBDriver takes the first -- never gets
+ * to see the CDC descriptors while RNDIS is listed ahead of them.
+ */
+static const USBDescDevice desc_device_net_cdc = {
+    .bcdUSB                        = 0x0200,
+    .bDeviceClass                  = USB_CLASS_COMM,
+    .bMaxPacketSize0               = 0x40,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 2,
+            .bConfigurationValue   = DEV_CONFIG_VALUE,
+            .iConfiguration        = STRING_CDC,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+            .bMaxPower             = 0x32,
+            .nif = ARRAY_SIZE(desc_iface_cdc),
+            .ifs = desc_iface_cdc,
+        }
+    },
+};
+
+static const USBDesc desc_net_cdc = {
+    .id = {
+        .idVendor          = RNDIS_VENDOR_NUM,
+        .idProduct         = RNDIS_PRODUCT_NUM,
+        .bcdDevice         = 0,
+        .iManufacturer     = STRING_MANUFACTURER,
+        .iProduct          = STRING_PRODUCT,
+        .iSerialNumber     = STRING_SERIALNUMBER,
+    },
+    .full = &desc_device_net_cdc,
+    .str  = usb_net_stringtable,
+};
+
+/*
  * RNDIS Definitions - in theory not specific to USB.
  */
 #define RNDIS_MAXIMUM_FRAME_SIZE        1518
@@ -635,6 +672,7 @@ struct USBNetState {
     uint32_t vendorid;
 
     uint16_t connection;
+    bool offer_rndis;           /* list the RNDIS configuration at all */
 
     unsigned int out_ptr;
     uint8_t out_buf[2048];
@@ -1361,6 +1399,9 @@ static void usb_net_realize(USBDevice *dev, Error **errp)
 {
     USBNetState *s = USB_NET(dev);
 
+    if (!s->offer_rndis) {
+        dev->usb_desc = &desc_net_cdc;
+    }
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
 
@@ -1408,6 +1449,7 @@ static const VMStateDescription vmstate_usb_net = {
 };
 
 static const Property net_properties[] = {
+    DEFINE_PROP_BOOL("rndis", USBNetState, offer_rndis, true),
     DEFINE_NIC_PROPERTIES(USBNetState, conf),
 };
 
