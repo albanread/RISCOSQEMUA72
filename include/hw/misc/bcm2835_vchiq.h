@@ -89,6 +89,8 @@ struct BCM2835VchiqState {
     uint32_t master_base;
     uint32_t slave_base;
     uint32_t slot_size;
+    uint32_t max_slots;         /* from slot zero, bound every slot index by */
+    uint32_t per_side;          /* entries in each side's slot queue */
     uint32_t tx_slot;           /* the slot we write our messages into */
     uint32_t tx_pos;
     uint32_t rx_pos;            /* our cursor into the guest's message stream */

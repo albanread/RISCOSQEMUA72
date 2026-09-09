@@ -88,17 +88,17 @@ static void vchiq_init_from_slot_zero(BCM2835VchiqState *s, uint32_t value)
     uint32_t magic, slot_zero_size, max_slots, per_side, shared_size;
     uint32_t slot_first, slot_last, i;
 
-    s->slot0 = value & ~0xfu;
-
     /*
-     * The guest builds the bus address by adding the GPU alias to a physical
-     * address, so a slot buffer above 1GB would wrap and hand us nonsense.
+     * The low nibble carried the channel; the rest is a VideoCore bus
+     * address. Which 1GB alias it uses depends on the SoC (0x40000000 on a
+     * BCM2835, 0xC0000000 afterwards) and dma_as covers them all, so do not
+     * second-guess it: the magic word is the real test of whether this is
+     * pointing at a slot zero.
      */
-    if ((value >> 30) != 3) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: implausible slot zero bus address 0x%08x\n",
-                      __func__, value);
-        s->slot0 = 0;
+    s->slot0 = value & ~0xfu;
+    if (!s->slot0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: null slot zero address\n",
+                      __func__);
         return;
     }
 
@@ -110,28 +110,55 @@ static void vchiq_init_from_slot_zero(BCM2835VchiqState *s, uint32_t value)
 
     trace_bcm2835_vchiq_slot_zero(s->slot0, magic, s->slot_size, max_slots);
 
-    if (magic != VCHIQ_SLOT_MAGIC || !s->slot_size || !max_slots || !per_side) {
+    /*
+     * Everything from here on indexes guest memory using numbers the guest
+     * gave us, so each one is bounded before it is used. A slot is one page
+     * in every implementation, but allow a range rather than insist.
+     */
+    if (magic != VCHIQ_SLOT_MAGIC ||
+        s->slot_size < 2 * VCHIQ_MSG_HDR_SIZE || s->slot_size > 0x10000 ||
+        !max_slots || max_slots > 4096 ||
+        !per_side || per_side > max_slots) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: slot zero at 0x%08x does not look like VCHIQ "
-                      "(magic 0x%08x, slot_size %u)\n",
-                      __func__, s->slot0, magic, s->slot_size);
+                      "(magic 0x%08x, slot_size %u, max_slots %u, per_side %u)\n",
+                      __func__, s->slot0, magic, s->slot_size, max_slots,
+                      per_side);
         s->slot0 = 0;
         return;
     }
+    s->max_slots = max_slots;
+    s->per_side = per_side;
 
     /*
      * The debug array is last in each shared state and its size is a build
      * option, so derive the stride from slot_zero_size rather than assume it.
+     * It must at least hold the fixed fields and the slot queue.
      */
+    if (slot_zero_size < VCHIQ_SZ_MASTER + max_slots * 4) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: slot_zero_size %u too small\n",
+                      __func__, slot_zero_size);
+        s->slot0 = 0;
+        return;
+    }
     shared_size = (slot_zero_size - VCHIQ_SZ_MASTER - max_slots * 4) / 2;
+    if (shared_size < VCHIQ_SS_SLOT_QUEUE + per_side * 4) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: shared state of %u bytes cannot hold a %u-entry "
+                      "slot queue\n", __func__, shared_size, per_side);
+        s->slot0 = 0;
+        return;
+    }
     s->master_base = s->slot0 + VCHIQ_SZ_MASTER;
     s->slave_base = s->master_base + shared_size;
 
     slot_first = vchiq_ld(s, s->master_base + VCHIQ_SS_SLOT_FIRST);
     slot_last = vchiq_ld(s, s->master_base + VCHIQ_SS_SLOT_LAST);
-    if (slot_last < slot_first || slot_last >= max_slots) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad slot range %u..%u\n",
-                      __func__, slot_first, slot_last);
+    if (slot_last < slot_first || slot_last >= max_slots ||
+        slot_last - slot_first + 1 > per_side) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad slot range %u..%u for a "
+                      "%u-entry queue\n", __func__, slot_first, slot_last,
+                      per_side);
         s->slot0 = 0;
         return;
     }
@@ -187,14 +214,26 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
     tx_pos = vchiq_ld(s, s->slave_base + VCHIQ_SS_TX_POS);
 
     while (s->rx_pos != tx_pos && guard-- > 0) {
-        uint32_t qidx = (s->rx_pos / s->slot_size) & 0x3f;
+        uint32_t qidx = (s->rx_pos / s->slot_size) % s->per_side;
         uint32_t slot = vchiq_ld(s, s->slave_base + VCHIQ_SS_SLOT_QUEUE
                                     + qidx * 4);
-        uint32_t hdr = s->slot0 + slot * s->slot_size
-                       + (s->rx_pos % s->slot_size);
-        uint32_t msgid = vchiq_ld(s, hdr);
-        uint32_t size = vchiq_ld(s, hdr + 4);
-        uint32_t type = VCHIQ_MSG_TYPE(msgid);
+        uint32_t hdr, msgid, size, type;
+
+        /* The queue entry and the header both come from the guest */
+        if (slot >= s->max_slots) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: slot queue entry %u out of "
+                          "range\n", __func__, slot);
+            break;
+        }
+        hdr = s->slot0 + slot * s->slot_size + (s->rx_pos % s->slot_size);
+        msgid = vchiq_ld(s, hdr);
+        size = vchiq_ld(s, hdr + 4);
+        type = VCHIQ_MSG_TYPE(msgid);
+        if (size > s->slot_size - VCHIQ_MSG_HDR_SIZE) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: message of %u bytes cannot "
+                          "fit a slot\n", __func__, size);
+            break;
+        }
 
         s->rx_pos += QEMU_ALIGN_UP(size + VCHIQ_MSG_HDR_SIZE, 8);
 
@@ -351,6 +390,8 @@ static const VMStateDescription vmstate_bcm2835_vchiq = {
         VMSTATE_UINT32(master_base, BCM2835VchiqState),
         VMSTATE_UINT32(slave_base, BCM2835VchiqState),
         VMSTATE_UINT32(slot_size, BCM2835VchiqState),
+        VMSTATE_UINT32(max_slots, BCM2835VchiqState),
+        VMSTATE_UINT32(per_side, BCM2835VchiqState),
         VMSTATE_UINT32(tx_slot, BCM2835VchiqState),
         VMSTATE_UINT32(tx_pos, BCM2835VchiqState),
         VMSTATE_UINT32(rx_pos, BCM2835VchiqState),
@@ -385,6 +426,8 @@ static void bcm2835_vchiq_reset(DeviceState *dev)
     s->master_base = 0;
     s->slave_base = 0;
     s->slot_size = 0;
+    s->max_slots = 0;
+    s->per_side = 0;
     s->tx_slot = 0;
     s->tx_pos = 0;
     s->rx_pos = 0;
