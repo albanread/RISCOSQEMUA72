@@ -698,15 +698,168 @@ hardware; it answers questions.
     hw/misc: implement BCM2835 mailbox channel 0 (power management)
     scripts/symlink-install-tree: survive a host without symlink permission
 
+## 12. The disc, and the keyboard
+
+### The disc was one line
+
+With `--filesystem 192` in the CMOS blob and the ROOL SD image on `-drive
+if=sd`, RISC OS got as far as a Wimp error box saying the drive was empty. The
+card was there; QEMU had it plugged into the wrong controller. On a BCM2711
+the removable card lives on the second Arasan controller, EMMC2 at
+`0x340000`, and that is where RISC OS's SDIODriver looks — it marks the legacy
+EMMC as the WiFi slot and never registers SDHOST at all. `bcm2838_peripherals`
+aliased the machine's `sd-bus` to the GPIO block, whose pin mux only ever
+moves a card between the legacy EMMC and SDHOST, so every card handed to
+`raspi4b` sat one controller over from where the guest read.
+
+    object_property_add_alias(OBJECT(s), "sd-bus", OBJECT(&s->emmc2), "sd-bus");
+
+After that RISC OS 5.30 mounts `SDFS::RISCOSPi`, runs `!Boot` off the card and
+reaches the desktop. QEMU wants the image writable and, at 2 GiB or under, an
+exact power of two; the ROOL image was truncated to 2 GiB.
+
+### The keyboard was a shadowed register
+
+`-device usb-kbd` had been attached for weeks and RISC OS never enumerated it:
+the DWC2 controller ran, produced start-of-frame interrupts, and programmed no
+host channel. The earlier reading here — that the MPHI alias at `0xb200` was
+harmless because no writes to `0xfe00b3xx` appeared in the trace — was wrong,
+and wrong for a reason worth writing down: **QEMU logs an access through an
+alias against the target device's own offsets.** The trace did show the
+writes, as `mphi` offsets `0x110`, `0x120`, `0x124` and `0x128`; they were
+`FIQ_EN1`, `FIQ_DIS1`, `FIQ_DIS2` and `FIQ_DISB` of the BCM2711's FIQ
+controller at `0xb300`, being swallowed.
+
+What RISC OS does, from the source:
+
+- `DWCDriver` sets `use_fiq_fix = true` unconditionally and runs the host
+  controller from its FIQ handler. It claims the *MPHI* device vector rather
+  than the USB one, and arms the controller with `HAL_FIQEnable(9)` alone
+  (`dwc_otg_riscos.c`, `try_use_fiqs`). Nothing ever enables the USB IRQ at
+  the GIC.
+- On a Pi 4 the HAL's `FIQEnable` writes `1 << 9` to `FIQ_Base + FIQ_EN1` =
+  `0xfe00b310`; `FIQSource` reads `FIQ_PENDB` with `LDRB`, then `PEND2` and
+  `PEND1`, and CLZ-scans them (`s/IntVC6`, `hdr/BCM2835`). `MAX_FIQ` is 72.
+- The Pi 4 has no MPHI, so the FIQ handler hands over to the IRQ side through
+  the GIC itself: `HAL_USBControllerInfo` points `HW_MPHI` at
+  `GICD_ISPENDR` for SPI 96, and the handler sets that pending bit; the IRQ
+  handler clears it through `GICD_ICPENDR`. QEMU's GIC already does this.
+- The HAL's own comment on its GIC setup says how the FIQ is meant to arrive:
+  the boot stub leaves the GIC unable to raise FIQs from non-secure state, so
+  "FIQBypDisGrp1 is left at zero so that the bypass is enabled, allowing us to
+  get FIQs from the BCM2838 FIQ controller".
+
+So the hardware path is: DWC2 line → the BCM2711's legacy interrupt
+controller, core 0's FIQ bank → the GIC-400's legacy nFIQ input → the CPU,
+through the GICv2 interrupt-signal bypass. QEMU had none of it, and the
+datasheet (BCM2711 ARM Peripherals, §6.5.3) gives the whole register map: four
+IRQ banks at `ARMC+0x200` and four FIQ banks at `+0x300`, `0x40` apart, each
+with `PENDING0-2`, `SET_EN_0-2`, `CLR_EN_0-2`; `IRQ_STATUS0-2` in the first
+bank; `SWIRQ_SET/CLEAR` at `+0x3f0`.
+
+The model follows the hardware in four pieces:
+
+1. **`hw/intc/bcm2838_ic.c`** — the legacy controller: eight banks of enables
+   over the same 80 sources, pending = level & enable, outputs per core for IRQ
+   and FIQ. Mapped over the `0xb200` region at priority 1, above both the
+   BCM2835 controller the common code maps there and the MPHI alias; the
+   `SWIRQ` pair stays with the MPHI model, which already stands in for it.
+   Word 2 carries the summary bits and the core's line, as the datasheet has
+   them. `valid.min_access_size = 1` for the `LDRB`.
+2. **`hw/intc/arm_gic.c`** — a `legacy-fiq` input per CPU. It contributes to the
+   CPU's FIQ whenever the CPU interface is not itself routing Group 0 to FIQ,
+   including with the GIC disabled; QEMU already masks the bypass-disable
+   bits out of `GICC_CTLR`, so the bypass counts as always permitted, which is
+   what the register reads back as. Migration subsection, sent only when an
+   input is high.
+3. **`hw/arm/bcm2838*`** — a `split-irq` on the DWC2 line, one leg to the GIC
+   as before and one to legacy source 9; the four FIQ outputs into the GIC.
+4. **`hw/usb/hcd-dwc2.c`** — two model bugs that would have wedged the machine
+   the moment FIQs arrived, found by an agent review of the plan and confirmed
+   in the code: `GINTSTS.HCHINT` was only re-evaluated when a channel raised or
+   dropped its own bit, never on a `HAINTMSK` write — and RISC OS's FIQ state
+   machine defers every channel it does not handle by masking it, relying on
+   the line falling; and `dwc2_update_irq` kept its last level in a
+   function-local `static`, shared by all controllers and never reset.
+
+Evidence, in order: `FIQ0_SET_EN_0` reads back `0x200`; `info registers`
+catches the CPU in `fiq32` with the PC inside `DWCDriver`; the DWC2 trace
+shows the control transfers of an enumeration followed by the keyboard's
+interrupt endpoint being polled; `F12` opens the desktop command line. A
+keyboard and a mouse behind a `usb-hub` enumerate too, and the pointer goes
+where `input-send-event` sends it. The FIQ fires once per start-of-frame, about
+a thousand times a second — that is the design, not a leak.
+
+Two test-rig lessons. A bare `-device usb-kbd` on this machine goes behind a
+hub; `bus=usb-bus.0,port=1` puts it on the root port. And the earlier
+"enumeration" evidence — `usb_dwc2_attach`, `bus_start`, the SOF flood — is
+all reset-time work of the model; the only trace that proves the guest's
+driver ran is a write to `GINTMSK` or `GAHBCFG`.
+
+### The DHCP wait
+
+With the card in, `!Boot` ran to `PreDesk` and stopped, and stayed stopped for
+three minutes, the progress bar not moving. PC samples put it in `Internet`,
+`DHCP` and `SharedCLibrary`, and the image's `Choices:Internet.Startup`,
+found by searching the raw image for the string since the RISC OS partition
+is FileCore rather than FAT, says why:
+
+    Set Inet$EtherDevice EtherUSB
+    DHCPExecute -e -b -w -p ej0
+
+`-w` "waits for `<interface>` to appear", and the loop in `DHCP`'s
+`dhcp_cmd_execute` has three exits: the interface binds, the client abandons,
+or Escape is pressed. With no Ethernet-over-USB device there is no `ej0`, so
+it spins on `NoSuchInterface`. That is the stock RISC OS behaviour on a Pi
+with no network, and the stock remedy is Escape — which, with the keyboard
+working, takes the boot on to the desktop, where the Wimp shows its
+"Machine startup has not completed successfully: 'Escape'" box.
+
+### Networking, without modelling GENET
+
+RISC OS's `EtherUSB` has a generic CDC-Ethernet backend (`c/cdc`): class 2,
+subclass 6, a union descriptor naming the data interface and an Ethernet
+functional descriptor carrying the MAC as a string index. QEMU's `usb-net` is
+exactly that device in its CDC configuration, and slirp behind it serves
+DHCP. So the interface the boot sequence waits for can be supplied without
+touching the GENET, which is the soft answer and the one the design principle
+asks for.
+
+It did not bind first time, and the trace said why: the device took only
+control transfers, never a bulk pipe. `usb-net` lists its RNDIS configuration
+first and the CDC one second; RISC OS's USBDriver selects the first
+configuration at enumeration and copies *that configuration's* descriptors
+alone into the service call it announces the device with
+(`usbmodule.c`, `memcpy(... dev->cdesc, wTotalLength)`), so `EtherUSB` was
+shown an ACM-class interface with no Ethernet descriptor and declined it —
+the `CONF` override in its options string exists for exactly this class of
+device, but the stock image passes no options. A `rndis=off` property on
+`usb-net` offers the CDC configuration alone, through the per-device
+descriptor override QEMU already has.
+
+With it: `usb_set_config dev 5, config 1` twice (USBDriver, then `EtherUSB`
+selecting it again before setting the data interface's alternate), 44 frames
+out on the bulk pipe during the boot — the DHCP exchange and ARP — and no
+DHCP wait at all. Power-on to the desktop idling in `Portable`, with NetSurf
+opened on the image's Welcome page by the boot sequence: 27 seconds.
+
+### Boot time, measured
+
+Sampling the PC every five seconds and naming the ROM module it is in:
+
+    7s   ROM (HAL, kernel)          12s  Internet / DHCP  <- PreDesk done
+    27s  Portable                   <- the Wimp's idle loop; desktop up
+
+Without a network the machine sits in `DHCP` from 12 s until Escape, and is
+on the desktop five seconds after it. Everything slower than that in the
+earlier runs was the test harness waiting at fixed marks.
+
 ### What is left
 
-- **One data abort remains**, at a different address, still being chased.
-- **No keyboard.** The four type-A ports are the VL805 behind PCIe, which we
-  deliberately do not model; the HAL exposes only DWC2, on the USB-C port. The
-  intended answer is to inject keys rather than emulate a controller — most
-  likely through a guest-side VM compatibility module talking to one MMIO
-  device, which is also where console capture and a host filing system belong.
-  That is the same shape as the HostFS podule ROM in the RPCEmu setup.
-- **No disc**, so the prompt is where it stops. Sprint 3.
-- `GET_EDID_BLOCK` (`0x00030020`) is still unimplemented in the property
-  channel, and `SET_CLOCK_RATE` is still NYI.
+- **The screen.** 640×256 because `GET_EDID_BLOCK` (`0x00030020`) goes
+  unanswered and RISC OS falls back to its smallest mode; a fake EDID is the
+  next step. `SET_CLOCK_RATE` is still NYI.
+- **Files into a running guest**, and the VM compatibility module that would
+  carry them: the disc is an image on the host, rewritten between runs.
+- The RISC OS side has now had every device it asked for; what it does with
+  the bandwidth is the next question, and that is the JIT.
