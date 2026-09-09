@@ -43,6 +43,41 @@ spin, so a missing peer fails the test instead of hanging.
 - With the `bcm2835-mbox-power` device it prints **`00000080`** — the reply,
   carrying channel 0 in the low nibble and the USB HCD bit set.
 
+## Building a CMOS blob
+
+A Raspberry Pi has no CMOS chip. The HAL reads its non-volatile settings from a
+blob the firmware leaves in memory immediately after the OS image, checks a
+version word, and blanks the lot to 0xFF if it is out of range -- which is what
+happens with stock QEMU, and why the machine boots unconfigured and never
+reaches the desktop.
+
+Under emulation QEMU is the firmware, so `-device loader` can supply that blob:
+
+    python mkcmos.py --riscos-src <path>/BCM2835/RiscOS --rom RISCOS.IMG         --unplug 106 -o cmos.bin
+
+    qemu-system-aarch64 ... -device loader,file=cmos.bin,addr=0x510000,force-raw=on
+
+Nothing in it is transcribed by hand. The CMOS layout comes from RISC OS's own
+`hdr/CMOS` by simulating ObjAsm's `^`/`#` storage map, and the defaults from the
+kernel's `DefaultCMOSTable`; the load address comes from the ROM's own `OSIm`
+header. It cross-checks the layout against the address comments in the header
+and reports any that disagree, and it mirrors the kernel's backwards-indexed
+unplug table rather than assuming the arithmetic.
+
+`--unplug 106` disables **EtherGENET** in RISC OS 5.30. With no Ethernet
+controller to find, its `genet_attach` returns `ENXIO` but leaves `nicifp`
+NULL, and a callback booked during module init then dereferences it -- a data
+abort on address `0x18`. That is a bug in the driver, not in the emulation, and
+no device model can prevent it; the only lever is not to start the module.
+
+`--language 1` makes the supervisor prompt a deliberate choice. The stock
+default is 11, the Desktop.
+
+**A valid checksum means the kernel skips `cmos_reset` entirely**, so the blob
+has to carry every setting, not just the one you came for. A blob of zeros with
+a correct checksum boots to a black screen: the abort is gone and so is
+everything else.
+
 ## Instruction-rate benchmarks
 
 `bench.s.in` is a register-only loop (2 instructions × 100M); `bench2.s.in` adds

@@ -4,7 +4,8 @@
 
 > [!CAUTION]
 > **RECENT EXPERIMENT.** Days old, everything in flux, and nothing here is
-> finished. It boots to a prompt; it has no keyboard and no disc.
+> finished. It reaches the desktop, but there is no disc behind that SD icon
+> and keyboard input is not yet proven.
 >
 > The badge goes green when this is the fastest RISC OS A72 emulator there is,
 > with an integrated debugging environment — and it works. Until then, treat
@@ -12,10 +13,13 @@
 
 
 A QEMU fork that boots **RISC OS 5.30 on an emulated Cortex-A72 in 32-bit
-mode** — `-M raspi4b` with the CPU in AArch32 — far enough to reach its
-supervisor prompt with a framebuffer on screen.
+mode** — `-M raspi4b` with the CPU in AArch32 — all the way to the desktop.
 
-![RISC OS 5.30 on an emulated Pi 4](first-boot.png)
+![The RISC OS 5.30 desktop on an emulated Pi 4](desktop.png)
+
+Along the way it looked like this, which is where most of the work went:
+
+![Reaching the supervisor prompt](first-boot.png)
 
 Branch: `riscos-pi4`, ten commits on top of QEMU **v11.1.0**.
 
@@ -34,8 +38,11 @@ tick and interrupt dispatch (~2,900 interrupts serviced per 30 seconds), I2C,
 the VCHIQ connect handshake, and a framebuffer allocated through the VideoCore
 property channel.
 
-Not working yet: no keyboard (see below), no disc, one remaining data abort,
-and `GET_EDID_BLOCK` / `SET_CLOCK_RATE` are unimplemented property tags.
+Not working yet: **no disc**, so there is nothing behind that SD icon. **No
+proven keyboard** — `-device usb-kbd` attaches to the DWC2 controller and the
+controller runs, but RISC OS has not been seen to enumerate it and no keypress
+has been shown to land. `GET_EDID_BLOCK` and `SET_CLOCK_RATE` are still
+unimplemented property tags.
 
 ## What it changes
 
@@ -110,10 +117,22 @@ the same as free to redistribute. Get the "RPi ROM stable" zip from
 `RISCOS.IMG` out of it.
 
 ```bash
+python riscos-pi4/tools/mkcmos.py --riscos-src <path>/BCM2835/RiscOS \
+    --rom RISCOS.IMG --unplug 106 -o cmos.bin
+
 qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
-    -kernel RISCOS.IMG -display none -serial null \
+    -kernel RISCOS.IMG \
+    -device loader,file=cmos.bin,addr=0x510000,force-raw=on \
     -qmp tcp:127.0.0.1:4455,server,nowait
 ```
+
+**Both parts are needed to reach the desktop.** A Raspberry Pi has no CMOS
+chip, so the HAL takes its settings from a blob the firmware leaves in memory
+after the OS image — and under emulation QEMU *is* the firmware. Without one
+the HAL blanks the settings and the machine boots unconfigured; without
+`--unplug 106` the EtherGENET driver dereferences a null pointer and RISC OS
+prints a data abort on its own console. `mkcmos.py` derives both the blob and
+the address to load it at from RISC OS's own headers and ROM image.
 
 `-cpu cortex-a72,aarch64=off` is the load-bearing part. `-M raspi4b` hard-codes
 its CPU, so it is widely assumed `-cpu` does nothing there — but the *property*
