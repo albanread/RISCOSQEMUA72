@@ -14,6 +14,12 @@
 #include "hw/gpio/bcm2838_gpio.h"
 
 /* SPI */
+/*
+ * The legacy VideoCore interrupts 0-63 appear on the GIC as SPI 64-127, so
+ * VC IRQ n is SPI 64 + n. The system timer's four compare outputs are VC IRQ
+ * 0-3; only 1 and 3 are free for the ARM to use on real hardware.
+ */
+#define GIC_SPI_INTERRUPT_SYSTIMER0    64
 #define GIC_SPI_INTERRUPT_MBOX         33
 #define GIC_SPI_INTERRUPT_MPHI         40
 #define GIC_SPI_INTERRUPT_DWC2         73

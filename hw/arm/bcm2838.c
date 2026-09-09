@@ -176,6 +176,17 @@ static void bcm2838_realize(DeviceState *dev, Error **errp)
                     qdev_get_gpio_in(gicdev, PPI(n, VIRTUAL_PMU_IRQ)));
     }
 
+    /*
+     * Connect the system timer to the interrupt controller. Without this its
+     * compare outputs reach only the legacy interrupt controller, which a
+     * guest driving a BCM2711 through the GIC never looks at -- the timer
+     * fires, sets its status bit, and nobody is told.
+     */
+    for (int n = 0; n < 4; n++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->systmr), n,
+                    qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_SYSTIMER0 + n));
+    }
+
     /* Connect UART0 to the interrupt controller */
     sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->uart0), 0,
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_UART0));
