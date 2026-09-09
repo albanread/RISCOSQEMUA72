@@ -196,6 +196,14 @@ struct SDState {
     uint32_t data_offset;
     size_t data_size;
     uint8_t data[512];
+
+    /*
+     * Read-ahead over the backing file. sd_blk_read serves from it; writes,
+     * resets and media changes throw it away. Not migrated: it refills.
+     */
+    uint8_t *readahead;
+    uint64_t readahead_addr;
+    uint32_t readahead_len;
     struct {
         uint32_t write_counter;
         uint8_t key[RPMB_KEY_MAC_LEN];
@@ -951,6 +959,7 @@ static void sd_reset(DeviceState *dev)
     sd->erase_start = INVALID_ADDRESS;
     sd->erase_end = INVALID_ADDRESS;
     sd->blk_len = 0x200;
+    sd->readahead_len = 0;
     sd->pwd_len = 0;
     sd->expecting_acmd = false;
     sd->dat_lines = 0xf;
@@ -975,6 +984,8 @@ static void sd_cardchange(void *opaque, bool load, Error **errp)
     SDBus *sdbus;
     bool inserted = sd_get_inserted(sd);
     bool readonly = sd_get_readonly(sd);
+
+    sd->readahead_len = 0;
 
     if (inserted) {
         trace_sdcard_inserted(readonly);
@@ -1113,19 +1124,47 @@ static const VMStateDescription sd_vmstate = {
     },
 };
 
+#define SD_READAHEAD_SIZE (64 * 1024)
+
 static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
 {
     trace_sdcard_read_block(addr, len);
     addr += sd_part_offset(sd);
-    if (!sd->blk || blk_pread(sd->blk, addr, len, sd->data, 0) < 0) {
+    if (!sd->blk) {
         fprintf(stderr, "sd_blk_read: read error on host side\n");
+        return;
     }
+
+    /*
+     * A multiple-block read arrives here one block at a time, and a
+     * synchronous read of the backing file -- a round trip through the
+     * block layer's thread pool -- costs far more per block than the block
+     * itself. Read ahead, and serve sequential blocks from the buffer.
+     */
+    if (addr < sd->readahead_addr ||
+        addr + len > sd->readahead_addr + sd->readahead_len) {
+        int64_t avail = blk_getlength(sd->blk) - addr;
+        uint32_t n = MIN(SD_READAHEAD_SIZE, MAX(avail, 0));
+
+        if (!sd->readahead) {
+            sd->readahead = g_malloc(SD_READAHEAD_SIZE);
+        }
+        sd->readahead_len = 0;
+        if (n < len || blk_pread(sd->blk, addr, n, sd->readahead, 0) < 0) {
+            fprintf(stderr, "sd_blk_read: read error on host side\n");
+            return;
+        }
+        sd->readahead_addr = addr;
+        sd->readahead_len = n;
+    }
+    memcpy(sd->data, sd->readahead + (addr - sd->readahead_addr), len);
 }
 
 static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
 {
     trace_sdcard_write_block(addr, len);
     addr += sd_part_offset(sd);
+    sd->readahead_len = 0;
     if (!sd->blk || blk_pwrite(sd->blk, addr, len, sd->data, 0) < 0) {
         fprintf(stderr, "sd_blk_write: write error on host side\n");
     }
@@ -3073,6 +3112,7 @@ static void sd_instance_finalize(Object *obj)
     SDState *sd = SDMMC_COMMON(obj);
 
     timer_free(sd->ocr_power_timer);
+    g_free(sd->readahead);
 }
 
 static void sd_blk_size_error(SDState *sd, int64_t blk_size,
