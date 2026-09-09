@@ -23,6 +23,7 @@
 #include "hw/misc/bcm2835_rng.h"
 #include "hw/misc/bcm2835_mbox.h"
 #include "hw/misc/bcm2835_mbox_power.h"
+#include "hw/misc/bcm2835_vchiq.h"
 #include "hw/misc/bcm2835_mphi.h"
 #include "hw/misc/bcm2835_thermal.h"
 #include "hw/misc/bcm2835_cprman.h"
@@ -68,6 +69,7 @@ struct BCMSocPeripheralBaseState {
     BCM2835ICState ic;
     BCM2835PropertyState property;
     BCM2835MboxPowerState mbox_power;
+    BCM2835VchiqState vchiq;
     BCM2835MboxState mboxes;
     SDHCIState sdhci;
     BCM2835SDHostState sdhost;

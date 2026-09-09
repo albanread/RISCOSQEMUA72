@@ -339,6 +339,14 @@ aspeed_hace_hash_addr(const char *s, uint64_t addr) "%s: 0x%" PRIx64
 aspeed_hace_hash_execute_acc_mode(bool final_request) "final request: %d"
 aspeed_hace_hexdump(const char *desc, uint32_t offset, char *s) "%s: 0x%08x: %s"
 
+# bcm2835_vchiq.c
+bcm2835_vchiq_mbox_write(uint32_t value) "vchiq slot zero posted: 0x%08x"
+bcm2835_vchiq_slot_zero(uint32_t addr, uint32_t magic, uint32_t slot_size, uint32_t max_slots) "vchiq slot zero at 0x%08x magic 0x%08x slot_size %u max_slots %u"
+bcm2835_vchiq_tx(uint32_t msgid, uint32_t type, uint32_t size) "vchiq tx msgid 0x%08x type %u size %u"
+bcm2835_vchiq_rx(uint32_t msgid, uint32_t type, uint32_t size) "vchiq rx msgid 0x%08x type %u size %u"
+bcm2835_vchiq_open(uint32_t fourcc, uint32_t srcport) "vchiq service open fourcc 0x%08x srcport %u -- refusing"
+bcm2835_vchiq_bell(uint32_t bell0) "vchiq ring VC->ARM doorbell, bell0 now 0x%08x"
+
 # bcm2835_property.c
 bcm2835_mbox_property(uint32_t tag, uint32_t bufsize, size_t resplen) "mbox property tag:0x%08x in_sz:%u out_sz:%zu"
 

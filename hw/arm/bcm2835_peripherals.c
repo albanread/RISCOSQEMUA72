@@ -112,6 +112,11 @@ static void raspi_peripherals_base_init(Object *obj)
     object_initialize_child(obj, "mbox-power", &s->mbox_power,
                             TYPE_BCM2835_MBOX_POWER);
 
+    /* VCHIQ */
+    object_initialize_child(obj, "vchiq", &s->vchiq, TYPE_BCM2835_VCHIQ);
+    object_property_add_const_link(OBJECT(&s->vchiq), "dma-mr",
+                                   OBJECT(&s->gpu_bus_mr));
+
     /* Framebuffer */
     object_initialize_child(obj, "fb", &s->fb, TYPE_BCM2835_FB);
     object_property_add_alias(obj, "vcram-size", OBJECT(&s->fb), "vcram-size");
@@ -385,6 +390,26 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->fb), 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->fb), 0,
                        qdev_get_gpio_in(DEVICE(&s->mboxes), MBOX_CHAN_FB));
+
+    /* VCHIQ: the channel-3 window, plus the doorbells it signals through */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->vchiq), errp)) {
+        return;
+    }
+
+    memory_region_add_subregion(&s->mbox_mr,
+                MBOX_CHAN_VCHIQ << MBOX_AS_CHAN_SHIFT,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->vchiq), 0));
+    /*
+     * The doorbells live inside the range the mailbox device claims, which
+     * answers them from its "unsupported offset" arm, so overlay at a higher
+     * priority rather than reaching into that device.
+     */
+    memory_region_add_subregion_overlap(&s->peri_mr,
+                ARMCTRL_0_SBM_OFFSET + 0x40,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->vchiq), 1), 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->vchiq), 0,
+        qdev_get_gpio_in_named(DEVICE(&s->ic), BCM2835_IC_ARM_IRQ,
+                               INTERRUPT_ARM_DOORBELL_0));
 
     /* Power management channel */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->mbox_power), errp)) {
