@@ -199,6 +199,10 @@ def main():
     ap.add_argument('--set', action='append', default=[], metavar='LOC=VAL',
                     help='set any CMOS byte. LOC may be a name from hdr/CMOS '
                          '(e.g. LanguageCMOS) or a number; repeatable.')
+    ap.add_argument('--base', metavar='FILE',
+                    help='start from an existing blob instead of the kernel '
+                         'defaults: the CMOS file from a Pi boot partition '
+                         '(2048 bytes, optionally followed by its version word)')
     ap.add_argument('--version', type=int, default=530)
     args = ap.parse_args()
 
@@ -221,13 +225,20 @@ def main():
     for loc, val, why in unresolved:
         print(f'  warning: skipped {loc} = {val} ({why})', file=sys.stderr)
 
-    cmos = bytearray(CMOS_SIZE)
-    for loc, val in defaults.items():
-        cmos[loc] = val
-    # The HAL leaves everything from the checksum byte up blank, and the kernel
-    # never resets it, so match that rather than inventing zeros.
-    for i in range(SKIP_FROM + 1, CMOS_SIZE):
-        cmos[i] = 0xFF
+    if args.base:
+        base = open(args.base, 'rb').read()
+        if len(base) < CMOS_SIZE:
+            raise SystemExit(f'{args.base}: {len(base)} bytes, want {CMOS_SIZE}')
+        cmos = bytearray(base[:CMOS_SIZE])
+        print(f'starting from {args.base}', file=sys.stderr)
+    else:
+        cmos = bytearray(CMOS_SIZE)
+        for loc, val in defaults.items():
+            cmos[loc] = val
+        # The HAL leaves everything from the checksum byte up blank, and the
+        # kernel never resets it, so match that rather than inventing zeros.
+        for i in range(SKIP_FROM + 1, CMOS_SIZE):
+            cmos[i] = 0xFF
 
     for chunk in args.unplug:
         loc, bit = unplug_byte(chunk, syms)
