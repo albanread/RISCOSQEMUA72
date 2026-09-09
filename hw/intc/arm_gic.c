@@ -159,6 +159,22 @@ static inline bool gic_irq_signaling_enabled(GICState *s, int cpu, bool virt,
     return true;
 }
 
+/*
+ * The interrupt signal bypass of a GICv2: a legacy nFIQ input reaches the
+ * processor whenever the CPU interface is not signalling FIQs of its own,
+ * unless GICC_CTLR.FIQBypDisGrp0 forbids it. We never store the bypass
+ * disable bits (see GICC_CTLR_V2_MASK), so the bypass is always allowed,
+ * and the CPU interface signals FIQs only with Group 0 enabled and routed
+ * to FIQ.
+ */
+static inline bool gic_legacy_fiq_bypassed(GICState *s, int cpu, bool virt)
+{
+    uint32_t ctlr = s->cpu_ctlr[cpu];
+    bool own_fiqs = (ctlr & GICC_CTLR_EN_GRP0) && (ctlr & GICC_CTLR_FIQ_EN);
+
+    return !virt && s->legacy_fiq[cpu] && !own_fiqs;
+}
+
 /* TODO: Many places that call this routine could be optimized.  */
 /* Update interrupt status after enabled or pending bits have been changed.  */
 static inline void gic_update_internal(GICState *s, bool virt)
@@ -178,7 +194,8 @@ static inline void gic_update_internal(GICState *s, bool virt)
         if (!gic_irq_signaling_enabled(s, cpu, virt,
                                        GICD_CTLR_EN_GRP0 | GICD_CTLR_EN_GRP1)) {
             qemu_irq_lower(irq_lines[cpu]);
-            qemu_irq_lower(fiq_lines[cpu]);
+            qemu_set_irq(fiq_lines[cpu],
+                         gic_legacy_fiq_bypassed(s, cpu, virt));
             continue;
         }
 
@@ -220,7 +237,8 @@ static inline void gic_update_internal(GICState *s, bool virt)
         }
 
         qemu_set_irq(irq_lines[cpu], irq_level);
-        qemu_set_irq(fiq_lines[cpu], fiq_level);
+        qemu_set_irq(fiq_lines[cpu],
+                     fiq_level || gic_legacy_fiq_bypassed(s, cpu, virt));
     }
 }
 
@@ -416,6 +434,15 @@ static void gic_set_irq(void *opaque, int irq, int level)
     }
     trace_gic_set_irq(irq, level, cm, target);
 
+    gic_update(s);
+}
+
+/* A legacy nFIQ input changed: it bypasses the distributor entirely */
+static void gic_set_legacy_fiq(void *opaque, int cpu, int level)
+{
+    GICState *s = opaque;
+
+    s->legacy_fiq[cpu] = level != 0;
     gic_update(s);
 }
 
@@ -2132,6 +2159,8 @@ static void arm_gic_realize(DeviceState *dev, Error **errp)
      * interface (s->vifaceiomem[0]) and virtual CPU interface).
      */
     gic_init_irqs_and_mmio(s, gic_set_irq, gic_ops, gic_virt_ops);
+    qdev_init_gpio_in_named(dev, gic_set_legacy_fiq, "legacy-fiq",
+                            s->num_cpu);
 
     /* Extra core-specific regions for the CPU interfaces. This is
      * necessary for "franken-GIC" implementations, for example on

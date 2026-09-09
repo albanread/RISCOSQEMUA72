@@ -119,6 +119,13 @@ struct GICState {
     uint32_t apr[GIC_NR_APRS][GIC_NCPU];
     uint32_t nsapr[GIC_NR_APRS][GIC_NCPU];
 
+    /*
+     * The legacy nFIQ inputs ("legacy-fiq" GPIO, one per CPU). A GICv2
+     * passes these through to the processor while it is not signalling
+     * FIQs itself: the interrupt signal bypass.
+     */
+    uint8_t legacy_fiq[GIC_NCPU];
+
     /* Virtual interface control registers */
     uint32_t h_hcr[GIC_NCPU];
     uint32_t h_misr[GIC_NCPU];

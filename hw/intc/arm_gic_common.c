@@ -98,6 +98,29 @@ static const VMStateDescription vmstate_gic_virt_state = {
     }
 };
 
+static bool gic_legacy_fiq_needed(void *opaque)
+{
+    GICState *s = opaque;
+
+    for (int i = 0; i < GIC_NCPU; i++) {
+        if (s->legacy_fiq[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const VMStateDescription vmstate_gic_legacy_fiq = {
+    .name = "arm_gic/legacy_fiq",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = gic_legacy_fiq_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(legacy_fiq, GICState, GIC_NCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_gic = {
     .name = "arm_gic",
     .version_id = 12,
@@ -124,6 +147,7 @@ static const VMStateDescription vmstate_gic = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_gic_virt_state,
+        &vmstate_gic_legacy_fiq,
         NULL
     }
 };
@@ -283,6 +307,7 @@ static void arm_gic_common_reset_hold(Object *obj, ResetType type)
     }
 
     memset(s->irq_state, 0, GIC_MAXIRQ * sizeof(gic_irq_state));
+    memset(s->legacy_fiq, 0, sizeof(s->legacy_fiq));
     arm_gic_common_reset_irq_state(s, 0, resetprio);
 
     if (s->virt_extn) {
