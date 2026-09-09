@@ -23,6 +23,37 @@
 
 /* https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface */
 
+/*
+ * The monitor the firmware would have read over DDC: an EDID 1.3 block
+ * describing a digital 800x600 display, preferred timing VESA DMT 800x600
+ * at 60 Hz (40 MHz, 1056x628 total), with 640x480 and 800x600 among the
+ * established timings and a range-limits descriptor that admits them. The
+ * checksum byte is filled in when the block is handed over.
+ */
+static const uint8_t bcm2835_edid_800x600[127] = {
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,     /* header */
+    0x45, 0xb5, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,     /* "QMU", product 1 */
+    0x00, 0x24, 0x01, 0x03,                             /* 2026, EDID 1.3 */
+    0x80, 0x20, 0x18, 0x78, 0x02,                       /* digital, 32x24 cm, gamma 2.2, preferred timing */
+    0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54,
+    0x21, 0x00, 0x00,                                   /* established: 640x480@60, 800x600@60 */
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,     /* no standard timings */
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    /* detailed timing: 800x600@60 */
+    0xa0, 0x0f, 0x20, 0x00, 0x31, 0x58, 0x1c, 0x20, 0x28, 0x80, 0x14, 0x00,
+    0x40, 0xf0, 0x10, 0x00, 0x00, 0x1e,
+    /* monitor name */
+    0x00, 0x00, 0x00, 0xfc, 0x00, 'Q', 'E', 'M', 'U', ' ', 'P', 'i', ' ', '4',
+    0x0a, 0x20, 0x20, 0x20,
+    /* range limits: 50-75 Hz, 30-50 kHz, 50 MHz */
+    0x00, 0x00, 0x00, 0xfd, 0x00, 0x32, 0x4b, 0x1e, 0x32, 0x05, 0x00,
+    0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    /* unused descriptor */
+    0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,                                               /* no extension blocks */
+};
+
 static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
 {
     uint32_t tot_len;
@@ -252,6 +283,34 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
             stl_le_phys(&s->dma_as, value + 16, 0);
             resplen = 8;
             break;
+
+        /*
+         * The display chain's one question of the firmware. RISC OS reads
+         * the monitor's EDID through this, and picks its desktop mode from
+         * the preferred timing; without an answer it falls back to the
+         * kernel's oldest numbered modes and comes up in 640x256. A status
+         * other than 0 is "no acknowledge", which is how the guest learns
+         * there is no second block.
+         */
+        case RPI_FWREQ_GET_EDID_BLOCK:
+        {
+            uint32_t block = ldl_le_phys(&s->dma_as, value + 12);
+            uint8_t edid[128];
+            unsigned sum = 0;
+
+            stl_le_phys(&s->dma_as, value + 16, block == 0 ? 0 : 1);
+            if (block == 0) {
+                memcpy(edid, bcm2835_edid_800x600, sizeof(edid) - 1);
+                for (int i = 0; i < sizeof(edid) - 1; i++) {
+                    sum += edid[i];
+                }
+                edid[sizeof(edid) - 1] = -sum;
+                dma_memory_write(&s->dma_as, value + 20, edid, sizeof(edid),
+                                 MEMTXATTRS_UNSPECIFIED);
+            }
+            resplen = 8 + sizeof(edid);
+            break;
+        }
 
         /*
          * Buffers the firmware holds on the guest's behalf: the official
