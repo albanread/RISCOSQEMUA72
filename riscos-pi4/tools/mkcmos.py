@@ -186,6 +186,13 @@ def main():
                     metavar='CHUNK', help='disable ROM module chunk (repeatable)')
     ap.add_argument('--language', type=int,
                     help='module the kernel starts (stock default 11 = Desktop)')
+    ap.add_argument('--filesystem', type=int, metavar='N',
+                    help='filing system to boot from, by number: 192 = SDFS, '
+                         '23 = RamFS, 8 = ADFS (the stock default). This is '
+                         'what *Configure FileSystem writes.')
+    ap.add_argument('--set', action='append', default=[], metavar='LOC=VAL',
+                    help='set any CMOS byte. LOC may be a name from hdr/CMOS '
+                         '(e.g. LanguageCMOS) or a number; repeatable.')
     ap.add_argument('--version', type=int, default=530)
     args = ap.parse_args()
 
@@ -224,6 +231,22 @@ def main():
     if args.language is not None:
         cmos[syms['LanguageCMOS']] = args.language
         print(f'language module = {args.language}', file=sys.stderr)
+
+    if args.filesystem is not None:
+        cmos[syms['FileLangCMOS']] = args.filesystem
+        print(f'boot filing system = {args.filesystem} '
+              f'(&{syms["FileLangCMOS"]:02X})', file=sys.stderr)
+
+    for spec in args.set:
+        loc_s, _, val_s = spec.partition('=')
+        if not val_s:
+            raise SystemExit(f'--set wants LOC=VAL, got {spec!r}')
+        loc = syms[loc_s] if loc_s in syms else _eval(loc_s, syms)
+        val = _eval(val_s, syms) & 0xFF
+        if not 0 <= loc < CMOS_SIZE:
+            raise SystemExit(f'--set {spec}: &{loc:X} is outside the CMOS')
+        cmos[loc] = val
+        print(f'set &{loc:02X} = &{val:02X}   ({loc_s})', file=sys.stderr)
 
     cmos[SKIP_FROM] = 0
     cmos[SKIP_FROM] = checksum(cmos)
