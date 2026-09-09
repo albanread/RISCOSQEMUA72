@@ -1,0 +1,41 @@
+    .arch armv7-a
+    .text
+    .global _start
+_start:
+    mrc  p15, 0, r0, c0, c0, 5   @ MPIDR: only core 0 runs the test,
+    ands r0, r0, #3              @ so the output is one line, not four
+    bne  .                       @ secondaries park here
+    movw r9, #:lower16:UARTB
+    movt r9, #:upper16:UARTB
+    movw r8, #:lower16:TIMB
+    movt r8, #:upper16:TIMB
+    mov  r0, #0x301
+    str  r0, [r9, #0x30]
+    movw r3, #0x0000            @ buffer base 0x00400000
+    movt r3, #0x0040
+    movw r2, #0xffc0            @ wrap mask: 4MB span, 64-byte stride
+    movt r2, #0x003f
+    mov  r7, #0
+    ldr  r4, [r8]
+    movw r0, #:lower16:20000000
+    movt r0, #:upper16:20000000
+1:  ldr  r1, [r3, r7]
+    str  r1, [r3, r7]
+    add  r7, r7, #64
+    and  r7, r7, r2
+    subs r0, r0, #1
+    bne  1b
+    ldr  r5, [r8]
+    sub  r5, r5, r4
+    mov  r6, #28
+2:  lsr  r0, r5, r6
+    and  r0, r0, #0xf
+    cmp  r0, #10
+    addlt r0, r0, #48
+    addge r0, r0, #87
+    str  r0, [r9]
+    subs r6, r6, #4
+    bge  2b
+    mov  r0, #10
+    str  r0, [r9]
+3:  b 3b

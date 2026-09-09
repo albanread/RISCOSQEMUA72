@@ -20,3 +20,6 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Working files from the RISC OS Pi 4 work
+/*.log

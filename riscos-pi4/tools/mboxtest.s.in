@@ -1,0 +1,74 @@
+@ Bare-metal regression test for VideoCore mailbox channel 0 (power management).
+@
+@ Posts the message RISC OS's BCM2835 HAL posts during HAL_InitDevices --
+@ "power up the USB host controller", channel 0, device bit 3 -- and waits for
+@ the reply, with a bounded spin so a missing channel-0 peer fails the test
+@ instead of hanging the way RISC OS does.
+@
+@ Prints over the PL011:
+@   00000080  reply received, correct  -- PASS
+@   TIMEOUT                            -- nobody answered channel 0
+@
+@ Substitute UARTB and MBOXB for the machine before assembling; see README.md.
+@   raspi2b (BCM2836): UARTB=0x3F201000 MBOXB=0x3F00B800
+@   raspi4b (BCM2711): UARTB=0xFE201000 MBOXB=0xFE00B800
+
+    .arch armv7-a
+    .text
+    .global _start
+
+    .equ MAIL0_READ,   0x80
+    .equ MAIL0_STATUS, 0x98
+    .equ MAIL1_WRITE,  0xa0
+    .equ ARM_MS_EMPTY, 0x40000000
+
+    .equ CHAN_POWER,   0
+    .equ POWER_USB_HCD, (1 << 3)
+
+_start:
+    mrc  p15, 0, r0, c0, c0, 5   @ MPIDR: only core 0 runs the test,
+    ands r0, r0, #3              @ so the output is one line, not four
+    bne  .                       @ secondaries park here
+    movw r9, #:lower16:UARTB
+    movt r9, #:upper16:UARTB
+    movw r8, #:lower16:MBOXB
+    movt r8, #:upper16:MBOXB
+    mov  r0, #0x301                 @ UARTCR = UARTEN|TXE|RXE
+    str  r0, [r9, #0x30]
+
+    mov  r0, #(POWER_USB_HCD << 4) | CHAN_POWER
+    str  r0, [r8, #MAIL1_WRITE]
+
+    movw r4, #:lower16:20000000     @ bounded wait
+    movt r4, #:upper16:20000000
+1:  ldr  r0, [r8, #MAIL0_STATUS]
+    tst  r0, #ARM_MS_EMPTY
+    beq  2f
+    subs r4, r4, #1
+    bne  1b
+
+    adr  r5, timeout                @ nobody answered
+3:  ldrb r0, [r5], #1
+    cmp  r0, #0
+    beq  9f
+    str  r0, [r9]
+    b    3b
+
+2:  ldr  r5, [r8, #MAIL0_READ]      @ the reply
+    mov  r6, #28
+4:  lsr  r0, r5, r6
+    and  r0, r0, #0xf
+    cmp  r0, #10
+    addlt r0, r0, #48               @ '0'
+    addge r0, r0, #87               @ 'a' - 10
+    str  r0, [r9]
+    subs r6, r6, #4
+    bge  4b
+
+9:  mov  r0, #10                    @ newline
+    str  r0, [r9]
+5:  b    5b
+
+timeout:
+    .asciz "TIMEOUT"
+    .align 2
