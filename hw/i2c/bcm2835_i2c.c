@@ -211,7 +211,17 @@ static const MemoryRegionOps bcm2835_i2c_ops = {
     .write = bcm2835_i2c_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    /*
+     * The FIFO is a byte port, and guests do use STRB/LDRB on it. Accesses
+     * must reach the handlers at the size the guest used: letting the core
+     * synthesise a byte access out of a 32-bit one would turn a byte write
+     * into a read-modify-write, and reading the FIFO pops it.
+     */
+    .impl = {
+        .min_access_size = 1,
         .max_access_size = 4,
     },
 };
