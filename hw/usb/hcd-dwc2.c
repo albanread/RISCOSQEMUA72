@@ -62,16 +62,17 @@
     (!!((data) & (bitmask)))
 
 /* update irq line */
+static inline bool dwc2_irq_asserted(DWC2State *s)
+{
+    return (s->gintsts & s->gintmsk) && (s->gahbcfg & GAHBCFG_GLBL_INTR_EN);
+}
+
 static inline void dwc2_update_irq(DWC2State *s)
 {
-    static int oldlevel;
-    int level = 0;
+    bool level = dwc2_irq_asserted(s);
 
-    if ((s->gintsts & s->gintmsk) && (s->gahbcfg & GAHBCFG_GLBL_INTR_EN)) {
-        level = 1;
-    }
-    if (level != oldlevel) {
-        oldlevel = level;
+    if (level != s->irq_level) {
+        s->irq_level = level;
         trace_usb_dwc2_update_irq(level);
         qemu_set_irq(s->irq, level);
     }
@@ -951,6 +952,19 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
 
     *mmio = val;
 
+    if (addr == HAINTMSK) {
+        /*
+         * GINTSTS.HCHINT is the live OR of HAINT & HAINTMSK, so a new mask
+         * moves it as much as a channel event does. A driver that defers a
+         * channel interrupt by masking it relies on the line falling here.
+         */
+        if (s->haint & s->haintmsk) {
+            dwc2_raise_global_irq(s, GINTSTS_HCHINT);
+        } else {
+            dwc2_lower_global_irq(s, GINTSTS_HCHINT);
+        }
+    }
+
     if (iflg > 0) {
         trace_usb_dwc2_hreg0_action("enable PRTINT");
         dwc2_raise_global_irq(s, GINTSTS_PRTINT);
@@ -1412,10 +1426,20 @@ static const VMStateDescription vmstate_dwc2_state_packet = {
     },
 };
 
+static int dwc2_post_load(void *opaque, int version_id)
+{
+    DWC2State *s = opaque;
+
+    /* The line's state follows from the registers; it is not migrated */
+    s->irq_level = dwc2_irq_asserted(s);
+    return 0;
+}
+
 const VMStateDescription vmstate_dwc2_state = {
     .name = "dwc2",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = dwc2_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(glbreg, DWC2State,
                              DWC2_GLBREG_SIZE / sizeof(uint32_t)),

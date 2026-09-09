@@ -64,6 +64,7 @@ struct DWC2State {
     /*< public >*/
     USBBus bus;
     qemu_irq irq;
+    bool irq_level;             /* what we last drove irq to */
     MemoryRegion *dma_mr;
     AddressSpace dma_as;
     MemoryRegion container;
