@@ -104,9 +104,12 @@ Per frame, on the UI thread:
    `R8G8B8A8_UNORM` render target the size of the visible framebuffer
    (`xres × yres`, from `xoffset, yoffset` — the pan is a texture-coordinate
    offset).
-4. **Scale.** A second pass draws that target into the window: aspect
-   preserved, letterboxed, integer scaling when the window allows it,
-   nearest or sharp-bilinear filtering, optional scanline overlay.
+4. **Scale.** A second pass draws that target across the whole client
+   area. On a Pi the GPU scales every framebuffer to the display mode, so
+   the client area *is* the display mode: a 640×256 desktop fills the same
+   window as an 800×600 one, exactly as it fills a monitor. Nearest or
+   sharp-bilinear filtering, optional scanline overlay. Integer-scale and
+   keep-aspect are options for people who want them, off by default.
 5. **Present** through a DXGI flip-model swap chain with a waitable object;
    vsync on by default (the guest has no vsync of its own to fight).
 
@@ -129,12 +132,13 @@ which this fork declines, so they cannot appear either.
 
 RISC OS sets the GPU's physical size equal to the mode's size (the
 640×256 desktop came out as a 640×256 console), and on real hardware the
-GPU's scaler stretches that to the monitor. In this fork there is no
-monitor; the window is the scaler. Non-square modes — 640×256 is a 4:3
-picture — therefore need a pixel-aspect decision that the framebuffer alone
-does not carry. Heuristic first (a buffer wider than 2:1 gets 2:1 pixels),
-and later the VM compatibility module can tell the UI the mode's eigen
-factors directly.
+GPU's scaler stretches that to whatever mode the monitor is in. In this
+fork the window is the monitor: every framebuffer is scaled to the client
+area, whatever its size, and that is the whole aspect story — a 640×256
+mode 12 fills an 800×600 window the way it fills an 800×600 screen. The
+window's default client size is the EDID mode the firmware answer
+describes, 800×600; the user can resize it or go fullscreen, and the guest
+neither knows nor cares.
 
 ### 3.2 Shaders, per format
 
@@ -156,8 +160,8 @@ Output pass shaders, independent of format:
 
 | Shader | Purpose |
 | --- | --- |
-| nearest / integer | pixel-exact at whole multiples, the default for a RISC OS desktop |
-| sharp-bilinear | smooth at non-integer scales without smearing pixel edges |
+| sharp-bilinear | the default: smooth at any scale without smearing pixel edges |
+| nearest | pixel-exact, for the integer-scale option |
 | scanline / CRT (optional) | because a 640×256 mode 12 deserves it; off by default |
 
 Two shaders carry the entire real RISC OS load — 8 bpp palette and 32 bpp —
@@ -229,8 +233,8 @@ the UI thread costs the emulation nothing.
 ### Sprint 1 — the framebuffer, decoded on the GPU (3–4 days)
 
 The fb accessor and generation counter; raw upload; the 32 bpp and 8 bpp
-decoders with the palette texture; the scaler with aspect and integer
-scaling; mode changes resize the window. Done when: the 800×600 desktop
+decoders with the palette texture; the scaler stretching any mode to the
+client area; mode changes leave the window alone. Done when: the 800×600 desktop
 renders at the monitor's rate, a 256-colour mode shows the right palette,
 and a mode change mid-session does the right thing. Screenshot to PNG comes
 with it because it is the test tool.

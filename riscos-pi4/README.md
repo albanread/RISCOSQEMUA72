@@ -4,9 +4,8 @@
 
 > [!CAUTION]
 > **RECENT EXPERIMENT.** Days old, everything in flux, and nothing here is
-> finished. It boots the ROOL SD image to the desktop with a keyboard, a mouse
-> and a network, and the screen is 640×256 because nobody has answered the
-> EDID question yet.
+> finished. It boots the ROOL SD image to an 800×600 desktop with a keyboard,
+> a mouse and a network. Speed is measured, not yet chased.
 >
 > The badge goes green when this is the fastest RISC OS A72 emulator there is,
 > with an integrated debugging environment — and it works. Until then, treat
@@ -20,7 +19,7 @@ interface that takes a DHCP lease from QEMU's own network during the boot
 sequence. Power-on to an idle, networked desktop is about 27 seconds on an
 i7-12700.
 
-![RISC OS 5.30 booted from the ROOL SD image: NetSurf on the Welcome page](sd-desktop.png)
+![RISC OS 5.30 booted from the ROOL SD image, 800×600: NetSurf on the Welcome page](sd-desktop.png)
 
 Before the disc and the keyboard it looked like this, and before that like
 this, which is where most of the work went:
@@ -51,10 +50,14 @@ a hub — which on a Pi 4 means the FIQ path RISC OS drives it from; and
 QEMU's user-mode network. Twelve seconds from power-on to the end of
 PreDesk; 27 to an idle desktop with the network up.
 
-Not working yet: the screen is 640×256, because `GET_EDID_BLOCK` is still
-unanswered and RISC OS falls back to its smallest mode. `SET_CLOCK_RATE` is
-still NYI. There is no way to get files into a running guest except through
-the card image.
+The screen is 800×600 because the firmware channel now answers
+`GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
+MonitorType EDID; RISC OS's ScreenModes does the rest.
+
+Not working yet: `SET_CLOCK_RATE` is still NYI. There is no way to get files
+into a running guest except through the card image. The boot spends about
+five seconds reading the card at a millisecond per stall for reasons that
+are measured but not yet understood (DESIGN.md §12).
 
 ## What it changes
 
@@ -79,7 +82,8 @@ The rest are missing devices and unanswered firmware calls:
 - `hw/misc`: a **VCHIQ peer** for mailbox channel 3, plus the VC→ARM and
   ARM→VC doorbells
 - `hw/misc/bcm2835_property`: the touch and GPIO virtual buffer tags, and the
-  GPIO state tags
+  GPIO state tags; and **`GET_EDID_BLOCK`**, answered with an EDID block for
+  an 800×600 monitor, which is what turns the 640×256 fallback into a desktop
 - `hw/arm/bcm2838`: an unimplemented-device stub over the PCIe root complex,
   so probing it reads as "link down" instead of taking an external abort
 - `hw/intc/bcm2838_ic`: the **BCM2711 legacy interrupt controller** — the
@@ -142,9 +146,13 @@ to a raw card image. QEMU wants a card of 2 GiB or under to be an exact power
 of two, so pad it (`truncate -s 2G card.img`); it also wants it writable, and
 `snapshot=on` keeps the file pristine across runs.
 
+The image's boot partition also carries a `CMOS` file: RISC OS's own
+settings for the machine, MonitorType EDID among them. Copy it out (any FAT
+tool; `riscos-pi4/tools` has a reader) and build the blob from it:
+
 ```bash
 python riscos-pi4/tools/mkcmos.py --riscos-src <path>/BCM2835/RiscOS \
-    --rom RISCOS.IMG --unplug 106 --filesystem 192 -o cmos.bin
+    --rom RISCOS.IMG --base CMOS --unplug 106 -o cmos.bin
 
 qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -kernel RISCOS.IMG \
@@ -160,9 +168,10 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
 
 Three things about that line:
 
-- `--filesystem 192` makes RISC OS boot from SDFS. Leave it and the `-drive`
-  out and it boots to the desktop from ROM alone, with nothing behind the SD
-  icon.
+- `--base CMOS` starts from the distribution's settings; without it, use
+  `--filesystem 192` to boot from SDFS and expect a 640×256 desktop, since
+  the kernel's defaults have no monitor type. Leave the `-drive` out and it
+  boots to the desktop from ROM alone, with nothing behind the SD icon.
 - The DWC2 controller has one root port, hence the hub. A lone `usb-kbd` can
   sit on `port=1` directly. Name the ports: a bare `-device usb-kbd` lands
   behind an automatic hub, which works but hides what you are testing.
