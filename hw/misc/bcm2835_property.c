@@ -248,6 +248,17 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
          * than the SoC's own pins. Both are just an address the guest hands
          * over and can ask for back.
          */
+        /*
+         * The expander GPIOs, which on Pi 3 and later carry the activity and
+         * power LEDs. Nothing here drives an LED, but the request has to be
+         * answered at the documented length or a guest that checks sees a
+         * failed call. Echo the pin and state back.
+         */
+        case RPI_FWREQ_SET_GPIO_STATE:
+        case RPI_FWREQ_GET_GPIO_STATE:
+            resplen = 8;
+            break;
+
         case RPI_FWREQ_FRAMEBUFFER_SET_TOUCHBUF:
             s->touchbuf = ldl_le_phys(&s->dma_as, value + 12);
             stl_le_phys(&s->dma_as, value + 12, 0);
