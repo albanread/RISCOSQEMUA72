@@ -276,6 +276,10 @@ heathrow_set_irq(int num, int level) "set_irq: num=0x%02x level=%d"
 bcm2835_ic_set_gpu_irq(int irq, int level) "GPU irq #%d level %d"
 bcm2835_ic_set_cpu_irq(int irq, int level) "CPU irq #%d level %d"
 
+# bcm2838_ic.c
+bcm2838_ic_set_irq(int irq, int level) "irq #%d level %d"
+bcm2838_ic_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+
 # spapr_xive.c
 spapr_xive_claim_irq(uint32_t lisn, bool lsi) "lisn=0x%x lsi=%d"
 spapr_xive_free_irq(uint32_t lisn) "lisn=0x%x"

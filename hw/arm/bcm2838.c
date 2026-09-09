@@ -221,8 +221,18 @@ static void bcm2838_realize(DeviceState *dev, Error **errp)
     /* Connect USB OTG and MPHI to the interrupt controller */
     sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->mphi), 0,
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_MPHI));
-    sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->dwc2), 0,
-                       qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_DWC2));
+    qdev_connect_gpio_out(DEVICE(&ps->dwc2_irq_splitter), 0,
+                          qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_DWC2));
+
+    /*
+     * The legacy controller's FIQs reach each core through the GIC's
+     * bypass. Its IRQ outputs are left unconnected: that bypass only opens
+     * with the GIC's own signalling off, which no guest of this SoC does.
+     */
+    for (int n = 0; n < BCM283X_NCPUS; n++) {
+        qdev_connect_gpio_out_named(DEVICE(&ps->ic), BCM2838_IC_FIQ_OUT, n,
+                    qdev_get_gpio_in_named(gicdev, "legacy-fiq", n));
+    }
 
     /* Connect DMA 0-6 to the interrupt controller */
     for (int n = GIC_SPI_INTERRUPT_DMA_0; n <= GIC_SPI_INTERRUPT_DMA_6; n++) {

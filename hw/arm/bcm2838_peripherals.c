@@ -59,6 +59,10 @@ static void bcm2838_peripherals_init(Object *obj)
                             TYPE_OR_IRQ);
     object_property_set_int(OBJECT(&s->dma_9_10_irq_orgate), "num-lines", 2,
                             &error_abort);
+
+    object_initialize_child(obj, "bcm2838-ic", &s->ic, TYPE_BCM2838_IC);
+    object_initialize_child(obj, "dwc2-irq-splitter", &s->dwc2_irq_splitter,
+                            TYPE_SPLIT_IRQ);
 }
 
 static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
@@ -196,6 +200,32 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                              BCM2838_MPHI_SIZE);
     memory_region_add_subregion(&s_base->peri_mr, BCM2838_MPHI_OFFSET,
                                 &s->mphi_mr_alias);
+
+    /*
+     * The BCM2711 legacy interrupt controller, over the BCM2835 one the
+     * common code mapped here and over the MPHI alias above: ARMC+0x200 to
+     * +0x3ef are its IRQ and FIQ banks. SWIRQ_SET/CLEAR at +0x3f0 stay with
+     * the MPHI model, which already stands in for them.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ic), errp)) {
+        return;
+    }
+    memory_region_add_subregion_overlap(&s_base->peri_mr, ARMCTRL_IC_OFFSET,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->ic), 0), 1);
+
+    /*
+     * USB is the one source a Pi 4 guest asks for as a FIQ -- RISC OS runs
+     * its DWC host controller from the FIQ handler -- so its line must reach
+     * the legacy controller as well as the GIC. The SoC connects the GIC leg.
+     */
+    qdev_prop_set_uint32(DEVICE(&s->dwc2_irq_splitter), "num-lines", 2);
+    if (!qdev_realize(DEVICE(&s->dwc2_irq_splitter), NULL, errp)) {
+        return;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s_base->dwc2), 0,
+                       qdev_get_gpio_in(DEVICE(&s->dwc2_irq_splitter), 0));
+    qdev_connect_gpio_out(DEVICE(&s->dwc2_irq_splitter), 1,
+                          qdev_get_gpio_in(DEVICE(&s->ic), INTERRUPT_USB));
 
     create_unimp(s_base, &s->clkisp, "bcm2835-clkisp", CLOCK_ISP_OFFSET,
                  CLOCK_ISP_SIZE);

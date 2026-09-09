@@ -12,6 +12,7 @@
 #include "hw/arm/bcm2835_peripherals.h"
 #include "hw/sd/sdhci.h"
 #include "hw/gpio/bcm2838_gpio.h"
+#include "hw/intc/bcm2838_ic.h"
 
 /* SPI */
 /*
@@ -90,6 +91,14 @@ struct BCM2838PeripheralState {
 
     UnimplementedDeviceState asb;
     UnimplementedDeviceState clkisp;
+
+    /*
+     * The BCM2711's own legacy interrupt controller. It sits over the
+     * BCM2835 one in parent_obj, which the common code maps at the same
+     * address and which nothing on this SoC listens to.
+     */
+    BCM2838ICState ic;
+    SplitIRQ dwc2_irq_splitter;     /* USB goes to the GIC and to ic */
 };
 
 struct BCM2838PeripheralClass {
