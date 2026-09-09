@@ -127,12 +127,38 @@ static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s)
               BCM2835_I2C_S_TXW | BCM2835_I2C_S_RXD);
 }
 
+/* The current value of a plain register, with no side effects */
+static uint32_t bcm2835_i2c_shadow(BCM2835I2CState *s, hwaddr reg)
+{
+    switch (reg) {
+    case BCM2835_I2C_C:    return s->c;
+    case BCM2835_I2C_S:    return s->s;
+    case BCM2835_I2C_DLEN: return s->dlen;
+    case BCM2835_I2C_A:    return s->a;
+    case BCM2835_I2C_DIV:  return s->div;
+    case BCM2835_I2C_DEL:  return s->del;
+    case BCM2835_I2C_CLKT: return s->clkt;
+    default:               return 0;
+    }
+}
+
 static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
 {
     BCM2835I2CState *s = opaque;
+    hwaddr reg = addr & ~3;
+    unsigned shift = (addr & 3) * 8;
     uint32_t readval = 0;
 
-    switch (addr) {
+    /*
+     * A sub-word access selects bytes of the 32-bit register. The FIFO is
+     * the exception: only its low byte is the data port, and reading that
+     * pops it, so a read of the upper bytes returns zero without popping.
+     */
+    if (reg == BCM2835_I2C_FIFO && shift) {
+        return 0;
+    }
+
+    switch (reg) {
     case BCM2835_I2C_C:
         readval = s->c;
         break;
@@ -171,16 +197,43 @@ static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
                       "%s: Bad offset 0x%" HWADDR_PRIx "\n", __func__, addr);
     }
 
-    return readval;
+    return readval >> shift;
 }
 
 static void bcm2835_i2c_write(void *opaque, hwaddr addr,
                               uint64_t value, unsigned int size)
 {
     BCM2835I2CState *s = opaque;
+    hwaddr reg = addr & ~3;
+    unsigned shift = (addr & 3) * 8;
     uint32_t writeval = value;
 
-    switch (addr) {
+    if (size < 4) {
+        uint32_t mask = ((1u << (size * 8)) - 1) << shift;
+
+        switch (reg) {
+        case BCM2835_I2C_FIFO:
+            /* Only the low byte is the data port */
+            if (shift) {
+                return;
+            }
+            break;
+        case BCM2835_I2C_S:
+            /*
+             * Write-1-to-clear: a byte the guest did not write clears
+             * nothing, so do not fill it in from the current value.
+             */
+            writeval = (writeval << shift) & mask;
+            break;
+        default:
+            /* A plain register: merge into the bytes not written */
+            writeval = (bcm2835_i2c_shadow(s, reg) & ~mask)
+                       | ((writeval << shift) & mask);
+            break;
+        }
+    }
+
+    switch (reg) {
     case BCM2835_I2C_C:
         /* ST is a one-shot operation; it must read back as 0 */
         s->c = writeval & ~BCM2835_I2C_C_ST;
