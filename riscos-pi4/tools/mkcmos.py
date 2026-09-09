@@ -144,22 +144,28 @@ def unplug_byte(chunk, syms):
     Kernel/s/ModHand indexes UnplugCMOSTable *backwards* from its end, so the
     arithmetic is easy to get wrong; this mirrors the kernel exactly.
     """
-    table = ['Unplug17CMOS', 'Unplug16CMOS', 'Unplug15CMOS', 'Unplug14CMOS',
-             'Unplug13CMOS', 'Unplug12CMOS', 'Unplug11CMOS', 'Unplug10CMOS',
-             'Unplug9CMOS', 'Unplug8CMOS', 'Unplug7CMOS']
+    # UnplugCMOSTable as laid out in the kernel: seventeen (name, offset)
+    # bytes, the last of which sits past the UnplugCMOSTableEnd label and
+    # serves the lowest chunks.
+    table = [('Unplug17CMOS', 0), ('Unplug16CMOS', 0), ('Unplug15CMOS', 0),
+             ('Unplug14CMOS', 0), ('Unplug13CMOS', 0), ('Unplug12CMOS', 0),
+             ('Unplug11CMOS', 0), ('Unplug10CMOS', 0), ('Unplug9CMOS', 0),
+             ('Unplug8CMOS', 0), ('Unplug7CMOS', 0),
+             ('FrugalCMOS', 1), ('FrugalCMOS', 0),
+             ('MosROMFrugalCMOS', 3), ('MosROMFrugalCMOS', 2),
+             ('MosROMFrugalCMOS', 1), ('MosROMFrugalCMOS', 0)]
     first = syms.get('FirstUnpluggableModule', 8)
     if chunk < first:
         raise SystemExit(f'chunk {chunk} is below FirstUnpluggableModule ({first})')
     n = chunk - first
     byte_index, bit = n >> 3, n & 7
-    offset = 16 - byte_index                         # RSBCSS r1, r1, #16
+    offset = (len(table) - 1) - byte_index          # RSBCSS r1, r1, #End-Table
     if not 0 <= offset < len(table):
         raise SystemExit(f'chunk {chunk} is outside the unplug table')
-    name = table[offset]
+    name, extra = table[offset]
     if name not in syms:
         raise SystemExit(f'{name} not found in hdr/CMOS')
-    return syms[name], 1 << bit
-
+    return syms[name] + extra, 1 << bit
 
 def checksum(cmos):
     total = CHECKSUM_SEED + sum(cmos[0:SKIP_FROM]) + sum(cmos[SKIP_TO:CMOS_SIZE])
