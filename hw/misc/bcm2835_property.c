@@ -241,6 +241,32 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
             stl_le_phys(&s->dma_as, value + 12, fbconfig.alpha);
             resplen = 4;
             break;
+        /*
+         * Buffers the firmware holds on the guest's behalf: the official
+         * touchscreen's state page, and the virtual GPIO page that carries
+         * the activity LED on boards where it hangs off the VideoCore rather
+         * than the SoC's own pins. Both are just an address the guest hands
+         * over and can ask for back.
+         */
+        case RPI_FWREQ_FRAMEBUFFER_SET_TOUCHBUF:
+            s->touchbuf = ldl_le_phys(&s->dma_as, value + 12);
+            stl_le_phys(&s->dma_as, value + 12, 0);
+            resplen = 4;
+            break;
+        case RPI_FWREQ_FRAMEBUFFER_GET_TOUCHBUF:
+            stl_le_phys(&s->dma_as, value + 12, s->touchbuf);
+            resplen = 4;
+            break;
+        case RPI_FWREQ_FRAMEBUFFER_SET_GPIOVIRTBUF:
+            s->gpiovirtbuf = ldl_le_phys(&s->dma_as, value + 12);
+            stl_le_phys(&s->dma_as, value + 12, 0);
+            resplen = 4;
+            break;
+        case RPI_FWREQ_FRAMEBUFFER_GET_GPIOVIRTBUF:
+            stl_le_phys(&s->dma_as, value + 12, s->gpiovirtbuf);
+            resplen = 4;
+            break;
+
         case RPI_FWREQ_FRAMEBUFFER_GET_PITCH:
             stl_le_phys(&s->dma_as, value + 12,
                         bcm2835_fb_get_pitch(&fbconfig));
@@ -496,11 +522,13 @@ static const MemoryRegionOps bcm2835_property_ops = {
 
 static const VMStateDescription vmstate_bcm2835_property = {
     .name = TYPE_BCM2835_PROPERTY,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_MACADDR(macaddr, BCM2835PropertyState),
         VMSTATE_UINT32(addr, BCM2835PropertyState),
+        VMSTATE_UINT32(touchbuf, BCM2835PropertyState),
+        VMSTATE_UINT32(gpiovirtbuf, BCM2835PropertyState),
         VMSTATE_BOOL(pending, BCM2835PropertyState),
         VMSTATE_END_OF_LIST()
     }

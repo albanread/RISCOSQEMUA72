@@ -33,6 +33,8 @@ struct BCM2835PropertyState {
     uint32_t board_rev;
     uint32_t addr;
     char *command_line;
+    uint32_t touchbuf;
+    uint32_t gpiovirtbuf;
     bool pending;
 };
 
