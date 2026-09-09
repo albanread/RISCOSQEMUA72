@@ -156,6 +156,8 @@ option('bpf', type : 'feature', value : 'auto',
         description: 'eBPF support')
 option('cocoa', type : 'feature', value : 'auto',
        description: 'Cocoa user interface (macOS only)')
+option('dx11', type : 'feature', value : 'auto',
+       description: 'Direct3D 11 windowed display (Windows only)')
 option('curl', type : 'feature', value : 'auto',
        description: 'CURL block device driver')
 option('gio', type : 'feature', value : 'auto',

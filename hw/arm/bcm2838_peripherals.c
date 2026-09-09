@@ -194,6 +194,23 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->peri_low_mr, BCM2838_PCIE_OFFSET,
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pcie), 0), -1000);
 
+    /*
+     * The GENET Ethernet MAC (BCM54213) is not modelled either. EtherGENET
+     * is driven from the device tree: with no GENET node the module still
+     * installs its Mbuf session and ticker and then calls through a device
+     * pointer that was never filled in -- the data abort kills the whole
+     * boot at the first network client. A node pointed at an unimplemented
+     * device keeps the module happy: reads as zero read as no silicon, the
+     * driver folds and boot carries on.
+     */
+    object_initialize_child(OBJECT(s), "bcm2711-genet", &s->genet,
+                            TYPE_UNIMPLEMENTED_DEVICE);
+    qdev_prop_set_string(DEVICE(&s->genet), "name", "bcm2711-genet");
+    qdev_prop_set_uint64(DEVICE(&s->genet), "size", BCM2711_GENET_SIZE);
+    sysbus_realize(SYS_BUS_DEVICE(&s->genet), &error_fatal);
+    memory_region_add_subregion_overlap(&s->peri_low_mr, BCM2711_GENET_OFFSET,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->genet), 0), -1000);
+
     /* Map MPHI to BCM2838 memory map */
     mphi_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s_base->mphi), 0);
     memory_region_init_alias(&s->mphi_mr_alias, OBJECT(s), "mphi", mphi_mr, 0,

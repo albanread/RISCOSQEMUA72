@@ -62,7 +62,13 @@ static void raspi4_modify_dtb(const struct arm_boot_info *info, void *fdt)
 {
     uint64_t ram_size;
 
-    /* Temporarily disable following devices until they are implemented */
+    /*
+     * Temporarily disable following devices until they are implemented.
+     * GENET would point at the unimplemented-device stand-in in the
+     * peripherals, but no DTB reaches this guest under -kernel, so the node
+     * is moot; EtherGENET is kept out with the CMOS unplug bit or a patched
+     * ROM instead (riscos-pi4/tools/patch-rom-nogenet.py).
+     */
     const char *nodes_to_remove[] = {
         "brcm,bcm2711-pcie",
         "brcm,bcm2711-rng200",

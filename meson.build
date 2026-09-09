@@ -1219,6 +1219,17 @@ cocoa = dependency('appleframeworks',
                    modules: ['Cocoa', 'CoreVideo', 'QuartzCore'],
                    required: get_option('cocoa'))
 
+dx11 = not_found
+if host_os == 'windows'
+  d3d11 = cc.find_library('d3d11', required: get_option('dx11'))
+  dxgi = cc.find_library('dxgi', required: get_option('dx11'))
+  if d3d11.found() and dxgi.found()
+    dx11 = declare_dependency(dependencies: [d3d11, dxgi])
+  elif get_option('dx11').enabled()
+    error('dx11 requires d3d11 and dxgi')
+  endif
+endif
+
 vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
 if vmnet.found() and not cc.has_header_symbol('vmnet/vmnet.h',
                                               'VMNET_BRIDGED_MODE',
@@ -2430,6 +2441,7 @@ config_host_data.set('CONFIG_BSD', host_os in bsd_oses)
 config_host_data.set('CONFIG_FREEBSD', host_os == 'freebsd')
 config_host_data.set('CONFIG_CAPSTONE', capstone.found())
 config_host_data.set('CONFIG_COCOA', cocoa.found())
+config_host_data.set('CONFIG_DX11', dx11.found())
 config_host_data.set('CONFIG_DARWIN', host_os == 'darwin')
 config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))

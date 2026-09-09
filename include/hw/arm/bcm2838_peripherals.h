@@ -64,6 +64,14 @@
 #define BCM2838_PCIE_OFFSET     0x1500000
 #define BCM2838_PCIE_SIZE       0x100000
 
+/*
+ * The GENET Ethernet MAC in the low peripheral range, 0xfd580000 on a real
+ * BCM2711. Not modelled; here so a device-tree-driven driver that probes it
+ * reads zero ("no silicon") instead of taking an external abort.
+ */
+#define BCM2711_GENET_OFFSET    0x580000
+#define BCM2711_GENET_SIZE      0x10000
+
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
 
@@ -81,6 +89,7 @@ struct BCM2838PeripheralState {
     MemoryRegion mphi_mr_alias;
 
     UnimplementedDeviceState pcie;
+    UnimplementedDeviceState genet;
 
     SDHCIState emmc2;
     BCM2838GpioState gpio;

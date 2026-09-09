@@ -86,6 +86,13 @@ The rest are missing devices and unanswered firmware calls:
   an 800×600 monitor, which is what turns the 640×256 fallback into a desktop
 - `hw/arm/bcm2838`: an unimplemented-device stub over the PCIe root complex,
   so probing it reads as "link down" instead of taking an external abort
+- `hw/arm/bcm2838`: the same over the **GENET Ethernet MAC** register block
+  at `0xfd580000` — no MAC is modelled, but a driver that probes it must
+  read "no silicon", not abort
+- `ui/dx11.c`, `ui/dx11.cpp`: the **D3D 11 windowed display** (`-display
+  dx11`), Windows-only — a Win32 window and flip-model swap chain on the
+  main thread, QEMU's loop on a worker, joined at an `extern "C"` boundary
+  because QEMU's headers are not C++-parseable
 - `hw/intc/bcm2838_ic`: the **BCM2711 legacy interrupt controller** — the
   per-core IRQ and FIQ banks at ARMC+0x200 from the datasheet — and the DWC2
   line split so that USB reaches it as well as the GIC. RISC OS runs its USB
@@ -163,6 +170,7 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -device usb-kbd,bus=usb-bus.0,port=1.1 \
     -device usb-mouse,bus=usb-bus.0,port=1.2 \
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 \
+    -display dx11 \
     -qmp tcp:127.0.0.1:4455,server,nowait
 ```
 
@@ -190,6 +198,24 @@ the HAL blanks the settings and the machine boots unconfigured; without
 `--unplug 106` the EtherGENET driver dereferences a null pointer and RISC OS
 prints a data abort on its own console. `mkcmos.py` derives both the blob and
 the address to load it at from RISC OS's own headers and ROM image.
+
+If you cannot lay hands on the RISC OS sources that `mkcmos.py` needs,
+`riscos-pi4/tools/patch-rom-nogenet.py` achieves the same by patching the
+ROM image instead of the CMOS: EtherGENET's init becomes a no-op and its
+service/SWI entries are removed. Boot `-kernel RISCOS-nogenet.IMG` and the
+rest of this page works unchanged. The failure without either is loud and
+specific — `Error: DataAbort:Abort on data transfer at &FC3FB800` — which
+is EtherGENET calling a method on a device it never found, because the
+GENET MAC is not modelled. The register block it would probe, `0xfd580000`,
+is covered by an unimplemented-device stub so a future driver reads "no
+silicon" there instead of an external abort.
+
+`-display dx11` is the fork's own Windows display (Sprint U0): a Win32
+window on the main thread with a D3D11 flip-model swap chain clearing it
+at vsync, QEMU's main loop running on a worker thread. It shows a blank
+surface for now — the guest framebuffer is decoded onto it in U1 — but the
+boot behind it is pixel-identical to `-display none`, and closing the
+window shuts the emulator down cleanly.
 
 `-cpu cortex-a72,aarch64=off` is the load-bearing part. `-M raspi4b` hard-codes
 its CPU, so it is widely assumed `-cpu` does nothing there — but the *property*

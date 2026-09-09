@@ -54,6 +54,24 @@ closing the window shuts QEMU down cleanly.
 *Done when:* RISC OS boots behind the (blank) window and the boot timeline
 over QMP matches `-display none` — the UI thread costs the emulation nothing.
 
+**Done.** The display lives in `ui/dx11.c` (QEMU side, C) and `ui/dx11.cpp`
+(window + D3D11, C++), split at an `extern "C"` boundary because QEMU's
+headers are not C++-parseable. Verified on the 5.30 ROM with the ROOL card:
+the desktop is in the framebuffer at t+30s behind the window, and a
+headless `-display none` run with the same devices is pixel-identical
+(84 of 480,000 pixels differ — the clock). Posting `WM_CLOSE` to the window
+ends the process in under a second.
+
+Getting there needed the boot unblocked first: the CMOS blob in use had
+been built without `--unplug 106`, so EtherGENET started, found no GENET
+hardware (none is modelled, and no DTB reaches a `-kernel` guest), and
+aborted at `&FC3FB800` — the data abort that used to be the whole screen.
+`tools/patch-rom-nogenet.py` is the source-free equivalent of the unplug
+bit until GENET is modelled; the machine also gained an
+unimplemented-device stand-in at GENET's register block (`0xfd580000`),
+same shape as the PCIe one, so a future driver that probes it reads "no
+silicon" rather than an external abort.
+
 ## U1 — the framebuffer, decoded on the GPU (3–4 days)
 
 The fb config accessor and generation counter in `bcm2835_fb`; raw upload

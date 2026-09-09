@@ -1511,6 +1511,8 @@
 #
 # @cocoa: The Cocoa user interface.
 #
+# @dx11: The Direct3D 11 windowed user interface (Windows).
+#
 # @spice-app: Set up a Spice server and run the default associated
 #     application to connect to it.  The server will redirect the
 #     serial console and QEMU monitors.  (Since 4.0)
@@ -1528,6 +1530,7 @@
     { 'name': 'egl-headless', 'if': 'CONFIG_OPENGL' },
     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
+    { 'name': 'dx11', 'if': 'CONFIG_DX11' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
     { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
   ]
