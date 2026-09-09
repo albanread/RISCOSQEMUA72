@@ -32,7 +32,8 @@ U0 → U1 → U2 ────────────► a usable desktop applic
                  │                        ▲
                  └─► 6 host files ────────┼─► 13 blitter, sprites, pointer
                                           │
-U3, U4 and 9 slot in wherever a week has room; 11 and 12 come last.
+U3, U4 and 9 slot in wherever a week has room; 14 reviews 9 and 13
+together; 11 and 12 come last.
 ```
 
 U0–U2 first because everything after them is used through that window. Then
@@ -215,6 +216,52 @@ change per measurement.
 *Done when:* every benchmark has a hardware number, an emulator number and a
 ratio in the README, and at least one measured stall is gone.
 
+## 14 — performance analysis and review (4–5 days)
+
+Sprint 9 measures and fixes what it finds; this one steps back and does
+the analysis properly, once the window, the blitter and the snapshots
+exist, because they change what the machine spends its time on. It is a
+report before it is a change.
+
+**Tooling first, scripted so it can be re-run.** The instruction-count
+plugin already built (`tests/tcg/plugins/libinsn`) for the retired rate;
+`libhotblocks` and `libhotpages` from the same directory for which guest
+code and pages are hot, mapped to ROM modules with the chain table the
+profiler already uses; the PC sampler from `DESIGN.md` §12 for the
+wall-clock share by module; `-d` trace counts per device for the MMIO trap
+rate; host-side profiling of the process (ETW through Windows Performance
+Recorder, or VTune) for where the host threads spend their time — TCG
+translation versus execution, the memory dispatch, the BQL, the main loop.
+
+**The analysis**, each with a number and a share of wall clock or of CPU:
+
+- guest instruction mix and the TB translation rate (how much is
+  re-translation after TB flushes);
+- the TLB-walk share — the 16 % seen in one profile is either real or an
+  artefact, and it matters which;
+- MMIO trap rate per device, and the cost per trap: the system timer,
+  `GINTSTS`, the SD buffer port, the framebuffer;
+- interrupt rates — the 1 kHz SOF FIQ and its hand-off IRQ, the SD
+  interrupts, the tick — and the guest time each handler takes;
+- the millisecond stall per SD block from §12, run to ground with the host
+  profiler now that the trace has said where to look;
+- main-loop wake-ups and timer deadlines, and the BQL's contention profile
+  between the UI, the main loop and core 0;
+- the UI thread's frame cost, and the blitter's gains from Sprint 13,
+  measured against the same Wimp workloads before and after;
+- the whole against the Pi 4 numbers from Sprint 9, per benchmark.
+
+**The review.** A written `PERF.md`: the method, the numbers, the top five
+costs ranked by what they take, each with a proposed fix and the gain to
+expect, and an honest answer to the question the project started with —
+where TCG's ceiling is for this workload, and whether a purpose-built
+recompiler for a single Cortex-A72 running RISC OS would beat it by enough
+to be worth building. Reviewed together before anything in it is started.
+
+*Done when:* the top five costs are quantified with their share of the
+whole, each has a fix and an expected gain written down, the scripts
+reproduce the numbers on a clean checkout, and the review has happened.
+
 ## 10 — record and replay (3 days)
 
 `-icount shift=auto,rr=record` with the card behind an overlay and the
@@ -252,7 +299,7 @@ one-page quick start that says where to get the ROM and the image and what
 - host files and the developer loop — 6, 7
 - the debugger catches a fault by symbol — 8
 - the pointer composited and sprites blitted by the host — 13
-- speed measured against hardware, and the gap understood — 9
+- speed measured against hardware, and the gap understood — 9, 14
 
 *Done when:* the checklist has no gaps, and the badge turns green.
 
@@ -261,6 +308,6 @@ one-page quick start that says where to get the ROM and the image and what
 ## Days, added up
 
 U0–U4: 12–14 days. Sprints 5–8: 15–20. Sprint 13: 5–8. Sprint 9 runs
-alongside. 10–12: 8–9. About nine working weeks for one person doing
-nothing else, which is not how it will go; the order above is what matters,
-not the arithmetic.
+alongside; 14 takes 4–5 after 9 and 13. 10–12: 8–9. About ten working
+weeks for one person doing nothing else, which is not how it will go; the
+order above is what matters, not the arithmetic.
