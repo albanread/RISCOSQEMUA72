@@ -30,7 +30,8 @@ U0 → U1 → U2 ────────────► a usable desktop applic
                  │
                  ├─► 5 snapshots ──► 7 developer loop ──► 8 debugger ──► 10 record/replay
                  │                        ▲
-                 └─► 6 host files ────────┘
+                 └─► 6 host files ────────┼─► 13 blitter, sprites, pointer
+                                          │
 U3, U4 and 9 slot in wherever a week has room; 11 and 12 come last.
 ```
 
@@ -130,6 +131,50 @@ Two routes, in order of cheapness:
 desktop within a second and without a reboot, and a `*Cat` typed in the
 guest appears on the host.
 
+## 13 — the blitter: render ops, sprites and the pointer on the host (5–8 days)
+
+RISC OS draws with a blitter it does not have. `OS_SpriteOp` plots go
+through the `SpriteV` vector to SpriteExtend, which does them in ARM code;
+rectangle copies and fills go through `GraphicsV_Render`, a hook the kernel
+already routes to the display driver for acceleration — `BCMVideo` hands
+them to the GPU on real hardware; and the pointer, RISC OS's one true
+hardware sprite, is a dispmanx overlay on real hardware and, because this
+fork declines VCHIQ, is currently painted into the framebuffer by the
+kernel. All three are guest-side work that the host can do at memory speed,
+and all three reach the host the same way: the VM module of Sprint 6 and
+its doorbell. Needs 6 and U1.
+
+1. **The pointer, composited.** The module claims GraphicsV's pointer calls
+   — shape (up to 32×32, 2 bpp, three colours and transparent, with its
+   hot spot) and position — and passes them to the host. The UI keeps the
+   shape as a small texture and draws it in the output pass, on top of the
+   scaled frame, at the host's resolution: sharp at any scale, never in the
+   framebuffer, and moving it writes no guest memory at all.
+2. **Render ops.** `GraphicsV_Render` copies and fills executed by the host
+   directly in guest RAM — SIMD on the host CPU first, which is already a
+   hundred times the emulated rate; the compute-shader version follows once
+   the screen has a GPU-side owner (below).
+3. **Sprites.** `SpriteV` claimed ahead of SpriteExtend for the plot reasons
+   that matter — `PlotSpriteUserCoords`, `PutSpriteScaled`, the masked and
+   ColourTrans-translated variants. The host reads the sprite, its mask and
+   the translation table from guest memory and blits into the framebuffer.
+   Any reason or format the host does not handle falls through to
+   SpriteExtend, so correctness never depends on coverage.
+
+The "graphics kernel" itself — every blit as a shader, the screen living
+on the GPU — is the step after these, and it has a precondition this sprint
+makes explicit: the destination stays in guest RAM for as long as the
+kernel's VDU drivers, the Font Manager and applications draw there too,
+because a GPU-resident screen needs every writer to go through the host.
+Sprites and render ops are the bulk of the pixels; moving them is what
+makes the rest possible.
+
+*Done when:* the pointer is drawn by the UI and absent from the
+framebuffer; dragging a window across the Pinboard backdrop, and scrolling
+a NetSurf page, show a measured speed-up with sprites and render ops
+offloaded; and a pixel-compare test shows every fall-through case producing
+exactly SpriteExtend's output.
+
 ## 7 — the developer loop: roscc on the target (3–4 days)
 
 `compiler/tools/run_on_emu.py` gains a QEMU back end: build on the host,
@@ -206,6 +251,7 @@ one-page quick start that says where to get the ROM and the image and what
 - desktop in under a second — Sprint 5
 - host files and the developer loop — 6, 7
 - the debugger catches a fault by symbol — 8
+- the pointer composited and sprites blitted by the host — 13
 - speed measured against hardware, and the gap understood — 9
 
 *Done when:* the checklist has no gaps, and the badge turns green.
@@ -214,6 +260,7 @@ one-page quick start that says where to get the ROM and the image and what
 
 ## Days, added up
 
-U0–U4: 12–14 days. Sprints 5–8: 15–20. Sprint 9 runs alongside. 10–12: 8–9.
-About eight working weeks for one person doing nothing else, which is not
-how it will go; the order above is what matters, not the arithmetic.
+U0–U4: 12–14 days. Sprints 5–8: 15–20. Sprint 13: 5–8. Sprint 9 runs
+alongside. 10–12: 8–9. About nine working weeks for one person doing
+nothing else, which is not how it will go; the order above is what matters,
+not the arithmetic.
