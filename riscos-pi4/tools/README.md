@@ -1,6 +1,6 @@
-# tools/pi4 — reproducing the QEMU Pi 4 findings
+# tools — reproducing the findings
 
-Supporting material for [`docs/PI4-QEMU.md`](../../docs/PI4-QEMU.md). Nothing
+Supporting material for [`DESIGN.md`](../DESIGN.md). Nothing
 here is part of a build; it exists so the measurements in that document can be
 re-run.
 
