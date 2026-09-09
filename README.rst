@@ -4,11 +4,12 @@ RISC OS 5 on an emulated Raspberry Pi 4 -- a fork
 
 .. image:: https://img.shields.io/badge/RECENT_EXPERIMENT-c1121f?style=for-the-badge&labelColor=c1121f
 
-**This is a fork of QEMU, not QEMU itself.** It boots RISC OS 5.30 on an
-emulated Cortex-A72 in 32-bit mode -- ``-M raspi4b`` with the CPU in AArch32 --
-as far as its supervisor prompt, with a framebuffer on screen.
+**This is a fork of QEMU, not QEMU itself.** It boots RISC OS 5.30 to the
+desktop on an emulated Cortex-A72 in 32-bit mode -- ``-M raspi4b`` with the CPU
+in AArch32.
 
-It is days old. There is no keyboard and no disc, and everything is in flux.
+It is days old. There is no disc, keyboard input is not yet proven, and
+everything is in flux.
 
 See `riscos-pi4/README.md <riscos-pi4/README.md>`_ for what it does, what it
 changes in QEMU, how to build it and the licence position, and
