@@ -208,7 +208,16 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
         &s_base->peri_mr, GPIO_OFFSET,
         sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->gpio), 0));
 
-    object_property_add_alias(OBJECT(s), "sd-bus", OBJECT(&s->gpio), "sd-bus");
+    /*
+     * Put the card on EMMC2. A BCM2711 keeps its removable SD slot on the
+     * second Arasan controller at 0x340000; the GPIO block's mux only ever
+     * moves a card between the legacy EMMC and the SDHOST, neither of which
+     * a Pi 4 guest uses for the card -- RISC OS marks the legacy one as the
+     * integrated WiFi slot and never registers SDHOST at all. Without this
+     * the card is one controller over from where the guest looks, and the
+     * drive reads as permanently empty.
+     */
+    object_property_add_alias(OBJECT(s), "sd-bus", OBJECT(&s->emmc2), "sd-bus");
 
     /* BCM2838 RPiVid ASB must be mapped to prevent kernel crash */
     create_unimp(s_base, &s->asb, "bcm2838-asb", BRDG_OFFSET, 0x24);
