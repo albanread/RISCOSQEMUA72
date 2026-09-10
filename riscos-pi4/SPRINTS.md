@@ -103,8 +103,13 @@ Verified on the pristine 5.30 ROM with the unplug CMOS: the 800×600
 desktop renders behind vsync (and in a resized 896×614 window — the scaler
 stretches any mode to the client area); the screenshot decodes to exactly
 the QMP screendump's pixels; closing the window exits the process in
-about a second. A 256-colour mode and a mid-session mode change wait for
-U2's keyboard to drive them.
+about a second.  The two mode checks waited for U2's keyboard and are now
+done with it: `*SCREENMODE 800x600x256` (and the user's own Display
+Manager) brought up a 256-colour desktop — `pipeline built: gen 16,
+800×600, pitch 800, bpp 8` — with the palette decoder confirmed by eye,
+and the same session moved 32bpp → 8bpp → 32bpp again, the pipeline
+rebuilding on each generation bump without the window so much as
+flickering.
 
 ## U2 — keyboard and mouse (3 days)
 
