@@ -863,3 +863,57 @@ earlier runs was the test harness waiting at fixed marks.
   carry them: the disc is an image on the host, rewritten between runs.
 - The RISC OS side has now had every device it asked for; what it does with
   the bandwidth is the next question, and that is the JIT.
+
+## 13. The timers RISC OS needs, and the thread that provides them
+
+RISC OS is interrupt-driven: nothing in the desktop polls a clock, everything
+waits for a signal. On the Pi those signals come from three blocks in the SoC
+and from the GPU firmware. Rather than model those blocks, the fork provides
+the signals from one host thread, `system/hrtimer.c`: a list of deadlines on
+the virtual clock, waited for with a high-resolution waitable timer on
+Windows (100 ns units, honoured to tens of microseconds) and fired with the
+BQL held. The registers RISC OS writes to acknowledge them stay as thin
+latches that only record what was written.
+
+| Signal | Who waits for it in the guest | How the guest sees it | Rate | Provided by |
+|---|---|---|---|---|
+| Centisecond ticker (TickerV, HAL timer 0) | Kernel: OS_ReadMonotonicTime, callbacks, Wimp polling, SDIODriver's state machine | System timer compare 1 match, VC IRQ 1 (compare 3 is HAL timer 1); acked in CS; the HAL re-arms by adding the period to the compare value | 100 Hz | one thread deadline per compare write, `hw/timer/bcm2835_systmr.c` |
+| Microsecond counter (HAL_CounterRead) | Kernel, for time between ticks | System timer CLO/CHI, free-running 1 MHz | read on demand | the virtual clock; no thread needed |
+| Vertical sync | BCMVideo VSync_Handler, then GraphicsV VSync into the kernel: pointer movement via PointerV, VsyncV, OS_Byte 19, cursor flash | SMI interrupt, VC IRQ 48 (GIC SPI 112), raised by the GPU firmware every frame; acked by writing SMI CS | 30 Hz by default, `-display dx11,vsync=N` | the generator on the thread, `hw/misc/bcm2835_vsyncgen.c`, into the SMI latch `hw/misc/bcm2835_smi.c` |
+| Half-frame update pulse | BCMVideo Timer_Handler, then MergeUpdate: palette, scroll offset, gamma and blanking to the GPU | ARM timer interrupt, ARMC IRQ 0 (GIC SPI 32); BCMVideo arms it after every vsync for half the measured interval; acked in IRQ clear | once per frame, mid-frame, while armed | the generator, into the ARM timer latch `hw/timer/bcm2835_armtimer.c`; ignored unless BCMVideo has enabled the timer |
+| Fake vsync, the fallback | Kernel NewIRQs: when the driver reports no vsync interrupt, every other tick | derived from the ticker | 50 Hz | not needed once BCMVideo's start-up test has seen more than three SMI interrupts in 20 cs |
+| USB frame (SOF) | DWCDriver's FIQ state machine, HID polling | DWC2 frame interrupt | 1 kHz | still QEMU's dwc2 model on the main loop; the next candidate for the thread |
+
+BCMVideo decides at start-up: it claims the SMI interrupt, counts arrivals for
+20 centiseconds, and keeps the real vsync only if more than three came. A rate
+below about 20 Hz therefore puts it back on the ticker fallback. Once on the
+real vsync it also uses the ARM timer's free-running counter to measure the
+frame and arms the timer for half of it, so the half-frame pulse and the
+counter are both needed for its screen updates to keep flowing.
+
+## 14. Video acceleration: what RISC OS asks the video driver to do
+
+RISC OS 5 offers the video driver three render operations through GraphicsV
+reason 13 (Render). The kernel tries them before plotting in software; the
+driver answers Complete or NotComplete, and the flags in r0 ask it to wait
+for the hardware to go idle so the kernel can safely touch the screen next.
+On the Pi, BCMVideo implements only the copy, with the DMA controller. These
+are the operations Sprint 13 (blitter and pointer) will take onto the host;
+the table records what each one is, who issues it, and what happens today.
+
+| Operation (r1) | Issued by the kernel from | Parameters (r2 block) | BCMVideo on hardware | QEMU today | Sprint 13 |
+|---|---|---|---|---|---|
+| CopyRectangle (1) | OS_Plot block copy and move (`vdugrafd`): Wimp_BlockCopy, window scrolling, window dragging; text-window scroll (`vduwrch` TryCopyCommon) | srcL, srcB, dstL, dstB, width-1, height-1, in pixels | DMA control block on the channel DMAManager gave it: TI = 2D mode, source and destination incrementing, 128-bit wide, burst length from the HAL; TXFR_LEN = (height-1) << 16 | width in bytes; STRIDE = pitch minus width for both ends. Three cases: destination before source, forward from the top row; source before destination with rows not overlapping, from the bottom row upwards with negative strides; rows overlapping, refused, software | `hw/dma/bcm2835_dma.c` moves each row whole with any width and either stride sign; the trace point `bcm2835_dma_2d` counts them | the same copy done by the host; the framebuffer must still end up updated, since RISC OS reads it back |
+| FillRectangle (2) | OS_Plot rectangle fill (`vdugrafa`): window backgrounds and borders; CLS and clear text window (`vduwrch`) | left, bottom, right, top, pointer to the colour block | not implemented: NotComplete, the kernel fills in software | software in the guest | needs a driver-side implementation; BCMVideo refuses it, so either a soft-loaded GraphicsV layer or a ROM change |
+| NOP (0) | before software plotting, with the sync flags, so a pending copy lands first | none | waits for the DMA channel to go idle | copies complete synchronously, always idle | same |
+
+Sync flags in r0: bit 0 waits if the operation was done, bit 1 waits if it
+was not; the kernel passes both.
+
+Before the DMA fix every copy was refused: QEMU's model treated the 128-bit
+width bit as unsupported, flagged an error and moved nothing, while BCMVideo
+reported Complete and the Wimp redrew only the newly exposed strips. That
+was the partly drawn desktop. One drag of the NetSurf window by 120 by 140
+pixels is about fourteen copies of 621 by up to 475 pixels, all backwards,
+on DMA channel 2; a session's boot into NetSurf makes about fifty more of
+512 to 1144 bytes wide.

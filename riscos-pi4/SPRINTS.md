@@ -173,6 +173,12 @@ guest appears on the host.
 
 ## 13 — the blitter: render ops, sprites and the pointer on the host (5–8 days)
 
+The render operations RISC OS actually issues, who issues them, and what
+they cost today are tabulated in DESIGN.md section 14. The DMA copy path
+described there, `hw/dma/bcm2835_dma.c` moving rows whole, is the baseline
+this sprint replaces, and its trace point `bcm2835_dma_2d` is how to count
+the copies a workload makes.
+
 RISC OS draws with a blitter it does not have. `OS_SpriteOp` plots go
 through the `SpriteV` vector to SpriteExtend, which does them in ARM code;
 rectangle copies and fills go through `GraphicsV_Render`, a hook the kernel
