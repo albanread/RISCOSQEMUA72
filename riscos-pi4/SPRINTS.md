@@ -117,6 +117,37 @@ absolute pointer.
 *Done when:* typing at the RISC OS command line and dragging a window both
 feel like the real thing, and the host gets its pointer back on demand.
 
+**Done.** It ended up absolute, not relative, and one guest-visible QEMU
+bug had to die first:
+
+- The keyboard is scan codes through `qemu_input_map_atset1_to_linux`
+  (the extended-bit + scan form), delivered under the BQL like cocoa's
+  `with_bql`.  Verified by typing at the F12 CLI: `*HELP` prints its
+  listing, `*BASIC` runs, and an immediate-mode `MOUSE x,y,b:PRINT`
+  became the readback instrument for the pointer work.
+- `usb-tablet` it is: RISC OS's USBDriver claims absolute HID devices
+  (`UMS_ABS`), but its attach path treats a failed SET_PROTOCOL as fatal
+  and QEMU stalled that request for tablets — so the pointer froze at
+  the screen corner.  Accepting SET/GET_PROTOCOL for `HID_TABLET`
+  (`cc932f6a7f`) fixed it; QMP-injected absolutes then map exactly
+  (8000,4000 of 0..32767 reads back 390,1058 on the 1600×1200-unit
+  screen).
+- The window sends absolute coordinates on a `usb-tablet`: ungrabbed,
+  the host cursor's client position scaled to the guest screen, so the
+  two arrows coincide — the reported offset was relative deltas
+  accumulating drift.  Grabbed (a click into the window captures the
+  pointer, Ctrl+Alt+G or focus loss releases), host deltas accumulate
+  into a virtual position still sent absolutely: relative feel, no
+  drift, and release re-aligns the arrows.  Confirmed by the user on
+  the desktop.
+- The mouse readback channel (`MOUSE`) verified buttons too: Select
+  held reports 4.  A synthetic click on the icon bar's disc icon opened
+  the SDFS Filer window.
+
+U2's one late lesson is recorded under U0's window instead: a flip-model
+`Present(1)` parked the UI thread forever once Windows ghosted the
+window; the chain is waitable now and presents only on a free slot.
+
 ## U3 — the rest of the formats, and polish (2–3 days)
 
 16 bpp RGB565, 24 bpp and the packed low-depth decoders; sharp-bilinear and
