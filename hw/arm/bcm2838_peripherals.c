@@ -195,13 +195,11 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pcie), 0), -1000);
 
     /*
-     * The GENET Ethernet MAC (BCM54213) is not modelled either. EtherGENET
-     * is driven from the device tree: with no GENET node the module still
-     * installs its Mbuf session and ticker and then calls through a device
-     * pointer that was never filled in -- the data abort kills the whole
-     * boot at the first network client. A node pointed at an unimplemented
-     * device keeps the module happy: reads as zero read as no silicon, the
-     * driver folds and boot carries on.
+     * The GENET Ethernet MAC is not modelled either. RISC OS's HAL registers
+     * it as a device regardless, and EtherGENET reads its revision register
+     * first thing; against unmapped memory that is an external abort. An
+     * unimplemented device reads as zero, which the driver takes as an
+     * unknown controller and declines.
      */
     object_initialize_child(OBJECT(s), "bcm2711-genet", &s->genet,
                             TYPE_UNIMPLEMENTED_DEVICE);

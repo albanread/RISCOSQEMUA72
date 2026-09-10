@@ -65,11 +65,12 @@
 #define BCM2838_PCIE_SIZE       0x100000
 
 /*
- * The GENET Ethernet MAC in the low peripheral range, 0xfd580000 on a real
- * BCM2711. Not modelled; here so a device-tree-driven driver that probes it
- * reads zero ("no silicon") instead of taking an external abort.
+ * The GENET Ethernet MAC in the low peripheral range: 0xfd580000 on a
+ * BCM2711, which RISC OS's HAL hands its driver as a device at that address
+ * (HAL_BCM2835 hdr/BCM2835: GENET_Base * &01580000). Not modelled; here so
+ * a driver that probes it reads zero instead of taking an external abort.
  */
-#define BCM2711_GENET_OFFSET    0x580000
+#define BCM2711_GENET_OFFSET    0x1580000
 #define BCM2711_GENET_SIZE      0x10000
 
 #define BCM2838_MPHI_OFFSET     0xb200
