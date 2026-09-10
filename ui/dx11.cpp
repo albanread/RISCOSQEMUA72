@@ -832,9 +832,10 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     fb.pitch = v->pitch;
     fb.rows = v->rows;
     fb.up = true;
-    dx11_log("pipeline built: gen %u, %ux%u, pitch %u, bpp %u, pan %u,%u",
+    dx11_log("pipeline built: gen %u, %ux%u, pitch %u, bpp %u, pan %u,%u, "
+             "base 0x%llx",
              v->generation, v->xres, v->yres, v->pitch, v->bpp,
-             v->xoffset, v->yoffset);
+             v->xoffset, v->yoffset, (unsigned long long)v->gbase);
     return true;
 }
 

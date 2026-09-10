@@ -86,7 +86,12 @@ uint32_t bcm2835_fb_get_config(BCM2835FBState *s, BCM2835FBConfig *out);
 static inline uint32_t bcm2835_fb_get_pitch(BCM2835FBConfig *config)
 {
     uint32_t xres = MAX(config->xres, config->xres_virtual);
-    return xres * (config->bpp >> 3);
+    /*
+     * Round up to whole bytes: 1, 2 and 4 bpp lines are byte-packed.
+     * (xres * (bpp >> 3) gave the sub-byte depths a zero pitch and a
+     * zero-sized framebuffer with it.)
+     */
+    return (xres * config->bpp + 7) >> 3;
 }
 
 /**
@@ -106,5 +111,14 @@ static inline uint32_t bcm2835_fb_get_size(BCM2835FBConfig *config)
  * adjusts it if necessary.
  */
 void bcm2835_fb_validate_config(BCM2835FBConfig *config);
+
+/**
+ * bcm2835_fb_synth_mode: force the fb into a mode no guest asked for, with
+ * a deterministic test pattern in the buffer -- the debug command behind
+ * "synthfb", so the display pipeline's decoders can be exercised for
+ * depths and sizes this guest's OS never programs.
+ */
+void bcm2835_fb_synth_mode(BCM2835FBState *s, uint32_t bpp,
+                           uint32_t xres, uint32_t yres);
 
 #endif

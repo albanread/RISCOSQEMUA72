@@ -1865,6 +1865,23 @@ SRST
   List event channels in the guest
 ERST
 
+    {
+        .name       = "synthfb",
+        .args_type  = "bpp:i,xres:i?,yres:i?",
+        .params     = "bpp [xres [yres]]",
+        .help       = "force the framebuffer to bpp bits per pixel at xres x yres, with a test pattern",
+        .cmd        = hmp_synthfb,
+    },
+
+SRST
+``synthfb`` *bpp* [*xres* [*yres*]]
+  Force the bcm2835 framebuffer into *bpp* bits per pixel (1, 2, 4, 8, 16,
+  24 or 32) at *xres* by *yres* (default 640x480) and fill it with a
+  deterministic test pattern, palette ramp included for the indexed depths.
+  A debug command for exercising display decoders on formats the guest OS
+  never programs; xres defaults apply when omitted.
+ERST
+
 HXCOMM *** MUST BE LAST ENTRY **
     {
         .name       = "info",

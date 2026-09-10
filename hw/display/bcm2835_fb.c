@@ -321,6 +321,61 @@ static void bcm2835_fb_mbox_push(BCM2835FBState *s, uint32_t value)
     bcm2835_fb_reconfigure(s, &newconf);
 }
 
+/*
+ * Debug: force a mode of any depth and size, then fill the buffer with a
+ * pattern whose bytes are a pure function of their offset, and (for the
+ * indexed depths) a palette ramp at the VideoCore RAM base.  The window's
+ * decoders can then be checked against the pattern's expected image for
+ * formats no guest OS programs -- tools/synthfb-test.py does the arithmetic.
+ *
+ * Buffer byte i = (i + (i >> 8)) & 0xff; palette entry p is
+ * R=p, G=p*3&255, B=p*7&255, stored little-endian 0x00BBGGRR.
+ */
+void bcm2835_fb_synth_mode(BCM2835FBState *s, uint32_t bpp,
+                           uint32_t xres, uint32_t yres)
+{
+    BCM2835FBConfig newconf;
+    uint32_t pitch, len, i;
+    uint8_t *buf;
+
+    newconf = s->config;
+    newconf.xres = xres;
+    newconf.yres = yres;
+    newconf.xres_virtual = xres;
+    newconf.yres_virtual = yres;
+    newconf.xoffset = 0;
+    newconf.yoffset = 0;
+    newconf.bpp = bpp;
+    newconf.base = s->vcram_base + BCM2835_FB_OFFSET;
+    newconf.pixo = 1;               /* RGB order, no swap in the decoder */
+    bcm2835_fb_validate_config(&newconf);
+    bcm2835_fb_reconfigure(s, &newconf);
+
+    pitch = bcm2835_fb_get_pitch(&s->config);
+    len = pitch * s->config.yres;
+    buf = g_malloc(len);
+    for (i = 0; i < len; i++) {
+        buf[i] = (i + (i >> 8)) & 0xff;
+    }
+    address_space_rw(&s->dma_as, s->config.base, MEMTXATTRS_UNSPECIFIED,
+                     buf, len, true);
+    g_free(buf);
+
+    if (bpp <= 8) {
+        uint8_t pal[256 * 4];
+        for (i = 0; i < 256; i++) {
+            pal[i * 4 + 0] = i;
+            pal[i * 4 + 1] = (i * 3) & 0xff;
+            pal[i * 4 + 2] = (i * 7) & 0xff;
+            pal[i * 4 + 3] = 0;
+        }
+        address_space_rw(&s->dma_as, s->vcram_base, MEMTXATTRS_UNSPECIFIED,
+                         pal, sizeof(pal), true);
+    }
+
+    s->invalidate = true;
+}
+
 static uint64_t bcm2835_fb_read(void *opaque, hwaddr offset, unsigned size)
 {
     BCM2835FBState *s = opaque;

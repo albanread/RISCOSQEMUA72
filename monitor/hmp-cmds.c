@@ -40,6 +40,7 @@
 #include "system/memory.h"
 #include "system/system.h"
 #include "disas/disas.h"
+#include "hw/display/bcm2835_fb.h"
 
 /* Please update hmp-commands.hx when adding or changing commands */
 static HMPCommand hmp_info_cmds[] = {
@@ -139,6 +140,21 @@ void hmp_quit(Monitor *mon, const QDict *qdict)
 void hmp_stop(Monitor *mon, const QDict *qdict)
 {
     qmp_stop(NULL);
+}
+
+void hmp_synthfb(Monitor *mon, const QDict *qdict)
+{
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    int bpp = qdict_get_int(qdict, "bpp");
+    int xres = qdict_get_try_int(qdict, "xres", 640);
+    int yres = qdict_get_try_int(qdict, "yres", 480);
+
+    if (!obj) {
+        monitor_printf(mon, "no bcm2835 framebuffer in this machine\n");
+        return;
+    }
+    bcm2835_fb_synth_mode(BCM2835_FB(obj), bpp, xres, yres);
+    monitor_printf(mon, "synthfb: %dx%d, %d bpp\n", xres, yres, bpp);
 }
 
 void hmp_sync_profile(Monitor *mon, const QDict *qdict)

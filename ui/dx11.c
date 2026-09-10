@@ -119,6 +119,7 @@ int dx11_glue_fb_view(Dx11FbView *out)
     out->pixo = cfg.pixo;
     out->rows = rows;
     out->generation = view.generation;
+    out->gbase = cfg.base;
     out->fb = view.fb_ptr;
     out->palette = view.pal_ptr;
     return 1;
