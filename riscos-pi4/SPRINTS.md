@@ -289,9 +289,42 @@ Two routes, in order of cheapness:
    factors for the UI, clipboard, and time sync. The ROM-splice recipe in
    `DESIGN.md` stays for disc-less boots.
 
-*Done when:* a file written on the host is readable from the RISC OS
-desktop within a second and without a reboot, and a `*Cat` typed in the
-guest appears on the host.
+   **This is the plan.** The design is `FSDESIGN.md`: the `vmchannel`
+   device (synchronous doorbell, request blocks in guest RAM, no queues,
+   trivially snapshot-safe) and the `HostFS` module (roscc/Mojo, the
+   mojomod pattern, soft-loaded from the card).  Sprint 6 splits:
+
+   **6A — the vmchannel device (1–2 days).**  Find the hole in the Pi 4
+   map the HAL does not name (candidate window `0xfd400000`, survey
+   first), implement the device with PING and the file-command set,
+   `root=` property with canonicalisation clamped to it, and smoke it
+   bare-metal: a bench-style guest that rings the doorbell and prints the
+   echo over the PL011.
+
+   *Done when:* the bare-metal guest pings the device and gets its bytes
+   back over the serial port.
+
+   **6B — the HostFS module (2–3 days).**  Module on the mojomod
+   pattern, FS registration (`HostFS`, unclaimed number), the FSEntry
+   points the desktop exercises, metadata synthesised from host mtime,
+   `*HostFSPing` for the CLI.  Soft-load from `!Boot.Choices.Boot.PreDesk`
+   on the card image.
+
+   *Done when:* `*Cat HostFS:$` lists the files seeded in the root and a
+   file saved from RISC OS appears on the host with sane name, type and
+   date; and a `savevm`/`loadvm` round-trip with HostFS mounted leaves
+   everything working.
+
+   **6C — the extras that ride the same channel (1 day).**  Console
+   capture (`*HostConsole on` → write vectors → CONSOLE commands → host
+   log), time sync from host UTC at boot, and the eigen-factor/absolute-
+   pointer hooks if the UI work wants them.
+
+   *Done when:* a `*Cat` typed in the guest appears in the host log.
+
+*Done when (sprint 6 as a whole):* a file written on the host is
+readable from the RISC OS desktop within a second and without a
+reboot, and a `*Cat` typed in the guest appears on the host.
 
 ## 13 — the blitter: render ops, sprites and the pointer on the host (5–8 days)
 
