@@ -347,7 +347,20 @@ static const struct { uint32_t keycode; uint32_t mask; } metal_mods[] = {
     { 58, METAL_LALT   },  { 61, METAL_RALT   },
     { 55, METAL_LCMD   },  { 54, METAL_RCMD   },
 };
+#define METAL_SHIFT_ANY (METAL_LSHIFT | METAL_RSHIFT)
+#define METAL_CTRL_ANY  (METAL_LCTRL  | METAL_RCTRL)
+#define METAL_CMD_ANY   (METAL_LCMD   | METAL_RCMD)
+#define METAL_ALT_ANY   (METAL_LALT   | METAL_RALT)
+
 static uint32_t mod_state;              /* the masks we believe are down */
+/*
+ * Masks spent on a mouse button and therefore hidden from the guest. A
+ * modifier used to pick a button must not also arrive as a key: RISC OS
+ * reads Shift-Adjust and Adjust as different gestures, so leaking the
+ * Shift makes the click land as something else entirely -- which is
+ * exactly how Shift-click came to do nothing while Ctrl-click worked.
+ */
+static uint32_t mod_masked;
 
 static void metal_flags_changed(NSEvent *e)
 {
@@ -358,6 +371,9 @@ static void metal_flags_changed(NSEvent *e)
         bool now = (flags & metal_mods[i].mask) != 0;
         bool was = (mod_state & metal_mods[i].mask) != 0;
 
+        if (mod_masked & metal_mods[i].mask) {
+            continue;               /* it is a mouse button just now */
+        }
         if (now != was) {
             metal_glue_key(now, metal_mods[i].keycode);
             if (now) {
@@ -373,6 +389,42 @@ static void metal_flags_changed(NSEvent *e)
         metal_glue_key(true, 57);
         metal_glue_key(false, 57);
     }
+}
+
+/* Take a modifier away from the guest for the duration of a click */
+static void metal_mods_hold(uint32_t masks)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(metal_mods) / sizeof(metal_mods[0]); i++) {
+        uint32_t m = metal_mods[i].mask;
+
+        if ((masks & m) && (mod_state & m)) {
+            metal_glue_key(false, metal_mods[i].keycode);
+            mod_state &= ~m;
+            mod_masked |= m;
+        }
+    }
+}
+
+/* And give it back, if it is still physically down when the button is up */
+static void metal_mods_restore(NSEvent *e)
+{
+    NSUInteger flags = [e modifierFlags];
+    size_t i;
+
+    if (!mod_masked) {
+        return;
+    }
+    for (i = 0; i < sizeof(metal_mods) / sizeof(metal_mods[0]); i++) {
+        uint32_t m = metal_mods[i].mask;
+
+        if ((mod_masked & m) && (flags & m)) {
+            metal_glue_key(true, metal_mods[i].keycode);
+            mod_state |= m;
+        }
+    }
+    mod_masked = 0;
 }
 
 /* Every modifier the guest thinks is down, released.  Called when the
@@ -1035,24 +1087,40 @@ static void metal_screenshot(void)
 
 /*
  * RISC OS wants three buttons -- Select, Menu and Adjust -- and a Mac
- * has one. Shift-click is Adjust and Control-click is Menu, which is the
- * usual bargain on this platform. Two things make it fiddlier than it
- * looks: macOS turns a Control-click into a right click before we ever
- * see it, so Menu has to be recognised on that stream too; and the
- * modifier may be let go before the button is, so the button actually
- * sent is latched at press time and that is what gets released.
+ * has one. Control-click is Menu; Command, Option or Shift is Adjust.
  *
- * The cost is Shift-Select and Control-Select, which RISC OS does use.
- * Menu is worth more: there is no reaching a menu without it.
+ * Three things make it fiddlier than it looks. macOS turns a
+ * Control-click into a right click before we ever see it, so Menu has to
+ * be recognised on that stream too. The modifier may be let go before
+ * the button is, so the button sent is latched at press time and that is
+ * what gets released. And the modifier must be taken away from the guest
+ * while it is being a button: RISC OS reads Shift-Adjust and Adjust as
+ * different gestures, so leaking the Shift makes the click land as
+ * something else -- which is how Shift-click came to do nothing at all
+ * while Control-click worked.
+ *
+ * Command is the one to reach for. RISC OS has no Command key, so
+ * nothing is lost to it, whereas Shift-Select and Control-Select are
+ * gestures the Filer really uses.
  */
 static int metal_button_for(NSEvent *e, int plain)
 {
     NSUInteger f = [e modifierFlags];
 
     if (f & NSEventModifierFlagControl) {
+        metal_mods_hold(METAL_CTRL_ANY);
         return 1;                       /* Menu */
     }
+    if (f & NSEventModifierFlagCommand) {
+        metal_mods_hold(METAL_CMD_ANY);
+        return 2;                       /* Adjust */
+    }
+    if (f & NSEventModifierFlagOption) {
+        metal_mods_hold(METAL_ALT_ANY);
+        return 2;                       /* Adjust */
+    }
     if (f & NSEventModifierFlagShift) {
+        metal_mods_hold(METAL_SHIFT_ANY);
         return 2;                       /* Adjust */
     }
     return plain;
@@ -1061,27 +1129,35 @@ static int metal_button_for(NSEvent *e, int plain)
 - (void)mouseDown:(NSEvent *)e
 {
     mouse.held_left = metal_button_for(e, 0);
+    if (metal_debug()) {
+        metal_log("view: mouseDown -> button %d (flags %#lx)",
+                  mouse.held_left, (unsigned long)[e modifierFlags]);
+    }
     metal_glue_mouse_btn(mouse.held_left, true);
     m.mouse_buttons++;
 }
 
 - (void)mouseUp:(NSEvent *)e
 {
-    (void)e;
     metal_glue_mouse_btn(mouse.held_left, false);
+    metal_mods_restore(e);
 }
 
 - (void)rightMouseDown:(NSEvent *)e
 {
     mouse.held_right = metal_button_for(e, 2);
+    if (metal_debug()) {
+        metal_log("view: rightMouseDown -> button %d (flags %#lx)",
+                  mouse.held_right, (unsigned long)[e modifierFlags]);
+    }
     metal_glue_mouse_btn(mouse.held_right, true);
     m.mouse_buttons++;
 }
 
 - (void)rightMouseUp:(NSEvent *)e
 {
-    (void)e;
     metal_glue_mouse_btn(mouse.held_right, false);
+    metal_mods_restore(e);
 }
 
 /*

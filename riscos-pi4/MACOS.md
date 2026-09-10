@@ -80,6 +80,7 @@ So the shapes correspond one for one:
 | Hand-rolled PNG over zlib | ImageIO, which is already there |
 | System menu item | An `NSMenu` |
 | `ShowCursor(FALSE)` while grabbed | An `NSTrackingArea`, and hidden over the guest's screen at all times |
+| Three mouse buttons | Control-click is Menu, Command-click is Adjust |
 
 The C++ boundary on Windows exists because QEMU's headers are not
 C++-parseable. Objective-C has no such problem — `ui/metal.m` could have
@@ -123,6 +124,30 @@ time the pointer is over the view in a key window, grabbed or not. An
 losing focus, ungrabbing and shutting down all put the cursor back.
 `[NSCursor hide]` is a counted call, so the state is tracked and the call
 made only on a change — an unbalanced pair is a cursor that never returns.
+
+### Three buttons on a machine with one
+
+RISC OS wants Select, Menu and Adjust. A MacBook has one button, so
+Control-click is Menu and Command-click is Adjust (Option and Shift do
+Adjust as well).
+
+Two things about that are not obvious. macOS turns a Control-click into a
+right click *before* the view sees it, so Menu has to be recognised on
+that stream too — and since the modifier can be released before the
+button is, the button chosen is latched at press time and that is what
+gets released.
+
+The third only showed up when Control-click worked and Shift-click did
+nothing at all. A modifier used to pick a button was still being sent to
+the guest as a key, so RISC OS saw Shift *and* Adjust, which is a
+different gesture from Adjust — the click was arriving and being read as
+something else. Control-Menu happens to be harmless, which is why one of
+them worked. The qualifying modifier is now taken away from the guest for
+the duration of the click and handed back on release if it is still held.
+
+Command is the one to reach for: RISC OS has no Command key, so nothing
+is lost to it, whereas Shift-Select and Control-Select are gestures the
+Filer really uses.
 
 ### The mistake that cost the first run
 
