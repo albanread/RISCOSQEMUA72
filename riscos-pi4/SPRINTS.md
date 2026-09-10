@@ -232,6 +232,33 @@ tools.
 *Done when:* a cold start to a usable networked desktop takes under one
 second from a snapshot, and a boot from scratch still works unchanged.
 
+**Done.**  `tools/run.py` is the wrapper: it creates the qcow2 overlay over
+the card image on first use, launches the canonical machine, and
+`--save NAME` snapshots machine+disc once the desktop is painted (the
+emulator keeps running); `--snapshot NAME` is a `-loadvm` cold start.
+
+Two devices needed real work:
+
+- `usb-net` was vmstate-stubbed `unmigratable=1`, which blocked savevm for
+  the whole canonical machine.  The CDC path now migrates (USB core,
+  control-request results, half-sent frames both ways; the RNDIS response
+  queue is documented as uncovered and is always empty in CDC mode).
+- `bcm2835_fb` post_load forces `invalidate` and calls
+  `qemu_console_resize` to the restored mode: a restored machine never
+  passes through reconfigure, so the console kept its placeholder surface
+  and the first screendump segfaulted (gdb: `draw_line` dst=0x448fc000,
+  unmapped).
+
+Measured: cold start to a painted desktop **0.68 s** (`-loadvm desktop`),
+and the restored machine is fully alive — F12 opens the CLI, its caret
+blinks (the centisecond ticker survived), `*CAT SDFS::SD_FSDisc.$.`
+lists the disc, and `*PING 10.0.2.2` over the restored usb-net/slirp
+answers in 2 ms.  The window's system menu carries "Load snapshot",
+which rewinds to the snapshot named `desktop` through a bottom half on
+the main loop (the hmp_loadvm sequence); verified live — a session mid-
+`*CAT` at the CLI reverted to the clean desktop.  Boot from scratch is
+unchanged (`run.py` with no options).
+
 ## 6 — host files (4–5 days)
 
 Two routes, in order of cheapness:

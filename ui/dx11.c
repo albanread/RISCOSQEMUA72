@@ -18,6 +18,7 @@
 #include "ui/dx11.h"
 #include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_vsyncgen.h"
+#include "migration/snapshot.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 
@@ -235,6 +236,36 @@ bool dx11_glue_set_vsync_hz(int hz)
     }
     bcm2835_vsyncgen_set_hz(BCM2835_VSYNCGEN(obj), hz);
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Snapshot restore, from the window's system menu                     */
+
+/* The one snapshot the menu loads; tools/run.py creates it. */
+#define DX11_SNAPSHOT_NAME "desktop"
+
+static QEMUBH *dx11_loadvm_bh;
+
+static void dx11_loadvm_bh_fn(void *opaque)
+{
+    /* Main loop, BQL held: exactly the hmp_loadvm sequence. */
+    RunState saved = runstate_get();
+    Error *err = NULL;
+
+    vm_stop(RUN_STATE_RESTORE_VM);
+    if (load_snapshot(DX11_SNAPSHOT_NAME, NULL, false, NULL, &err)) {
+        load_snapshot_resume(saved);
+    } else {
+        error_report_err(err);
+    }
+}
+
+void dx11_glue_load_snapshot(void)
+{
+    if (!dx11_loadvm_bh) {
+        dx11_loadvm_bh = qemu_bh_new(dx11_loadvm_bh_fn, NULL);
+    }
+    qemu_bh_schedule(dx11_loadvm_bh);
 }
 
 static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)

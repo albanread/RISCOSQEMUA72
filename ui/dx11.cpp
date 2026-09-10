@@ -102,6 +102,9 @@ static struct {
 static const wchar_t DX11_CLASS[] = L"qemu-dx11";
 static const wchar_t DX11_TITLE[] = L"RISC OS 5 — Raspberry Pi 4 (QEMU)";
 
+/* System-menu id for the snapshot entry (SC_* ids live at 0xF000+). */
+#define DX11_SC_LOADSNAP 0x0100
+
 /* Development log: dx11-debug.txt next to the CWD, one line per notable
  * event, so failures on a windowed app are not lost to OutputDebugString. */
 static void dx11_log(const char *fmt, ...)
@@ -375,6 +378,12 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_MOUSEWHEEL:
         dx11_glue_mouse_wheel(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA);
         return 0;
+    case WM_SYSCOMMAND:
+        if ((w & 0xfff0) == DX11_SC_LOADSNAP) {
+            dx11_glue_load_snapshot();
+            return 0;
+        }
+        return DefWindowProcW(h, msg, w, l);
     default:
         return DefWindowProcW(h, msg, w, l);
     }
@@ -406,6 +415,13 @@ static bool dx11_create_window(void)
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!dx11.hwnd) {
         return false;
+    }
+    /* The window menu carries the dev-loop convenience: a click on
+     * "Load snapshot" rewinds the machine to the saved desktop. */
+    HMENU sm = GetSystemMenu(dx11.hwnd, FALSE);
+    if (sm) {
+        AppendMenuW(sm, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sm, MF_STRING, DX11_SC_LOADSNAP, L"Load snapshot\tDesktop");
     }
     /*
      * The first ShowWindow of a process honours wShowWindow from

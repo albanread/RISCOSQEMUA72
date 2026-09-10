@@ -81,6 +81,10 @@ bool dx11_glue_set_vsync_hz(int hz);
  * compiled. */
 void dx11_glue_video_opts(int scaling, int scanlines);
 
+/* Reload the named-by-convention snapshot ("desktop") from the window's
+ * system menu; the load itself runs as a bottom half on the main loop. */
+void dx11_glue_load_snapshot(void);
+
 #ifdef __cplusplus
 }
 #endif
