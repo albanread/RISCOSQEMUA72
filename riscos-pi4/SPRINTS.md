@@ -63,9 +63,10 @@ headless `-display none` run with the same devices is pixel-identical
 ends the process in under a second.
 
 Getting there needed the boot unblocked first: the CMOS blob in use had
-been built without `--unplug 106`, so EtherGENET started, found no GENET
-hardware (none is modelled, and no DTB reaches a `-kernel` guest), and
-aborted at `&FC3FB800` — the data abort that used to be the whole screen.
+been built without `--unplug 106`, so EtherGENET started, was handed a
+GENET device by the HAL's fixed table, found no controller behind it (none
+is modelled), and aborted at `&FC3FB800` — the data abort that used to be
+the whole screen.
 `tools/patch-rom-nogenet.py` is the source-free equivalent of the unplug
 bit until GENET is modelled; the machine also gained an
 unimplemented-device stand-in at GENET's register block (`0xfd580000`),

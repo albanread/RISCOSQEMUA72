@@ -205,10 +205,13 @@ ROM image instead of the CMOS: EtherGENET's init becomes a no-op and its
 service/SWI entries are removed. Boot `-kernel RISCOS-nogenet.IMG` and the
 rest of this page works unchanged. The failure without either is loud and
 specific — `Error: DataAbort:Abort on data transfer at &FC3FB800` — which
-is EtherGENET calling a method on a device it never found, because the
-GENET MAC is not modelled. The register block it would probe, `0xfd580000`,
-is covered by an unimplemented-device stub so a future driver reads "no
-silicon" there instead of an external abort.
+is EtherGENET calling a method on a device it never attached, because the
+GENET MAC is not modelled: the HAL hands the driver a GENET device at
+`0xfd580000` from a fixed table (RISC OS reads no device tree), the driver
+finds no controller there and later dereferences the pointer it never
+filled in. That register block is covered by an unimplemented-device stub
+so the probe reads zero instead of taking an external abort; it does not
+save the boot on its own, hence the unplug bit.
 
 `-display dx11` is the fork's own Windows display (Sprint U0): a Win32
 window on the main thread with a D3D11 flip-model swap chain clearing it
