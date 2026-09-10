@@ -664,7 +664,7 @@ struct rndis_response {
 struct USBNetState {
     USBDevice dev;
 
-    enum rndis_state rndis_state;
+    int rndis_state;            /* enum rndis_state, int so it migrates */
     uint32_t medium;
     uint32_t speed;
     uint32_t media_state;
@@ -1445,7 +1445,35 @@ static void usb_net_instance_init(Object *obj)
 
 static const VMStateDescription vmstate_usb_net = {
     .name = "usb-net",
-    .unmigratable = 1,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    /*
+     * Enough to snapshot the CDC ECM path (rndis=off), which is how the
+     * RISC OS launch uses it: the USB core state, the control-request
+     * results the guest cached, and any frame half-sent in either
+     * direction.  Not covered: the RNDIS response queue, which is always
+     * empty in CDC mode, and the NIC peer's own queues, which the net
+     * layer flushes at save time.  The endpoint pointers are set in
+     * realize and the device instance survives loadvm, so they need no
+     * migration.
+     */
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, USBNetState),
+        VMSTATE_INT32(rndis_state, USBNetState),
+        VMSTATE_UINT32(medium, USBNetState),
+        VMSTATE_UINT32(speed, USBNetState),
+        VMSTATE_UINT32(media_state, USBNetState),
+        VMSTATE_UINT16(filter, USBNetState),
+        VMSTATE_UINT32(vendorid, USBNetState),
+        VMSTATE_UINT16(connection, USBNetState),
+        VMSTATE_BOOL(offer_rndis, USBNetState),
+        VMSTATE_UINT32(out_ptr, USBNetState),
+        VMSTATE_UINT8_ARRAY(out_buf, USBNetState, 2048),
+        VMSTATE_UINT32(in_ptr, USBNetState),
+        VMSTATE_UINT32(in_len, USBNetState),
+        VMSTATE_UINT8_ARRAY(in_buf, USBNetState, 2048),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static const Property net_properties[] = {
