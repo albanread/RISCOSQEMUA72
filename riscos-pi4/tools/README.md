@@ -14,6 +14,31 @@ re-run.
   `RISCOS.IMG`.
 - clang and ld.lld (the installed LLVM) to build the benchmarks.
 
+## run.py — the launch, and snapshots
+
+`run.py` is the canonical launch wrapped up: it creates a qcow2 overlay
+over the card image on first use (so the card image stays pristine and a
+snapshot carries machine *and* disc state), boots the machine, and:
+
+    run.py                     boot from scratch
+    run.py --save desktop      save machine+disc as 'desktop' once the
+                               desktop is painted, then keep running
+    run.py --snapshot desktop  cold-start from that snapshot (<1 s to a
+                               painted desktop)
+
+The window's system menu also carries "Load snapshot", which rewinds the
+running machine to the 'desktop' snapshot.
+
+One rule with teeth: **always shut the emulator down cleanly** — close
+the window, or `quit` over QMP.  The overlay is a real disc to the
+guest; killing the process hard is yanking the power mid-write, and
+SDFS/FileCore can be left with a torn update.  Diagnosed live: after a
+day of hard kills a fresh boot stopped with `SDFS error &1E4 on drive
+0 : disc error` just after SDFS started; `qemu-img check` passes in
+that state (the qcow2 is fine — the filesystem *inside* the disc is
+what tore; only the guest can see it).  Recovery is to quarantine the
+overlay and let `run.py` mint a fresh one from the pristine image.
+
 ## Boot probe
 
     python probe.py raspi4b RISCOS.IMG 30 -- -cpu cortex-a72,aarch64=off
