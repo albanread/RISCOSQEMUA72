@@ -158,7 +158,17 @@ The periodic log line carries the mode, the frame rate and the input
 counters, so a keyboard or mouse that is not arriving says so:
 
 ```
-frame 16200: pipeline up, fb gen 10, 800x600 bpp 32, keys 0, mouse moves 260, button events 2
+frame 16200: pipeline up, fb gen 10, 800x600 bpp 32, keys 67, mouse moves 448, button events 6
+```
+
+`METAL_DEBUG=1` goes further and traces every key event the pump sees,
+with the routing that decides where it lands. That is the difference
+between "the app never got the keystroke" and "the view never got it",
+and it is not a question a counter can answer:
+
+```
+pump: key event type 10 code 17, our window 1, app active 1, key win 1, first responder MetalView
+view: keyDown code 17
 ```
 
 ## 5. The clock: measured, then left alone
@@ -187,10 +197,15 @@ needed yet.
 ## 6. What is not done yet
 
 - **Grab, full screen and the snapshot menu are written but unexercised.**
-  The keyboard, the pointer, the buttons and a window drag were confirmed
-  against a running desktop — the drag is also the DMA 2D negative-stride
-  copy path, since the whole window redrew rather than the exposed strips.
   ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
+
+  Everything else in the input path has been. The pointer, the buttons and
+  a window drag went through against a running desktop — the drag is also
+  the DMA 2D negative-stride copy path, since the whole window redrew
+  rather than the exposed strips. So did the keyboard, into StrongED: the
+  letters, Space, Return, Shift for a capital, and five Deletes correcting
+  a word, all of which is `qemu_input_map_osx_to_linux` being faithful
+  from an `NSEvent` keyCode through to RISC OS.
 - **No `-display metal` equivalent of the Windows DPI dance.** The layer
   is sized in backing pixels and the guest is scaled to the whole view, so
   a Retina display shows the guest at the panel's own resolution — but

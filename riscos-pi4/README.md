@@ -79,6 +79,7 @@ render loop sends nothing.
 eleven-call boundary — a Cocoa window on the main thread, the guest
 framebuffer decoded by an MSL shader specialised per pixel format, the
 same three scalers and the same optional scanlines, ⌘S or F13 for a PNG.
+Keyboard, pointer, buttons and drags all reach the guest.
 The emulation itself needed no changes at all. Power-on to a settled,
 networked desktop is **20.8 seconds** on an M4 against about 27 on the
 i7-12700, and the centisecond ticker measures 100.0 a second with a worst

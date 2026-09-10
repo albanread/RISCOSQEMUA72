@@ -137,6 +137,20 @@ static void metal_log(const char *fmt, ...)
 
 static void metal_screenshot(void);
 
+/* METAL_DEBUG=1 traces the events the pump sees but the guest does not,
+ * which is the only way to tell "the app never got the keystroke" from
+ * "the view never got it". */
+static bool metal_debug(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("METAL_DEBUG");
+        on = e && *e && *e != '0';
+    }
+    return on != 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Grab: the guest owns the pointer until Ctrl+Alt+G                   */
 
@@ -974,6 +988,10 @@ static void metal_screenshot(void)
 {
     NSUInteger f = [e modifierFlags];
 
+    if (metal_debug()) {
+        metal_log("view: keyDown code %u", (unsigned)[e keyCode]);
+    }
+
     if ([e keyCode] == 5 /* G */
         && (f & NSEventModifierFlagControl)
         && (f & NSEventModifierFlagOption)) {
@@ -1301,6 +1319,24 @@ int metal_backend_main(void)
                                            untilDate:[NSDate distantPast]
                                               inMode:NSDefaultRunLoopMode
                                              dequeue:YES]) != nil) {
+                if (metal_debug()) {
+                    NSEventType t = [e type];
+
+                    if (t == NSEventTypeKeyDown || t == NSEventTypeKeyUp
+                        || t == NSEventTypeFlagsChanged) {
+                        id fr = [m.window firstResponder];
+
+                        metal_log("pump: key event type %ld code %u, "
+                                  "our window %d, app active %d, key win %d, "
+                                  "first responder %s",
+                                  (long)t, (unsigned)[e keyCode],
+                                  (int)([e window] == m.window),
+                                  (int)[NSApp isActive],
+                                  (int)[m.window isKeyWindow],
+                                  fr ? [NSStringFromClass([fr class]) UTF8String]
+                                     : "(none)");
+                    }
+                }
                 [NSApp sendEvent:e];
             }
             if (m.lost) {
