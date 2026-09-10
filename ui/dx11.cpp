@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <windowsx.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
@@ -43,6 +44,9 @@ static struct {
     ID3D11RenderTargetView *rtv;
     bool ready;
     bool lost;
+    /* mouse messages forwarded, for the debug log */
+    unsigned mouse_moves;
+    unsigned mouse_buttons;
 } dx11;
 
 /* The per-mode pipeline: everything that depends on the fb config. */
@@ -97,6 +101,13 @@ static struct {
     bool on;
 } kbd;
 
+static void dx11_mouse_centre(HWND h);
+/* mouse state, see the Mouse section */
+static struct {
+    bool have_last;
+    int last_x, last_y;
+} mouse;
+
 static void dx11_set_grab(bool on)
 {
     if (on == kbd.on) {
@@ -109,11 +120,57 @@ static void dx11_set_grab(bool on)
         GetWindowRect(dx11.hwnd, &r);
         ClipCursor(&r);             /* the pointer lives in the window */
         ShowCursor(FALSE);
+        dx11_mouse_centre(dx11.hwnd);
     } else {
         ClipCursor(nullptr);
         ShowCursor(TRUE);
+        mouse.have_last = false;
     }
     dx11_log("grab %s", on ? "on" : "off");
+}
+
+/* ------------------------------------------------------------------ */
+/* Mouse: ordinary window messages, turned into the relative motion a  */
+/* USB mouse reports. Grabbed, the host cursor is warped back to the   */
+/* centre after every move so motion is unbounded; ungrabbed, the      */
+/* deltas are simply the cursor's movement over the client area.       */
+
+static void dx11_mouse_centre(HWND h)
+{
+    RECT r;
+    POINT c;
+
+    GetClientRect(h, &r);
+    c.x = (r.right - r.left) / 2;
+    c.y = (r.bottom - r.top) / 2;
+    mouse.last_x = c.x;
+    mouse.last_y = c.y;
+    mouse.have_last = true;
+    ClientToScreen(h, &c);
+    SetCursorPos(c.x, c.y);
+}
+
+static void dx11_mouse_move(HWND h, int x, int y)
+{
+    /* No leave tracking: a return after leaving the window is one large
+     * delta, which is the motion the user actually made. */
+    if (mouse.have_last) {
+        int dx = x - mouse.last_x, dy = y - mouse.last_y;
+        if (dx || dy) {
+            dx11_glue_mouse_rel(dx, dy);
+            dx11.mouse_moves++;
+        }
+    }
+    mouse.last_x = x;
+    mouse.last_y = y;
+    mouse.have_last = true;
+    if (kbd.on) {
+        RECT r;
+        GetClientRect(h, &r);
+        if (x != (r.right - r.left) / 2 || y != (r.bottom - r.top) / 2) {
+            dx11_mouse_centre(h);   /* its own WM_MOUSEMOVE is a zero delta */
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -140,7 +197,10 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (LOWORD(w) == WA_INACTIVE) {
             dx11_set_grab(false);   /* never hold the host pointer hostage */
         }
-        return 0;
+        /* DefWindowProc gives an activated window the keyboard focus;
+         * without it the window is foreground but focusless, and raw
+         * mouse input is not delivered to it. */
+        return DefWindowProcW(h, msg, w, l);
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         /* Ctrl+Alt+G is the release, and never reaches the guest */
@@ -167,52 +227,29 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         }
         dx11_glue_key(false, l);
         return 0;
-    case WM_INPUT: {
-        /* Raw mouse input: relative deltas and buttons, exactly what a
-         * usb-mouse reports to RISC OS as Select/Menu/Adjust. */
-        UINT size = 0;
-        GetRawInputData(reinterpret_cast<HRAWINPUT>(w), RID_INPUT,
-                        nullptr, &size, sizeof(RAWINPUTHEADER));
-        if (size && size <= 512) {
-            uint8_t buf[512];
-            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(w), RID_INPUT,
-                                buf, &size,
-                                sizeof(RAWINPUTHEADER)) == size) {
-                RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(buf);
-                if (ri->header.dwType == RIM_TYPEMOUSE) {
-                    const RAWMOUSE &m = ri->data.mouse;
-                    if ((m.usFlags & MOUSE_MOVE_RELATIVE)
-                        && (m.lLastX || m.lLastY)) {
-                        dx11_glue_mouse_rel(m.lLastX, m.lLastY);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) {
-                        dx11_glue_mouse_btn(0, true);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) {
-                        dx11_glue_mouse_btn(0, false);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) {
-                        dx11_glue_mouse_btn(1, true);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP) {
-                        dx11_glue_mouse_btn(1, false);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) {
-                        dx11_glue_mouse_btn(2, true);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) {
-                        dx11_glue_mouse_btn(2, false);
-                    }
-                    if (m.usButtonFlags & RI_MOUSE_WHEEL) {
-                        dx11_glue_mouse_wheel(
-                            (int16_t)m.usButtonData / WHEEL_DELTA);
-                    }
-                }
-            }
-        }
-        DefWindowProcW(h, msg, w, l);   /* MSDN: always call for cleanup */
+    case WM_MOUSEMOVE:
+        dx11_mouse_move(h, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         return 0;
-    }
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        SetCapture(h);                  /* the up arrives even outside */
+        dx11_glue_mouse_btn(msg == WM_LBUTTONDOWN ? 0
+                            : msg == WM_MBUTTONDOWN ? 1 : 2, true);
+        dx11.mouse_buttons++;
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+        dx11_glue_mouse_btn(msg == WM_LBUTTONUP ? 0
+                            : msg == WM_MBUTTONUP ? 1 : 2, false);
+        if (!(w & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON))) {
+            ReleaseCapture();
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        dx11_glue_mouse_wheel(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA);
+        return 0;
     default:
         return DefWindowProcW(h, msg, w, l);
     }
@@ -255,16 +292,6 @@ static bool dx11_create_window(void)
     ShowWindow(dx11.hwnd, SW_SHOW);
     UpdateWindow(dx11.hwnd);
 
-    /* Raw mouse input, delivered while the window has focus: usage page
-     * 1 (generic desktop), usage 2 (mouse), no INPUTSINK. */
-    RAWINPUTDEVICE rid = {};
-    rid.usUsagePage = 0x01;
-    rid.usUsage = 0x02;
-    rid.dwFlags = 0;
-    rid.hwndTarget = dx11.hwnd;
-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
-        dx11_log("RegisterRawInputDevices failed: %lu", GetLastError());
-    }
     return true;
 }
 
@@ -753,9 +780,11 @@ static bool dx11_render_frame(void)
     Dx11FbView v;
 
     if (++frame_count % 300 == 0) {
-        dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u",
+        dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u, "
+                 "mouse moves %u, button events %u",
                  frame_count, fb.up ? "up" : "down",
-                 fb.generation, fb.xres, fb.yres, fb.bpp);
+                 fb.generation, fb.xres, fb.yres, fb.bpp,
+                 dx11.mouse_moves, dx11.mouse_buttons);
     }
 
     if (!dx11_glue_fb_view(&v)) {
