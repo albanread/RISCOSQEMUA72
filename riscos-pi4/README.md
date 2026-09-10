@@ -328,6 +328,10 @@ RISC OS at all. See `tools/README.md`.
 
 `riscos-pi4/DESIGN.md` is the full record: what was measured, what was tried,
 which hypotheses were wrong, and why each fix is shaped the way it is.
+`riscos-pi4/MACOS.md` is the macOS port; `riscos-pi4/SOUND.md` is the design
+for the sound that is not there yet — researched against the ROM's own
+sources, and turning out to need no audio hardware at all, because RISC OS
+reaches the speaker through the VCHIQ service this fork already owns.
 
 ## Licence
 
