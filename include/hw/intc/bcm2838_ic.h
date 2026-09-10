@@ -30,6 +30,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2838ICState, BCM2838_IC)
  *   72-79  the eight software interrupts
  */
 #define BCM2838_IC_NUM_IRQS     80
+#define BCM2838_IC_ARMC_BASE    64  /* inputs 64-71: the ARMC sources */
 #define BCM2838_IC_NUM_CORES    4
 #define BCM2838_IC_NUM_BANKS    (2 * BCM2838_IC_NUM_CORES)  /* IRQ0-3, FIQ0-3 */
 

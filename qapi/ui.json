@@ -1537,6 +1537,22 @@
 }
 
 ##
+# @DisplayDx11:
+#
+# Direct3D 11 display options.
+#
+# @vsync: how many vertical-sync interrupts a second the guest
+#     receives, each raised on the machine's vsync line after a
+#     presented frame (0 disables them; default 30).  Raspberry Pi
+#     guests see it as the firmware's SMI interrupt.
+#
+# Since: 11.1
+##
+{ 'struct'  : 'DisplayDx11',
+  'data'    : { '*vsync' : 'int' },
+  'if'      : 'CONFIG_DX11' }
+
+##
 # @DisplayOptions:
 #
 # Display (user interface) options.
@@ -1566,6 +1582,7 @@
   'data'    : {
       'gtk': { 'type': 'DisplayGTK', 'if': 'CONFIG_GTK' },
       'cocoa': { 'type': 'DisplayCocoa', 'if': 'CONFIG_COCOA' },
+      'dx11': { 'type': 'DisplayDx11', 'if': 'CONFIG_DX11' },
       'curses': { 'type': 'DisplayCurses', 'if': 'CONFIG_CURSES' },
       'egl-headless': { 'type': 'DisplayEGLHeadless',
                         'if': 'CONFIG_OPENGL' },

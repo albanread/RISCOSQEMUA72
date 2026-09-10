@@ -63,6 +63,10 @@ static void bcm2838_peripherals_init(Object *obj)
     object_initialize_child(obj, "bcm2838-ic", &s->ic, TYPE_BCM2838_IC);
     object_initialize_child(obj, "dwc2-irq-splitter", &s->dwc2_irq_splitter,
                             TYPE_SPLIT_IRQ);
+    object_initialize_child(obj, "smi-irq-splitter", &s->smi_irq_splitter,
+                            TYPE_SPLIT_IRQ);
+    object_initialize_child(obj, "armtmr-irq-splitter",
+                            &s->armtmr_irq_splitter, TYPE_SPLIT_IRQ);
 }
 
 static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
@@ -241,6 +245,27 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->dwc2_irq_splitter), 0));
     qdev_connect_gpio_out(DEVICE(&s->dwc2_irq_splitter), 1,
                           qdev_get_gpio_in(DEVICE(&s->ic), INTERRUPT_USB));
+
+    /* The SMI vsync latch and the ARM timer reach both controllers too */
+    qdev_prop_set_uint32(DEVICE(&s->smi_irq_splitter), "num-lines", 2);
+    if (!qdev_realize(DEVICE(&s->smi_irq_splitter), NULL, errp)) {
+        return;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s_base->smi), 0,
+                       qdev_get_gpio_in(DEVICE(&s->smi_irq_splitter), 0));
+    qdev_connect_gpio_out(DEVICE(&s->smi_irq_splitter), 1,
+                          qdev_get_gpio_in(DEVICE(&s->ic), INTERRUPT_SMI));
+
+    qdev_prop_set_uint32(DEVICE(&s->armtmr_irq_splitter), "num-lines", 2);
+    if (!qdev_realize(DEVICE(&s->armtmr_irq_splitter), NULL, errp)) {
+        return;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s_base->armtmr), 0,
+                       qdev_get_gpio_in(DEVICE(&s->armtmr_irq_splitter), 0));
+    qdev_connect_gpio_out(DEVICE(&s->armtmr_irq_splitter), 1,
+                          qdev_get_gpio_in(DEVICE(&s->ic),
+                                           BCM2838_IC_ARMC_BASE
+                                           + INTERRUPT_ARM_TIMER));
 
     create_unimp(s_base, &s->clkisp, "bcm2835-clkisp", CLOCK_ISP_OFFSET,
                  CLOCK_ISP_SIZE);

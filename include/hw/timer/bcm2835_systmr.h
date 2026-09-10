@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "qemu/timer.h"
+#include "qemu/hrtimer.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_SYSTIMER "bcm2835-sys-timer"
@@ -21,7 +22,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835SystemTimerState, BCM2835_SYSTIMER)
 
 typedef struct {
     unsigned id;
-    QEMUTimer timer;
+    HRTimer *timer;         /* on the high-resolution timer thread */
     qemu_irq irq;
     BCM2835SystemTimerState *state;
 } BCM2835SystemTimerCompare;

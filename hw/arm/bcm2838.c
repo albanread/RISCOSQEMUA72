@@ -223,6 +223,11 @@ static void bcm2838_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_MPHI));
     qdev_connect_gpio_out(DEVICE(&ps->dwc2_irq_splitter), 0,
                           qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_DWC2));
+    qdev_connect_gpio_out(DEVICE(&ps->smi_irq_splitter), 0,
+                          qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_SMI));
+    qdev_connect_gpio_out(DEVICE(&ps->armtmr_irq_splitter), 0,
+                          qdev_get_gpio_in(gicdev,
+                                           GIC_SPI_INTERRUPT_ARM_TIMER));
 
     /*
      * The legacy controller's FIQs reach each core through the GIC's

@@ -91,6 +91,8 @@ system_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'bcm2835_mbox_power.c',
   'bcm2835_vchiq.c',
   'bcm2835_mphi.c',
+  'bcm2835_smi.c',
+  'bcm2835_vsyncgen.c',
   'bcm2835_property.c',
   'bcm2835_rng.c',
   'bcm2835_thermal.c',

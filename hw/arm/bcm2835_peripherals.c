@@ -96,6 +96,13 @@ static void raspi_peripherals_base_init(Object *obj)
     object_initialize_child(obj, "systimer", &s->systmr,
                             TYPE_BCM2835_SYSTIMER);
 
+    /* ARM timer, and the SMI block's vertical-sync interrupt latch */
+    object_initialize_child(obj, "armtimer", &s->armtmr,
+                            TYPE_BCM2835_ARMTIMER);
+    object_initialize_child(obj, "smi", &s->smi, TYPE_BCM2835_SMI);
+    object_initialize_child(obj, "vsyncgen", &s->vsyncgen,
+                            TYPE_BCM2835_VSYNCGEN);
+
     /* UART0 */
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_PL011);
 
@@ -558,10 +565,43 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                                                  BCM2835_IC_GPU_IRQ,
                                                  INTERRUPT_I2C));
 
+    /* ARM timer */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->armtmr), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, ARMCTRL_TIMER0_1_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->armtmr), 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->armtmr), 0,
+        qdev_get_gpio_in_named(DEVICE(&s->ic), BCM2835_IC_ARM_IRQ,
+                               INTERRUPT_ARM_TIMER));
+
+    /* SMI: the firmware's vertical-sync interrupt, nothing else */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->smi), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, SMI_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->smi), 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->smi), 0,
+        qdev_get_gpio_in_named(DEVICE(&s->ic), BCM2835_IC_GPU_IRQ,
+                               INTERRUPT_SMI));
+
+    /* Vertical sync and the half-frame pulse, from the timer thread */
+    if (!qdev_realize(DEVICE(&s->vsyncgen), NULL, errp)) {
+        return;
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->vsyncgen),
+                                BCM2835_VSYNCGEN_VSYNC_OUT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->smi),
+                                                       BCM2835_SMI_VSYNC_IN,
+                                                       0));
+    qdev_connect_gpio_out_named(DEVICE(&s->vsyncgen),
+                                BCM2835_VSYNCGEN_HALF_FRAME_OUT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->armtmr),
+                                                       BCM2835_ARMTIMER_FIRE_IN,
+                                                       0));
+
     create_unimp(s, &s->txp, "bcm2835-txp", TXP_OFFSET, 0x1000);
-    create_unimp(s, &s->armtmr, "bcm2835-sp804", ARMCTRL_TIMER0_1_OFFSET, 0x40);
     create_unimp(s, &s->i2s, "bcm2835-i2s", I2S_OFFSET, 0x100);
-    create_unimp(s, &s->smi, "bcm2835-smi", SMI_OFFSET, 0x100);
     create_unimp(s, &s->bscsl, "bcm2835-spis", BSC_SL_OFFSET, 0x100);
     create_unimp(s, &s->dbus, "bcm2835-dbus", DBUS_OFFSET, 0x8000);
     create_unimp(s, &s->ave0, "bcm2835-ave0", AVE0_OFFSET, 0x8000);

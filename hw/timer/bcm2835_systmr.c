@@ -94,7 +94,10 @@ static void bcm2835_systmr_write(void *opaque, hwaddr offset,
         /* Compare lower 32-bits of the free-running counter. */
         triggers_delay_us = value - now;
         trace_bcm2835_systmr_run(index, triggers_delay_us);
-        timer_mod(&s->tmr[index].timer, now + triggers_delay_us);
+        /* A deadline for the timer thread: RISC OS waits on this for its
+         * 100 Hz ticker, so it fires when due, not at the next poll. */
+        hrtimer_mod_ns(s->tmr[index].timer,
+                       (now + triggers_delay_us) * SCALE_US);
         break;
     case A_COUNTER_LOW:
     case A_COUNTER_HIGH:
@@ -137,8 +140,8 @@ static void bcm2835_systmr_realize(DeviceState *dev, Error **errp)
         s->tmr[i].id = i;
         s->tmr[i].state = s;
         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->tmr[i].irq);
-        timer_init_us(&s->tmr[i].timer, QEMU_CLOCK_VIRTUAL,
-                      bcm2835_systmr_timer_expire, &s->tmr[i]);
+        s->tmr[i].timer = hrtimer_new(bcm2835_systmr_timer_expire,
+                                      &s->tmr[i]);
     }
 }
 

@@ -68,6 +68,11 @@ void dx11_glue_grab(bool on);
  * thread that pumps messages, before any grab. */
 void dx11_glue_kbd_hook_window(void *hwnd);
 
+/* Guest vertical sync rate, pulses per second, 0 for none. The machine's
+ * vsync generator delivers them from the timer thread; false if the
+ * machine has no generator. */
+bool dx11_glue_set_vsync_hz(int hz);
+
 #ifdef __cplusplus
 }
 #endif

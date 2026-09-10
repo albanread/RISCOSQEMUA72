@@ -17,6 +17,7 @@
 #include "qapi/qapi-types-ui.h"
 #include "ui/dx11.h"
 #include "hw/display/bcm2835_fb.h"
+#include "hw/misc/bcm2835_vsyncgen.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 
@@ -219,9 +220,24 @@ void dx11_glue_kbd_hook_window(void *hwnd)
     win32_kbd_set_window(hwnd);
 }
 
+/* ------------------------------------------------------------------ */
+/* Guest vertical sync                                                 */
+
+bool dx11_glue_set_vsync_hz(int hz)
+{
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_VSYNCGEN, NULL);
+
+    if (!obj) {
+        return false;
+    }
+    bcm2835_vsyncgen_set_hz(BCM2835_VSYNCGEN(obj), hz);
+    return true;
+}
+
 static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)
 {
     Dx11FbView prime;
+    int vsync_hz;
 
     if (dx11_backend_init() != 0) {
         error_report("dx11: cannot create window or D3D11 device");
@@ -230,6 +246,16 @@ static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)
     /* Resolve the framebuffer device now, while this thread is the only
      * one running; dx11_glue_fb_view keeps the cache warm after that. */
     dx11_glue_fb_view(&prime);
+
+    /* Guest vertical sync rate. The machine's generator delivers it from
+     * the timer thread; this only sets the rate. */
+    if (opts->u.dx11.has_vsync) {
+        vsync_hz = MIN(MAX(opts->u.dx11.vsync, 0), 1000);
+        if (!dx11_glue_set_vsync_hz(vsync_hz)) {
+            warn_report("dx11: this machine has no vertical-sync "
+                        "generator; vsync= ignored");
+        }
+    }
     /* The hand-off: system/main.c sees this set after qemu_init and runs
      * the QEMU main loop on its own thread, giving the UI the main one. */
     qemu_main = dx11_backend_main;

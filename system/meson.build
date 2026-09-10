@@ -39,3 +39,4 @@ system_ss.add(when: 'CONFIG_DEVICE_TREE',
 if host_os == 'linux'
   system_ss.add(files('async-teardown.c'))
 endif
+system_ss.add(files('hrtimer.c'))

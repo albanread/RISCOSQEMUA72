@@ -25,6 +25,9 @@
 #define GIC_SPI_INTERRUPT_DOORBELL0    34
 #define GIC_SPI_INTERRUPT_MPHI         40
 #define GIC_SPI_INTERRUPT_DWC2         73
+#define GIC_SPI_INTERRUPT_SMI          112 /* VC IRQ 48: the vsync latch */
+/* ARMC sources 0-7 appear as SPI 32-39 */
+#define GIC_SPI_INTERRUPT_ARM_TIMER    32
 #define GIC_SPI_INTERRUPT_DMA_0        80
 #define GIC_SPI_INTERRUPT_DMA_6        86
 #define GIC_SPI_INTERRUPT_DMA_7_8      87
@@ -109,6 +112,8 @@ struct BCM2838PeripheralState {
      */
     BCM2838ICState ic;
     SplitIRQ dwc2_irq_splitter;     /* USB goes to the GIC and to ic */
+    SplitIRQ smi_irq_splitter;      /* vsync, likewise */
+    SplitIRQ armtmr_irq_splitter;   /* ARM timer, likewise */
 };
 
 struct BCM2838PeripheralClass {

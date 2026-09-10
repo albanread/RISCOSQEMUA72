@@ -32,6 +32,9 @@
 #include "hw/sd/bcm2835_sdhost.h"
 #include "hw/gpio/bcm2835_gpio.h"
 #include "hw/timer/bcm2835_systmr.h"
+#include "hw/timer/bcm2835_armtimer.h"
+#include "hw/misc/bcm2835_smi.h"
+#include "hw/misc/bcm2835_vsyncgen.h"
 #include "hw/usb/hcd-dwc2.h"
 #include "hw/ssi/bcm2835_spi.h"
 #include "hw/i2c/bcm2835_i2c.h"
@@ -58,7 +61,7 @@ struct BCMSocPeripheralBaseState {
     BCM2835SystemTimerState systmr;
     BCM2835MphiState mphi;
     UnimplementedDeviceState txp;
-    UnimplementedDeviceState armtmr;
+    BCM2835ARMTimerState armtmr;
     BCM2835PowerMgtState powermgt;
     BCM2835CprmanState cprman;
     PL011State uart0;
@@ -83,7 +86,8 @@ struct BCMSocPeripheralBaseState {
     UnimplementedDeviceState ave0;
     UnimplementedDeviceState v3d;
     UnimplementedDeviceState bscsl;
-    UnimplementedDeviceState smi;
+    BCM2835SMIState smi;
+    BCM2835VsyncGenState vsyncgen;
     DWC2State dwc2;
     UnimplementedDeviceState sdramc;
 };
