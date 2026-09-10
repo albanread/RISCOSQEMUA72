@@ -10,14 +10,26 @@
 > The badge goes green when this is the fastest RISC OS A72 emulator there is,
 > with an integrated debugging environment — and it works. Until then, treat
 > everything below as a progress report rather than a product.
+>
+> It does now boot to a networked desktop on two hosts, with keyboard,
+> mouse and sound, which is further than that paragraph was written for.
 
 
 A QEMU fork that boots **RISC OS 5.30 on an emulated Cortex-A72 in 32-bit
 mode** — `-M raspi4b` with the CPU in AArch32 — from the RISC OS Open SD
-image to the desktop, with a USB keyboard, a mouse and an Ethernet-over-USB
+image to the desktop, with a USB keyboard, a mouse, an Ethernet-over-USB
 interface that takes a DHCP lease from QEMU's own network during the boot
-sequence. Power-on to an idle, networked desktop is about 27 seconds on an
-i7-12700.
+sequence, and **sound**. Power-on to an idle, networked desktop is about 27
+seconds on an i7-12700, and 20.8 on an M4: it runs on **macOS as well as
+Windows**, with a native front end on each.
+
+Sound is the newest of those and the one with the least hardware behind it.
+RISC OS reaches the speaker through a VCHIQ service and nothing else — no
+PWM, no I2S, no VideoCore — so the fork answers the service, gathers the
+samples out of the pagelist each bulk transfer describes, and hands them to
+the host's own sound card. What that card takes is what the guest is told
+has played, so its clock *is* the output device: delivery measures **0.998x
+real time**. `riscos-pi4/SOUND.md` is the research and the three sprints.
 
 ![RISC OS 5.30 booted from the ROOL SD image, 800×600: NetSurf on the Welcome page](sd-desktop.png)
 
