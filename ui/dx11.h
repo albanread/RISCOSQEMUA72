@@ -50,6 +50,24 @@ int dx11_glue_fb_view(Dx11FbView *out);
 /* Drop any cached mapping (called once from the UI loop at exit). */
 void dx11_glue_fb_done(void);
 
+/*
+ * Input, called from the UI thread's window procedure.  Each call takes
+ * the BQL just long enough to run the QEMU input API, the way cocoa's
+ * with_bql does; nothing else of QEMU is touched.
+ */
+/* lParam of WM_KEYDOWN/UP/SYSKEYDOWN/UP: scan code bits 16..23, extended
+ * bit 24; repeats are already dropped by the caller. */
+void dx11_glue_key(bool down, uint32_t lparam);
+void dx11_glue_mouse_rel(int dx, int dy);
+void dx11_glue_mouse_btn(int button, bool down); /* 0 left, 1 middle, 2 right */
+void dx11_glue_mouse_wheel(int notches);         /* positive = away from user */
+/* Keyboard grab: while on, the low-level hook swallows Alt+Tab and the
+ * Windows key instead of letting the host see them. */
+void dx11_glue_grab(bool on);
+/* Install the low-level keyboard hook for this window; call once from the
+ * thread that pumps messages, before any grab. */
+void dx11_glue_kbd_hook_window(void *hwnd);
+
 #ifdef __cplusplus
 }
 #endif

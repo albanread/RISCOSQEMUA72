@@ -8,8 +8,9 @@
  * Datasheet: BCM2835 ARM Peripherals (C6357-M-1398)
  * https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf
  *
- * Only the free running 64-bit counter is implemented.
- * The 4 COMPARE registers and the interruption are not implemented.
+ * Free-running 64-bit counter, the four COMPARE channels and their
+ * interrupts are implemented (upstream models the counter only; the rest
+ * came with this fork's RISC OS work).
  */
 
 #include "qemu/osdep.h"
@@ -91,8 +92,16 @@ static void bcm2835_systmr_write(void *opaque, hwaddr offset,
         index = (offset - A_COMPARE0) >> 2;
         s->reg.compare[index] = value;
         now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-        /* Compare lower 32-bits of the free-running counter. */
-        triggers_delay_us = value - now;
+        /*
+         * Compare lower 32-bits of the free-running counter. A value at or
+         * just behind the counter has already matched: hardware raises the
+         * event on the next tick. Computing the delay with unsigned wrap
+         * instead would push it a full 32-bit epoch away -- about 72
+         * minutes -- which reads as the guest's clock stopping dead the
+         * first time a timer interrupt is serviced late (a long FIQ
+         * section under USB input is enough).
+         */
+        triggers_delay_us = (int32_t)(value - now) > 0 ? value - now : 1;
         trace_bcm2835_systmr_run(index, triggers_delay_us);
         timer_mod(&s->tmr[index].timer, now + triggers_delay_us);
         break;

@@ -91,6 +91,32 @@ static void dx11_log(const char *fmt, ...)
 void dx11_screenshot(void);     /* PrintScreen: decoded surface to a PNG */
 
 /* ------------------------------------------------------------------ */
+/* Grab: the guest owns the keyboard and the pointer until Ctrl+Alt+G  */
+
+static struct {
+    bool on;
+} kbd;
+
+static void dx11_set_grab(bool on)
+{
+    if (on == kbd.on) {
+        return;
+    }
+    kbd.on = on;
+    dx11_glue_grab(on);             /* hook swallows Alt+Tab / Win keys */
+    if (on) {
+        RECT r;
+        GetWindowRect(dx11.hwnd, &r);
+        ClipCursor(&r);             /* the pointer lives in the window */
+        ShowCursor(FALSE);
+    } else {
+        ClipCursor(nullptr);
+        ShowCursor(TRUE);
+    }
+    dx11_log("grab %s", on ? "on" : "off");
+}
+
+/* ------------------------------------------------------------------ */
 /* Window                                                              */
 
 static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
@@ -110,13 +136,83 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
                                      DXGI_FORMAT_B8G8R8A8_UNORM, 0);
         }
         return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) {
+            dx11_set_grab(false);   /* never hold the host pointer hostage */
+        }
+        return 0;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        /* Ctrl+Alt+G is the release, and never reaches the guest */
+        if (w == 'G' && (GetKeyState(VK_CONTROL) & 0x8000)
+                     && (GetKeyState(VK_MENU) & 0x8000)) {
+            dx11_set_grab(!kbd.on);
+            return 0;
+        }
+        if (w == VK_SNAPSHOT) {
+            return 0;               /* PrintScreen acts on the up event */
+        }
+        if (l & (1u << 30)) {
+            return 0;               /* auto-repeat: the guest does its own */
+        }
+        dx11_glue_key(true, l);
+        return 0;
     case WM_KEYUP:
+    case WM_SYSKEYUP:
         /* PrintScreen only ever arrives as an up event; no down precedes
          * it, so the screenshot hook lives here. */
         if (w == VK_SNAPSHOT) {
             dx11_screenshot();
+            return 0;
         }
+        dx11_glue_key(false, l);
         return 0;
+    case WM_INPUT: {
+        /* Raw mouse input: relative deltas and buttons, exactly what a
+         * usb-mouse reports to RISC OS as Select/Menu/Adjust. */
+        UINT size = 0;
+        GetRawInputData(reinterpret_cast<HRAWINPUT>(w), RID_INPUT,
+                        nullptr, &size, sizeof(RAWINPUTHEADER));
+        if (size && size <= 512) {
+            uint8_t buf[512];
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(w), RID_INPUT,
+                                buf, &size,
+                                sizeof(RAWINPUTHEADER)) == size) {
+                RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(buf);
+                if (ri->header.dwType == RIM_TYPEMOUSE) {
+                    const RAWMOUSE &m = ri->data.mouse;
+                    if ((m.usFlags & MOUSE_MOVE_RELATIVE)
+                        && (m.lLastX || m.lLastY)) {
+                        dx11_glue_mouse_rel(m.lLastX, m.lLastY);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) {
+                        dx11_glue_mouse_btn(0, true);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) {
+                        dx11_glue_mouse_btn(0, false);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) {
+                        dx11_glue_mouse_btn(1, true);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP) {
+                        dx11_glue_mouse_btn(1, false);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) {
+                        dx11_glue_mouse_btn(2, true);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) {
+                        dx11_glue_mouse_btn(2, false);
+                    }
+                    if (m.usButtonFlags & RI_MOUSE_WHEEL) {
+                        dx11_glue_mouse_wheel(
+                            (int16_t)m.usButtonData / WHEEL_DELTA);
+                    }
+                }
+            }
+        }
+        DefWindowProcW(h, msg, w, l);   /* MSDN: always call for cleanup */
+        return 0;
+    }
     default:
         return DefWindowProcW(h, msg, w, l);
     }
@@ -158,6 +254,17 @@ static bool dx11_create_window(void)
     ShowWindow(dx11.hwnd, SW_SHOW);
     ShowWindow(dx11.hwnd, SW_SHOW);
     UpdateWindow(dx11.hwnd);
+
+    /* Raw mouse input, delivered while the window has focus: usage page
+     * 1 (generic desktop), usage 2 (mouse), no INPUTSINK. */
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = 0;
+    rid.hwndTarget = dx11.hwnd;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        dx11_log("RegisterRawInputDevices failed: %lu", GetLastError());
+    }
     return true;
 }
 
@@ -595,6 +702,9 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     fb.pitch = v->pitch;
     fb.rows = v->rows;
     fb.up = true;
+    dx11_log("pipeline built: gen %u, %ux%u, pitch %u, bpp %u, pan %u,%u",
+             v->generation, v->xres, v->yres, v->pitch, v->bpp,
+             v->xoffset, v->yoffset);
     return true;
 }
 
@@ -604,37 +714,54 @@ static bool fb_build_pipeline(const Dx11FbView *v)
 static uint32_t fb_failed_generation;
 static bool fb_failed;
 
+/* One frame of the guest's screen.  Returns false if there is nothing to
+ * show yet (clear instead). */
+static uint32_t frame_count;
+
 static void fb_upload(const Dx11FbView *v)
 {
     D3D11_MAPPED_SUBRESOURCE map;
+    HRESULT hr;
 
-    if (SUCCEEDED(dx11.context->Map(fb.raw, 0, D3D11_MAP_WRITE_DISCARD,
-                                    0, &map))) {
+    hr = dx11.context->Map(fb.raw, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+    if (SUCCEEDED(hr)) {
         const uint8_t *src = (const uint8_t *)v->fb;
         for (uint32_t y = 0; y < v->rows; y++) {
             memcpy((uint8_t *)map.pData + (size_t)y * map.RowPitch,
                    src + (size_t)y * v->pitch, v->pitch);
         }
         dx11.context->Unmap(fb.raw, 0);
+    } else if (frame_count % 300 == 0) {
+        dx11_log("raw Map failed: %#x", (unsigned)hr);
     }
 
     if (memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {
         memcpy(fb.pal_cache, v->palette, sizeof(fb.pal_cache));
-        if (SUCCEEDED(dx11.context->Map(fb.palette, 0,
-                                        D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+        hr = dx11.context->Map(fb.palette, 0, D3D11_MAP_WRITE_DISCARD, 0,
+                               &map);
+        if (SUCCEEDED(hr)) {
             memcpy(map.pData, fb.pal_cache, sizeof(fb.pal_cache));
             dx11.context->Unmap(fb.palette, 0);
+        } else {
+            dx11_log("palette Map failed: %#x", (unsigned)hr);
         }
     }
 }
 
-/* One frame of the guest's screen.  Returns false if there is nothing to
- * show yet (clear instead). */
 static bool dx11_render_frame(void)
 {
     Dx11FbView v;
 
+    if (++frame_count % 300 == 0) {
+        dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u",
+                 frame_count, fb.up ? "up" : "down",
+                 fb.generation, fb.xres, fb.yres, fb.bpp);
+    }
+
     if (!dx11_glue_fb_view(&v)) {
+        if (frame_count % 300 == 0) {
+            dx11_log("frame %u: no fb view yet", frame_count);
+        }
         return false;
     }
     if (!fb.up || v.generation != fb.generation) {
@@ -796,6 +923,10 @@ extern "C" int dx11_backend_main(void)
     if (!dx11.ready) {
         return 1;
     }
+    /* The low-level keyboard hook must be installed from the thread that
+     * pumps messages, which is this one; it only acts while grabbed. */
+    dx11_glue_kbd_hook_window(dx11.hwnd);
+
     /* A frame: pull the guest's screen, upload, decode, scale, present
      * at vsync.  Nothing here holds a QEMU lock. */
     const float clear[] = { 0.05f, 0.05f, 0.08f, 1.0f };
