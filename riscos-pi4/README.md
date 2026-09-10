@@ -92,6 +92,15 @@ The screen is 800×600 because the firmware channel now answers
 `GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
 MonitorType EDID; RISC OS's ScreenModes does the rest.
 
+**Sound**, through the VCHIQ audio service RISC OS actually uses:
+`BCMSound` opens `'AUDS'` and ships PCM over the channel this fork
+already owned, so there is no audio hardware modelled at all. The samples
+are gathered out of the pagelist each bulk transfer describes and handed
+to QEMU's audio backend — `coreaudio` on macOS, `dsound` on Windows — and
+what the host's sound card takes is what the guest is told has played, so
+its clock is the real output device and delivery measures 0.998x real
+time. `riscos-pi4/SOUND.md` is the research and the three sprints.
+
 Not working yet: `SET_CLOCK_RATE` is still NYI. There is no way to get files
 into a running guest except through the card image. The boot spends about
 five seconds reading the card at a millisecond per stall for reasons that

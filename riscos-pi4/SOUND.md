@@ -235,9 +235,9 @@ every sound.
 - **S2 — bulk receive. Done; see section 11.** `BULK_TX` → walk the
   pagelist → copy → reply `BULK_TX_DONE`, and write the samples to a
   `.wav` so they can be looked at.
-- **S3 — real output.** Open the voice from `CONFIG`, write from the ring
-  in `audio_cb`, and move `COMPLETE` onto what the backend actually took.
-  *This is where it makes a noise.*
+- **S3 — real output. Done; see section 12.** Open the voice from
+  `CONFIG`, write from the ring in the audio callback, and move
+  `COMPLETE` onto what the backend actually took.
 - **S4 — the edges.** Rate changes mid-stream (`CLOSE`/`OPEN`/`CONFIG`
   without a gap), `STOP` with draining, the starved bit, `CONTROL` volume
   applied rather than merely acknowledged, and migration state for the
@@ -450,3 +450,65 @@ build, and the symptom was silence — which is indistinguishable from
 - alternating `0x201a000` / `0x201b000`, no unreadable pages over a boot
 - peak amplitude traced per buffer (`bcm2835_vchiq_auds_pcm`), which is
   how silence is told from a tune without anything to listen with
+
+## 12. Sprint 3, as built
+
+RISC OS makes a noise.
+
+```
+vchiq AUDS voice open at 44100 Hz, 2 channels
+vchiq AUDS sound card took 8192 bytes, 4096 still queued
+vchiq AUDS sound card took 2048 bytes, 10240 still queued
+```
+
+`CONFIG` opens the voice at the format it asks for; the samples gathered
+out of the pagelist go into a ring; and the audio callback — which QEMU
+runs from the main-loop audio timer, so the BQL is held and a message can
+be queued and a doorbell rung from it — writes the ring to
+`audio_be_write` and reports **exactly what the sound card took** as the
+`COMPLETE`. `START` and `STOP` gate the voice. It is `coreaudio` on
+macOS and `dsound` on Windows, both already in the builds, so the same
+device makes sound on both hosts with no per-platform code.
+
+### The clock was the point
+
+| | delivered | of real time |
+| --- | --- | --- |
+| sprint 1, a deadline per buffer | 73.4 s / 96 s | 0.76x |
+| sprint 1, one virtual clock | 68.3 s / 96 s | 0.71x |
+| **sprint 3, the sound card** | **29.95 s / 30.0 s** | **0.998x** |
+
+Section 11 promised this and it is worth being precise about why it
+works, because it is not that the new code is more careful. It is that
+there is no longer a model of how fast audio should play: the host's
+sound card consumes at the real rate because it *is* the real rate, and
+reporting its consumption verbatim makes the guest's clock the same
+clock. Nothing to tune, and nothing that can drift, because the two
+quantities are the same quantity.
+
+The measurement wants care of its own. The first two attempts at it
+divided the audio delivered over a whole run by a guessed sound-start
+time and produced 0.65x and 0.68x, which had me looking for a starvation
+bug that was not there — the ring depth was sitting steady at 10240 bytes
+throughout, which is the opposite of starved. Sampling the delivered
+total over a known thirty-second interval gave 0.998x. The ratio was
+always right; the denominator was a guess.
+
+### The fallback
+
+A machine with no audio backend is not an error. `audio_be_check` falls
+back to a default and, if there is genuinely nothing, the virtual-clock
+pacer from sprint 1 stays in charge so the guest's sound loop still
+turns. `AUDIODEV=none riscos-pi4/tools/run-macos.sh` is silence that
+still boots and still runs.
+
+### What is left
+
+- **`CONTROL` is acknowledged, not applied.** Volume and output
+  destination arrive and are answered; the voice ignores them.
+- **A rate change mid-stream reopens the voice** and drops whatever was
+  in the ring. RISC OS sets the rate once at start-up in practice.
+- **The starved bit** in `COMPLETE` (bit 30) is never set. When the ring
+  does run dry the guest is told a smaller number rather than told it
+  starved, which is honest but less informative than it could be.
+- **No capture.** RISC OS has no path for it here worth the trouble.

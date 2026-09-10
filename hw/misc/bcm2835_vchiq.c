@@ -31,6 +31,7 @@
 #include "system/dma.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "trace.h"
@@ -374,6 +375,105 @@ static void auds_complete(BCM2835VchiqState *s, uint32_t bytes)
     auds_reply(s, msg);
 }
 
+/*
+ * The sound card's pull. Whatever it takes out of the ring is what the
+ * guest is told has played, so the reports come out at the rate the host
+ * actually consumes audio -- no timer to tune and nothing to drift
+ * against. Called from the audio timer on the main loop, BQL held, which
+ * is what makes it safe to queue a message and ring the doorbell here.
+ */
+static void auds_audio_cb(void *opaque, int avail)
+{
+    BCM2835VchiqState *s = opaque;
+    uint32_t reported = 0;
+
+    if (!s->auds_open || !s->voice) {
+        return;
+    }
+    while (avail > 0 && s->ring_used) {
+        uint32_t run = MIN((uint32_t)avail, s->ring_used);
+        size_t took;
+
+        /* One contiguous piece at a time: the ring wraps, the API does not */
+        run = MIN(run, s->ring_size - s->ring_tail);
+        took = audio_be_write(s->audio_be, s->voice, s->ring + s->ring_tail,
+                              run);
+        if (!took) {
+            break;
+        }
+        s->ring_tail = (s->ring_tail + took) % s->ring_size;
+        s->ring_used -= took;
+        reported += took;
+        avail -= took;
+    }
+    if (reported) {
+        trace_bcm2835_vchiq_auds_played(reported, s->ring_used);
+        auds_complete(s, reported);
+        vchiq_signal_guest(s, s->slave_base + VCHIQ_SS_TRIGGER);
+    }
+}
+
+/* Open, or re-open at a new format. Silent failure leaves s->voice NULL
+ * and the virtual-clock fallback in charge. */
+static void auds_open_voice(BCM2835VchiqState *s)
+{
+    struct audsettings as;
+
+    if (!s->audio_be || s->auds_bps != 16 || !s->auds_rate ||
+        !s->auds_channels) {
+        return;
+    }
+    as.freq = s->auds_rate;
+    as.nchannels = s->auds_channels;
+    as.fmt = AUDIO_FORMAT_S16;
+    as.big_endian = false;
+
+    s->voice = audio_be_open_out(s->audio_be, s->voice, TYPE_BCM2835_VCHIQ,
+                                 s, auds_audio_cb, &as);
+    if (!s->voice) {
+        qemu_log_mask(LOG_UNIMP, "%s: no voice at %u Hz, %u channels\n",
+                      __func__, s->auds_rate, s->auds_channels);
+        return;
+    }
+    if (!s->ring) {
+        s->ring_size = VCHIQ_AUDS_RING_BYTES;
+        s->ring = g_malloc(s->ring_size);
+    }
+    s->ring_head = s->ring_tail = s->ring_used = 0;
+    trace_bcm2835_vchiq_auds_voice(s->auds_rate, s->auds_channels);
+}
+
+/* Put a buffer's samples where the sound card will find them. */
+static void auds_ring_push(BCM2835VchiqState *s, const uint8_t *buf,
+                           uint32_t len)
+{
+    uint32_t space = s->ring_size - s->ring_used;
+
+    if (len > space) {
+        /*
+         * Only reachable if the host stopped consuming: the guest sends
+         * more only when we report, so it cannot outrun us by itself.
+         * Drop the oldest rather than the newest, so what plays next is
+         * what the guest sent most recently.
+         */
+        uint32_t drop = len - space;
+
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: audio ring full, dropping %u "
+                      "bytes\n", __func__, drop);
+        s->ring_tail = (s->ring_tail + drop) % s->ring_size;
+        s->ring_used -= drop;
+    }
+    while (len) {
+        uint32_t run = MIN(len, s->ring_size - s->ring_head);
+
+        memcpy(s->ring + s->ring_head, buf, run);
+        s->ring_head = (s->ring_head + run) % s->ring_size;
+        s->ring_used += run;
+        buf += run;
+        len -= run;
+    }
+}
+
 /* Bytes a second of the format the guest last configured, 0 if none */
 static uint32_t auds_byte_rate(const BCM2835VchiqState *s)
 {
@@ -426,6 +526,11 @@ static void auds_queue_playback(BCM2835VchiqState *s, uint32_t bytes)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t rate = auds_byte_rate(s);
 
+    if (s->voice && bytes) {
+        /* The sound card is the clock; auds_audio_cb does the reporting */
+        auds_ring_push(s, s->bulk_buf, bytes);
+        return;
+    }
     if (!rate || !bytes) {
         /* No format yet: answer at once rather than lose the buffer */
         auds_complete(s, bytes);
@@ -448,6 +553,10 @@ static void auds_close(BCM2835VchiqState *s)
     s->auds_running = false;
     s->auds_outstanding = 0;
     s->auds_played_ns = 0;
+    s->ring_head = s->ring_tail = s->ring_used = 0;
+    if (s->voice) {
+        audio_be_set_active_out(s->audio_be, s->voice, false);
+    }
     if (s->auds_timer) {
         hrtimer_del(s->auds_timer);
     }
@@ -474,6 +583,7 @@ static unsigned auds_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
             s->auds_bps = vchiq_ld(s, body + 12);
             trace_bcm2835_vchiq_auds_config(s->auds_channels, s->auds_rate,
                                             s->auds_bps);
+            auds_open_voice(s);
         }
         auds_result(s, 0);
         return 1;
@@ -489,6 +599,9 @@ static unsigned auds_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
         s->auds_running = false;
         s->auds_outstanding = 0;
         s->auds_played_ns = 0;
+        if (s->voice) {
+            audio_be_set_active_out(s->audio_be, s->voice, false);
+        }
         auds_result(s, 0);
         return 1;
 
@@ -498,10 +611,16 @@ static unsigned auds_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
     case VC_AUDIO_MSG_TYPE_START:
         s->auds_running = true;
         s->auds_played_ns = 0;
+        if (s->voice) {
+            audio_be_set_active_out(s->audio_be, s->voice, true);
+        }
         return 0;
 
     case VC_AUDIO_MSG_TYPE_STOP:
         s->auds_running = false;
+        if (s->voice) {
+            audio_be_set_active_out(s->audio_be, s->voice, false);
+        }
         return 0;
 
     case VC_AUDIO_MSG_TYPE_WRITE:
@@ -755,7 +874,8 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
                     VCHIQ_MAKE_MSG(VCHIQ_MSG_BULK_TX_DONE,
                                    VCHIQ_AUDS_VC_PORT, s->auds_port),
                     &bulk_size, 4);
-                auds_queue_playback(s, bulk_size);
+                /* Only what we actually read can be played on */
+                auds_queue_playback(s, MIN(got, bulk_size));
             }
             break;
         }
@@ -980,7 +1100,18 @@ static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_VCHIQ "-memory");
 
-    /* The audio clock. One deadline list, fired under the BQL, the same
+    /*
+     * The sound card, if this machine has one. Not having one is not an
+     * error: the guest's sound loop still has to turn, so the fallback
+     * paces the reports on the virtual clock instead.
+     */
+    if (!audio_be_check(&s->audio_be, NULL)) {
+        s->audio_be = NULL;
+        warn_report("bcm2835-vchiq: no audio backend; RISC OS will play "
+                    "to nothing");
+    }
+
+    /* The fallback clock. One deadline, fired under the BQL, the same
      * thread the vsync generator and the system timer run on. */
     s->auds_timer = hrtimer_new(auds_timer_fire, s);
 
@@ -988,6 +1119,7 @@ static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property bcm2835_vchiq_props[] = {
+    DEFINE_AUDIO_PROPERTIES(BCM2835VchiqState, audio_be),
     /* Where to write what the guest plays, for looking at before there
      * is anything to listen to. Empty means do not capture. */
     DEFINE_PROP_STRING("wav", BCM2835VchiqState, wav_path),

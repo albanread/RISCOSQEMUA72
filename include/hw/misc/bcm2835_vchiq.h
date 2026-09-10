@@ -10,6 +10,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qemu/hrtimer.h"
+#include "qemu/audio.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_VCHIQ "bcm2835-vchiq"
@@ -110,6 +111,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835VchiqState, BCM2835_VCHIQ)
 #define VCHIQ_AUDS_TICK_NS          (5 * 1000 * 1000)
 
 /*
+ * Room for the samples between the guest's bursts and the sound card's
+ * pull. BCMSound runs about 50 ms ahead and only sends more when we
+ * report, so this is several times what it can ever have outstanding.
+ */
+#define VCHIQ_AUDS_RING_BYTES       (128 * 1024)
+
+/*
  * The bulk transfers do not carry the samples: they carry the bus address
  * of a pagelist describing where the samples are. Linux's
  * vchiq_pagelist.h is the layout, and RISC OS ships a copy of it.
@@ -186,6 +194,22 @@ struct BCM2835VchiqState {
      * reports are paced on the virtual clock at the rate CONFIG asked
      * for. Sprint 3 moves the pacing onto the audio backend, which is
      * the host's real sound card and cannot drift against it.
+     */
+    /*
+     * The voice. What the host's sound card takes is what gets reported
+     * in COMPLETE, so the guest is clocked by the real output device and
+     * cannot drift against it -- which is the whole reason the audio
+     * backend is the right thing to hang this on rather than a timer.
+     */
+    AudioBackend *audio_be;
+    SWVoiceOut *voice;
+    uint8_t *ring;              /* samples waiting for the sound card */
+    uint32_t ring_size, ring_head, ring_tail, ring_used;
+
+    /*
+     * The fallback, for a machine with no audio backend at all: the same
+     * reports paced on the virtual clock instead. Slower and driftier,
+     * but it keeps the guest's sound loop turning.
      */
     HRTimer *auds_timer;
     uint64_t auds_outstanding;  /* bytes taken but not yet reported played */

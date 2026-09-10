@@ -8,6 +8,8 @@
 #   QEMU_BIN       the built emulator (default: build-macos/)
 #   DISPLAY_OPT    the -display argument; "cocoa" for QEMU's own display,
 #                  which converts the framebuffer on the CPU
+#   AUDIODEV       the -audiodev driver (default coreaudio; "none" for
+#                  silence that still keeps the guest's sound loop turning)
 #
 # Anything after the options is passed on to QEMU.
 #
@@ -17,6 +19,7 @@ ROOT="${HERE:h:h}"
 IMAGES="${RISCOS_IMAGES:-$ROOT/riscos-images}"
 Q="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 DISPLAY_OPT="${DISPLAY_OPT:-metal,vsync=30}"
+AUDIODEV="${AUDIODEV:-coreaudio}"
 
 for f in "$Q" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
     [[ -e "$f" ]] || { print -u2 "missing: $f"; exit 1; }
@@ -31,6 +34,8 @@ args=(
     -device usb-kbd,bus=usb-bus.0,port=1.1
     -device usb-tablet,bus=usb-bus.0,port=1.2
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3
+    -audiodev "$AUDIODEV",id=snd0
+    -global bcm2835-vchiq.audiodev=snd0
     -display "$DISPLAY_OPT"
     -qmp tcp:127.0.0.1:4455,server,nowait
 )
