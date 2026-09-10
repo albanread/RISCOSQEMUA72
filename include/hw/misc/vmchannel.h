@@ -58,6 +58,7 @@
 #define VMCH_CMD_RENAME   10
 #define VMCH_CMD_CONSOLE  16
 #define VMCH_CMD_TIME     17
+#define VMCH_CMD_SETSIZE  18
 
 /* rc codes */
 #define VMCH_RC_OK        0

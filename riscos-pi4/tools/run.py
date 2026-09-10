@@ -74,6 +74,9 @@ def command_line(args, overlay):
     ]
     if args.snapshot:
         argv += ["-loadvm", args.snapshot]
+    if args.hostfs:
+        argv += ["-global",
+                 "bcm2838-peripherals.vmchannel-root=" + args.hostfs]
     return argv
 
 
@@ -180,6 +183,9 @@ def main():
     ap.add_argument("--kernel", default=KERNEL)
     ap.add_argument("--cmos", default=CMOS)
     ap.add_argument("--image", default=IMAGE)
+    ap.add_argument("--hostfs", metavar="DIR",
+                    help="serve this host directory as HostFS:$ through "
+                         "the doorbell device")
     args = ap.parse_args()
 
     overlay = overlay_for(args.image)

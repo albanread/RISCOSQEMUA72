@@ -33,6 +33,15 @@ static uint32_t ld32(hwaddr a)
     return ldl_le_phys(&address_space_memory, a);
 }
 
+static uint8_t ld8(hwaddr a)
+{
+    uint8_t v = 0;
+
+    address_space_rw(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
+                     &v, 1, false);
+    return v;
+}
+
 static void st32(hwaddr a, uint32_t v)
 {
     stl_le_phys(&address_space_memory, a, v);
@@ -211,10 +220,11 @@ static uint32_t attrs_for(const GStatBuf *st)
     return a;
 }
 
-static uint32_t date_cs_for(const GStatBuf *st)
+static uint64_t date_cs_for(const GStatBuf *st)
 {
-    /* centiseconds since 1900, the RISC OS 5-byte instant */
-    return (uint32_t)((uint64_t)(st->st_mtime + 2208988800ULL) * 100);
+    /* centiseconds since 1900, the RISC OS 5-byte instant: must stay
+     * 64-bit, the value is ~3.9e11 for 2026 dates */
+    return (uint64_t)(st->st_mtime + 2208988800ULL) * 100;
 }
 
 /* ------------------------------------------------------------------ */
@@ -287,15 +297,37 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         if (s->fds[h] < 0) {
             rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
         } else {
-            st32(base + VMCH_HDR_HANDLE, (uint32_t)h);
+            /* handles are 1-based over the wire: 0 means "no file" to
+             * a RISC OS FSEntry_Open caller */
+            st32(base + VMCH_HDR_HANDLE, (uint32_t)(h + 1));
         }
         g_free(hp);
         g_free(path);
         break;
     }
 
+    case VMCH_CMD_SETSIZE: {
+        int h = (int)ld32(base + VMCH_HDR_HANDLE) - 1;
+        uint32_t ne = ld32(base + VMCH_HDR_ARG + 0);
+        int r = -1;
+
+        if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
+            rc = VMCH_RC_ACCESS;
+            break;
+        }
+#ifdef _WIN32
+        r = _chsize_s(s->fds[h], (long long)ne);
+#else
+        r = ftruncate(s->fds[h], (off_t)ne);
+#endif
+        if (r != 0) {
+            rc = VMCH_RC_IOERR;
+        }
+        break;
+    }
+
     case VMCH_CMD_CLOSE: {
-        int h = (int)ld32(base + VMCH_HDR_HANDLE);
+        int h = (int)ld32(base + VMCH_HDR_HANDLE) - 1;
 
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
             rc = VMCH_RC_ACCESS;
@@ -308,7 +340,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
     case VMCH_CMD_READ:
     case VMCH_CMD_WRITE: {
-        int h = (int)ld32(base + VMCH_HDR_HANDLE);
+        int h = (int)ld32(base + VMCH_HDR_HANDLE) - 1;
         hwaddr bufaddr = (hwaddr)(uint32_t)ld32(base + VMCH_HDR_ARG + 0);
         uint32_t len = ld32(base + VMCH_HDR_ARG + 4);
         void *tmp;
@@ -342,7 +374,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
     }
 
     case VMCH_CMD_SEEK: {
-        int h = (int)ld32(base + VMCH_HDR_HANDLE);
+        int h = (int)ld32(base + VMCH_HDR_HANDLE) - 1;
         int64_t off = (int64_t)(int32_t)ld32(base + VMCH_HDR_ARG + 0);
         int whence = (int)ld32(base + VMCH_HDR_ARG + 4);
         static const int w[] = { SEEK_SET, SEEK_CUR, SEEK_END };
@@ -543,13 +575,15 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
     }
 
     case VMCH_CMD_CONSOLE: {
-        uint8_t *buf = g_malloc(arglen ? arglen : 1);
+        uint8_t *buf;
 
-        if (arglen > VMCH_MAX_ARG) {
+        if (arglen > VMCH_MAX_ARG) {     /* bound check BEFORE the
+                                          * allocation: arglen is a raw
+                                          * guest value up to 4 GiB */
             rc = VMCH_RC_BADPATH;
-            g_free(buf);
             break;
         }
+        buf = g_malloc(arglen ? arglen : 1);
         block_read(base + VMCH_HDR_SIZE, buf, arglen);
         /*
          * A log file next to the other debug output: stderr is no use,
@@ -580,6 +614,24 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
     default:
         rc = VMCH_RC_BADCMD;
         break;
+    }
+
+    /* Development trace: every doorbell request, one stderr line.  The
+     * arg text is only decoded for path-carrying commands. */
+    if (cmd != VMCH_CMD_PING) {
+        fprintf(stderr, "vmch: cmd=%u hnd=%08x arglen=%u rc=%u",
+                cmd, ld32(base + VMCH_HDR_HANDLE), arglen, rc);
+        if (cmd == VMCH_CMD_OPEN || cmd == VMCH_CMD_CREATE ||
+            cmd == VMCH_CMD_DELETE || cmd == VMCH_CMD_CAT ||
+            cmd == VMCH_CMD_FILEARGS) {
+            uint32_t i;
+            fprintf(stderr, " path=");
+            for (i = 0; i < arglen && i < 64; i++) {
+                int c = ld8(base + VMCH_HDR_SIZE + i);
+                fputc((c >= 32 && c < 127) ? c : '.', stderr);
+            }
+        }
+        fputc('\n', stderr);
     }
 
     st32(base + VMCH_HDR_RC, rc);

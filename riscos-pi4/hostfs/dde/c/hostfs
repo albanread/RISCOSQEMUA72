@@ -1,0 +1,912 @@
+/* hostfs.c — the HostFS module body, DDE build (riscos-pi4/FSDESIGN.md).
+ *
+ * A filing system over the vmchannel doorbell at 0xFD400000: every
+ * operation becomes one request block built in this module's statics,
+ * poked into the doorbell, and answered in place by the device.
+ *
+ * This is the Acorn C/C++ port of the roscc body in ../hostfs.c.  cmhg
+ * provides the module header, lifecycle veneers and statics relocation;
+ * the seven generic FS entry veneers are cmhg-generated and call the
+ * fsentry_*_handler functions here with a live register block.  The FS
+ * information block for OS_FSControl 12 is built at RUNTIME (offsets
+ * computed from live addresses and the module base from OS_Module 18),
+ * exactly as LanManFS's LM_Declare does — see PRM2 page 2-532: "the
+ * block need not exist for long, as FileSwitch takes a copy of it".
+ */
+
+#include "kernel.h"
+#include <stdio.h>                       /* also provides NULL */
+
+typedef unsigned int   uint32_t;
+typedef int            int32_t;
+typedef unsigned char  uint8_t;
+
+/* ---- the doorbell (0xFD400000, the low-peripheral window) ---------- */
+
+#define VMCH_BASE        0xFD400000u
+#define VMCH_MAGIC      0x00
+#define VMCH_FEATURES   0x08
+#define VMCH_CMD        0x0C
+#define VMCH_MAGIC_VALUE 0x48434D56u
+#define VMCH_FEATURE_FS 0x1u
+
+#define VMCH_MAX_ARG 8192
+#define VMCH_MAX_OPEN 16                 /* device handle slots (1-based) */
+
+/* The request block, mirroring include/hw/misc/vmchannel.h exactly.
+ * The device reads BYTE offsets; the previous H_* word indices
+ * mismatched every field past CMD, so rc/arglen/handle were read from
+ * bytes the device never writes.  One struct, byte-accurate, so the
+ * two sides cannot drift again. */
+struct vmreq {
+    uint32_t cmd;                       /* +0  VMCH_HDR_CMD */
+    uint32_t seq;                       /* +4  VMCH_HDR_SEQ */
+    uint32_t rc;                        /* +8  VMCH_HDR_RC */
+    uint32_t handle;                    /* +12 VMCH_HDR_HANDLE */
+    uint32_t arglen;                    /* +16 VMCH_HDR_ARGLEN */
+    uint8_t  scratch[44];               /* +20 VMCH_HDR_ARG .. +63 */
+    uint8_t  data[VMCH_MAX_ARG];        /* +64 VMCH_HDR_SIZE */
+};
+
+/* word n of the scratch arg area (READ/WRITE buffer+count, SEEK
+ * offset+whence, SETSIZE size) */
+#define REQW(n) (*(uint32_t *)&req->scratch[(n) * 4])
+
+#define C_PING     0
+#define C_OPEN     1
+#define C_CLOSE    2
+#define C_READ     3
+#define C_WRITE    4
+#define C_SEEK     5
+#define C_FILEARGS 6
+#define C_CAT      7
+#define C_CREATE   8
+#define C_DELETE   9
+#define C_SETSIZE 18
+
+#define RC_OK        0
+#define RC_NOROOT    1
+#define RC_NOTFOUND  2
+#define RC_ACCESS    3
+#define RC_BADPATH   4
+#define RC_FULL      5
+#define RC_HANDLES   6
+#define RC_NOTDIR    7
+#define RC_ISDIR     8
+
+#define O_READ   0x1u
+#define O_WRITE  0x2u
+#define O_CREATE 0x4u
+#define O_TRUNC  0x8u
+
+/* XSWI numbers (swis.h pulls in a large generated header; these four
+ * are all this module needs) */
+#define XOS_Module          0x2001E
+#define XOS_FSControl       0x20029
+#define XOS_Memory          0x20068
+
+#define vmch_reg(idx) (*(volatile uint32_t *)(VMCH_BASE + (uint32_t)(idx) * 4u))
+
+/* The doorbell masks the request address down to 16 bytes.  Norcroft
+ * has no aligned attribute, so over-allocate and line it up in init. */
+static uint8_t reqstore[sizeof(struct vmreq) + 16];
+static struct vmreq *req;
+static uint32_t seq;
+
+/* Per-handle state, for FSEntry_Args: the doorbell is stateless (each
+ * op carries its own seek), so ptr/ext/load/exec live here instead.
+ * Device handles are 1-based; 0 means no file. */
+static uint32_t hptr[VMCH_MAX_OPEN];
+static uint32_t hext[VMCH_MAX_OPEN];
+static uint32_t hload[VMCH_MAX_OPEN];
+static uint32_t hexec[VMCH_MAX_OPEN];
+
+static _kernel_oserror err_notfound    = { 0x1D6, "HostFS: file not found" };
+static _kernel_oserror err_access      = { 0xBD,  "HostFS: access denied" };
+static _kernel_oserror err_badpath     = { 0x1E4, "HostFS: bad path" };
+static _kernel_oserror err_full        = { 0x101, "HostFS: directory too big" };
+static _kernel_oserror err_nodev       = { 0x1E4, "HostFS: no doorbell device" };
+static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" };
+static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
+
+static _kernel_oserror *rc_to_error(uint32_t rc)
+{
+    switch (rc) {
+    case RC_OK: return NULL;
+    case RC_NOTFOUND: return &err_notfound;
+    case RC_ACCESS: case RC_HANDLES: return &err_access;
+    case RC_BADPATH: return &err_badpath;
+    case RC_FULL: return &err_full;
+    case RC_NOROOT: return &err_nofs;
+    default: return &err_unsupported;
+    }
+}
+
+/* ---- the transport -------------------------------------------------- */
+
+static uint32_t vmch_go(void)
+{
+    req->seq = ++seq;
+    vmch_reg(VMCH_CMD / 4) = (uint32_t)req;
+    return req->rc;
+}
+
+static uint32_t vmch_arglen(void)
+{
+    return req->arglen;
+}
+
+/* path: NUL-terminated RISC OS path into the arg area */
+static void put_path(const char *path)
+{
+    char *arg = (char *)req->data;
+    uint32_t i = 0;
+
+    while (path[i] && i < VMCH_MAX_ARG - 1) {
+        arg[i] = path[i];
+        i++;
+    }
+    arg[i] = 0;
+    req->arglen = i;
+}
+
+/* one catalogue entry as cached from CAT */
+struct catent {
+    uint32_t load, exec, len, attr, type;
+    char name[48];
+};
+static struct catent catents[128];
+
+/* load/exec for a typed, dated file: load's low byte carries
+ * centiseconds 39..32, exec carries 31..0 */
+static void stamp_load_exec(uint32_t type, uint32_t cs_hi, uint32_t cs_lo,
+                            uint32_t *load, uint32_t *exec)
+{
+    if (type == 0xFFF || (cs_hi == 0 && cs_lo == 0)) {
+        *load = *exec = (type == 0xFFF) ? 0xFFFFFFFFu : 0;
+        return;
+    }
+    *load = 0xFFF00000u | (type << 8) | (cs_hi & 0xFFu);
+    *exec = cs_lo;
+}
+
+/* FILEARGS: 5-word response size,type,attr,cs_lo,cs_hi */
+static uint32_t info_of(const char *path, uint32_t *size, uint32_t *type,
+                        uint32_t *attr, uint32_t *cs_lo, uint32_t *cs_hi)
+{
+    uint32_t rc;
+    uint32_t *resp;
+
+    req->cmd = C_FILEARGS;
+    req->handle = 0;
+    put_path(path);
+    rc = vmch_go();
+    if (rc != RC_OK) {
+        return rc;
+    }
+    resp = (uint32_t *)req->data;
+    *size = resp[0];
+    *type = resp[1];
+    *attr = resp[2];
+    *cs_lo = resp[3];
+    *cs_hi = resp[4];
+    return RC_OK;
+}
+
+/* object type in the OS_File sense: 1 file, 2 directory, 0 none */
+static uint32_t objtype_of(uint32_t rc, uint32_t type)
+{
+    if (rc != RC_OK) {
+        return 0;
+    }
+    return type == 0 ? 2 : 1;
+}
+
+static uint32_t vmch_req_close(uint32_t h)
+{
+    req->cmd = C_CLOSE;
+    req->handle = h;
+    req->arglen = 0;
+    return vmch_go();
+}
+
+/* ---- guest buffer plumbing ------------------------------------------ */
+
+/* OS_Memory 0: translate one logical address to physical.  The device
+ * DMAs physical memory, so every guest buffer address must go through
+ * this before it enters a request block. */
+struct pbrec {
+    int32_t  page;                  /* physical page number */
+    uint32_t log;                   /* logical address */
+    uint32_t phys;                  /* physical address */
+};
+
+static uint32_t mem_phys(uint32_t log)
+{
+    struct pbrec pb;
+    _kernel_swi_regs r;
+
+    pb.page = -1;
+    pb.log = log;
+    pb.phys = 0;
+    r.r[0] = (1u << 9) | (1u << 13);    /* logical given, physical filled */
+    r.r[1] = (int)&pb;
+    r.r[2] = 1;
+    if (_kernel_swi(XOS_Memory, &r, &r) != NULL) {
+        return log;                     /* last resort: assume identity */
+    }
+    return pb.phys;
+}
+
+/* Move n bytes between the file (at file offset ptr) and guest memory
+ * at logical address mem.  Chunks never cross a 4KB page, so each
+ * translated address stays valid for the whole chunk.  Returns bytes
+ * moved; the per-handle pointer is maintained by the caller. */
+static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
+                     int is_write)
+{
+    uint32_t done = 0;
+
+    while (done < n) {
+        uint32_t chunk = n - done;
+        uint32_t left = 0x1000u - ((mem + done) & 0xFFFu);
+        uint32_t rc, moved;
+
+        if (chunk > left) {
+            chunk = left;
+        }
+
+        req->cmd = C_SEEK;
+        req->handle = h;
+        req->arglen = 0;
+        REQW(0) = ptr + done;
+        REQW(1) = 0;             /* SEEK_SET */
+        if (vmch_go() != RC_OK) {
+            break;
+        }
+
+        req->cmd = is_write ? C_WRITE : C_READ;
+        req->handle = h;
+        req->arglen = 0;
+        REQW(0) = mem_phys(mem + done);
+        REQW(1) = chunk;
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            break;
+        }
+        moved = req->handle;             /* bytes actually transferred */
+        if (moved == 0 || moved > chunk) {
+            moved = (moved > chunk) ? chunk : moved;
+            if (moved == 0 && !is_write) {
+                break;                  /* EOF */
+            }
+        }
+        done += moved;
+        if (moved < chunk && !is_write) {
+            break;                      /* short read: stop at EOF */
+        }
+    }
+    return done;
+}
+
+/* ---- FS entry handlers: r->r[] is the caller's register frame ------- */
+
+_kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t mode = (uint32_t)r->r[0];
+    const char *name = (const char *)r->r[1];
+    uint32_t flags = O_READ;
+    uint32_t rc, h, idx, load, exec;
+    uint32_t size = 0, type = 0xFFF, attr = 0, cs_lo = 0, cs_hi = 0;
+
+    (void)pw;
+
+    /* FSEntry_Open modes (PRM2 2-542): 0 read, 2 update; 1 is the
+     * RISC OS 2 create+update, kept for compatibility.  FileSwitch
+     * pre-creates via FSEntry_File 7 for OPENOUT. */
+    if (mode == 1) {
+        flags = O_WRITE | O_CREATE | O_TRUNC;
+    } else if (mode == 2) {
+        flags = O_WRITE | O_READ;
+    }
+
+    req->cmd = C_OPEN;
+    req->handle = flags;
+    put_path(name);
+    rc = vmch_go();
+    if (rc != RC_OK) {
+        return rc_to_error(rc);
+    }
+    h = req->handle;
+    if (h == 0 || h > VMCH_MAX_OPEN) {
+        return &err_access;             /* 0 means "no file open" */
+    }
+    idx = h - 1;
+
+    rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+    if (rc == RC_NOTFOUND) {
+        size = 0;                       /* newly created file */
+        type = 0xFFF;
+    } else if (rc != RC_OK) {
+        vmch_req_close(h);
+        return rc_to_error(rc);
+    }
+    stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
+
+    hptr[idx] = 0;
+    hext[idx] = size;
+    hload[idx] = load;
+    hexec[idx] = exec;
+
+    /* file information word: write+read granted, bit 28 declares the
+     * unbuffered GBPB convention (address in R2, file ptr in R4) */
+    r->r[0] = (int)((1u << 31) | (1u << 30) | (1u << 28));
+    r->r[1] = (int)h;
+    r->r[2] = 0;      /* unbuffered: every get/put carries the address */
+    r->r[3] = (int)((type == 0) ? 0 : size);
+    r->r[4] = (int)((size + 0xFFFu) & ~0xFFFu);   /* allocated: rounded */
+    return NULL;
+}
+
+_kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t h = (uint32_t)r->r[1];
+    uint32_t mem = (uint32_t)r->r[2];
+    uint32_t n = (uint32_t)r->r[3];
+    uint32_t ptr = (uint32_t)r->r[4];
+    uint32_t moved;
+    int idx = (int)h - 1;
+
+    (void)pw;
+
+    if (idx < 0 || idx >= VMCH_MAX_OPEN) {
+        return &err_access;
+    }
+    moved = xfer(h, ptr, mem, n, 0);
+    hptr[idx] = ptr + moved;
+    r->r[3] = (int)moved;
+    return NULL;
+}
+
+_kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t h = (uint32_t)r->r[1];
+    uint32_t mem = (uint32_t)r->r[2];
+    uint32_t n = (uint32_t)r->r[3];
+    uint32_t ptr = (uint32_t)r->r[4];
+    uint32_t moved;
+    int idx = (int)h - 1;
+
+    (void)pw;
+
+    if (idx < 0 || idx >= VMCH_MAX_OPEN) {
+        return &err_access;
+    }
+    moved = xfer(h, ptr, mem, n, 1);
+    hptr[idx] = ptr + moved;
+    if (hptr[idx] > hext[idx]) {
+        hext[idx] = hptr[idx];
+    }
+    r->r[3] = (int)moved;
+    return NULL;
+}
+
+_kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t h = (uint32_t)r->r[1];
+    int idx = (int)h - 1;
+
+    (void)pw;
+
+    if (idx < 0 || idx >= VMCH_MAX_OPEN) {
+        return &err_access;
+    }
+
+    /* Reason numbers are FileSwitch's internal ones (LowFSI:212), not
+     * the OS_Args SWI numbers: flush arrives as 6, not 255. */
+    switch (r->r[0]) {
+    case 0:                            /* ReadPTR */
+        r->r[2] = (int)hptr[idx];
+        return NULL;
+    case 1:                            /* SetPTR: host fseek extends
+                                        * lazily, so just accept it */
+        hptr[idx] = (uint32_t)r->r[2];
+        if (hptr[idx] > hext[idx]) {
+            hext[idx] = hptr[idx];
+        }
+        return NULL;
+    case 2:                            /* ReadEXT */
+        r->r[2] = (int)hext[idx];
+        return NULL;
+    case 3: {                          /* SetEXT: real truncate/extend */
+        uint32_t ne = (uint32_t)r->r[2];
+
+        req->cmd = C_SETSIZE;
+        req->handle = h;
+        req->arglen = 0;
+        REQW(0) = ne;
+        if (vmch_go() != RC_OK) {
+            return &err_access;
+        }
+        hext[idx] = ne;
+        if (hptr[idx] > ne) {
+            hptr[idx] = ne;
+        }
+        return NULL;
+    }
+    case 4:                            /* ReadSize: allocated size */
+        r->r[2] = (int)((hext[idx] + 0xFFFu) & ~0xFFFu);
+        return NULL;
+    case 5:                            /* EOFCheck: -1 at EOF */
+        r->r[2] = (hptr[idx] >= hext[idx]) ? -1 : 0;
+        return NULL;
+    case 6:                            /* Flush: hand back load/exec */
+    case 9:                            /* ReadLoadExec */
+        r->r[2] = (int)hload[idx];
+        r->r[3] = (int)hexec[idx];
+        return NULL;
+    case 7:                            /* EnsureSize: no-op */
+    case 10:                           /* ImageStampIs: image FS only */
+        return NULL;
+    default:                           /* incl. 8 WriteZeroes (buffered
+                                        * only) and 11 IOCtl */
+        return &err_unsupported;
+    }
+}
+
+_kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t rc = vmch_req_close((uint32_t)r->r[1]);
+    int idx = (int)r->r[1] - 1;
+
+    (void)pw;
+    if (idx >= 0 && idx < VMCH_MAX_OPEN) {
+        hptr[idx] = hext[idx] = 0;
+    }
+    return (rc == RC_OK) ? NULL : rc_to_error(rc);
+}
+
+_kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t reason = (uint32_t)r->r[0];
+    const char *name = (const char *)r->r[1];
+    uint32_t size, type, attr, cs_lo, cs_hi, rc, h, load, exec, len;
+
+    (void)pw;
+
+    switch (reason) {
+    case 5:                            /* read catalogue info */
+    case 9:                            /* ...without length */
+        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+        {
+            uint32_t obj = objtype_of(rc, type);
+
+            r->r[0] = (int)obj;
+            if (!obj) {
+                return NULL;
+            }
+            if (obj == 2) {
+                load = exec = 0;
+                size = 0;
+                attr = 3;
+            } else {
+                stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
+            }
+            r->r[2] = (int)load;
+            r->r[3] = (int)exec;
+            r->r[4] = (int)size;
+            r->r[5] = (int)attr;
+        }
+        return NULL;
+
+    case 0xFF: {                       /* load into memory at r2 */
+        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+        if (rc == RC_NOTFOUND) {
+            r->r[0] = 0;
+            return NULL;
+        }
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        if (type == 0) {
+            r->r[0] = 2;
+            return &err_unsupported;
+        }
+        req->cmd = C_OPEN;
+        req->handle = O_READ;
+        put_path(name);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        h = req->handle;
+
+        {
+            uint32_t moved = xfer(h, 0, (uint32_t)r->r[2], size, 0);
+
+            vmch_req_close(h);
+            if (moved != size) {
+                return &err_access;
+            }
+            rc = RC_OK;
+        }
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
+        r->r[0] = 1;
+        r->r[2] = (int)load;
+        r->r[3] = (int)exec;
+        r->r[4] = (int)size;
+        r->r[5] = (int)attr;
+        return NULL;
+    }
+
+    case 0: {                          /* save: data r4..r5 */
+        len = (uint32_t)(r->r[5] - r->r[4]);
+        req->cmd = C_CREATE;
+        req->handle = 0;
+        put_path(name);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        req->cmd = C_OPEN;
+        req->handle = O_WRITE | O_TRUNC;
+        put_path(name);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        h = req->handle;
+        {
+            uint32_t moved = xfer(h, 0, (uint32_t)r->r[4], len, 1);
+
+            vmch_req_close(h);
+            if (moved != len) {
+                return &err_access;
+            }
+            rc = RC_OK;
+        }
+        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+        load = exec = 0xFFFFFFFFu;
+        if (rc == RC_OK) {
+            stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
+        }
+        r->r[0] = 1;
+        r->r[2] = (int)load;
+        r->r[3] = (int)exec;
+        r->r[4] = (int)len;
+        r->r[5] = 3;
+        return NULL;
+    }
+
+    case 7:                            /* create empty */
+        req->cmd = C_CREATE;
+        req->handle = 0;
+        put_path(name);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        r->r[0] = 1;
+        r->r[2] = r->r[3] = -1;
+        r->r[4] = 0;
+        r->r[5] = 3;
+        return NULL;
+
+    case 6:                            /* delete */
+        req->cmd = C_DELETE;
+        req->handle = 0;
+        put_path(name);
+        rc = vmch_go();
+        if (rc == RC_NOTFOUND) {
+            r->r[0] = 0;
+            return NULL;
+        }
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        r->r[0] = 1;
+        return NULL;
+
+    default:
+        return &err_unsupported;
+    }
+}
+
+_kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
+{
+    uint32_t off, want, buflen, nbytes, n, done, load, exec, entlen, namelen;
+    uint8_t *buf, *src;
+    uint32_t rc;
+
+    (void)pw;
+
+    switch (r->r[0]) {
+    case 0: case 1:                    /* *Dir / *Lib: FileSwitch stores
+                                        * the prefix; nothing to do */
+        return NULL;
+    case 8: {                          /* read disc name and boot option:
+                                        * <len><name><opt> at r2 (PRM2
+                                        * FSEntry_Func 8).  FileSwitch
+                                        * asks this when canonicalising
+                                        * "HostFS:" style paths. */
+        static const char disc[] = "HostFS";
+        uint8_t *b = (uint8_t *)r->r[2];
+        uint32_t k = 0;
+
+        b[k++] = sizeof(disc) - 1;
+        while (disc[k - 1]) {
+            b[k] = disc[k - 1];
+            k++;
+        }
+        b[k] = 2;                       /* boot option 2 (Run), cosmetic */
+        return NULL;
+    }
+    case 16:                           /* shutdown */
+    case 17:                           /* print banner */
+    case 28:                           /* WriteBootOption: no-op */
+    case 32:                           /* StampImage: no-op */
+        return NULL;
+
+    case 27:                           /* ReadBootOption: 0 (SimpleFS
+                                        * says never error this) */
+        r->r[2] = 0;
+        return NULL;
+
+    case 14:                           /* read names: FileSwitch can get
+                                        * names from the info form */
+        return &err_unsupported;
+
+    case 15: {                         /* read names + info */
+        off = (uint32_t)r->r[4];
+        want = (uint32_t)r->r[3];
+        buf = (uint8_t *)r->r[2];
+        buflen = (uint32_t)r->r[5];
+
+        /* catalogue the whole directory into the cache */
+        req->cmd = C_CAT;
+        req->handle = 0;
+        put_path((const char *)r->r[1]);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        nbytes = vmch_arglen();
+        n = nbytes / 64;
+        if (n > 128) {
+            n = 128;
+        }
+        src = req->data;
+        for (uint32_t i = 0; i < n; i++) {
+            struct catent *e = &catents[i];
+            uint8_t *en = src + i * 64;
+            e->type = ((uint32_t)en[48]) | ((uint32_t)en[49] << 8)
+                    | ((uint32_t)en[50] << 16) | ((uint32_t)en[51] << 24);
+            e->len = ((uint32_t)en[52]) | ((uint32_t)en[53] << 8)
+                   | ((uint32_t)en[54] << 16) | ((uint32_t)en[55] << 24);
+            e->attr = ((uint32_t)en[56]) | ((uint32_t)en[57] << 8)
+                    | ((uint32_t)en[58] << 16) | ((uint32_t)en[59] << 24);
+            /* v0 leaves files undated: dates would need a FILEARGS
+             * per name; the type word still carries the filetype */
+            for (int k = 0; k < 47; k++) {
+                e->name[k] = en[k];
+                if (!en[k]) {
+                    break;
+                }
+            }
+            e->name[47] = 0;
+        }
+
+        /* fill the caller's buffer from the continuation offset */
+        done = 0;
+        while (off < n && done < want) {
+            struct catent *e = &catents[off];
+            namelen = 0;
+            while (e->name[namelen]) {
+                namelen++;
+            }
+            entlen = 20 + ((namelen + 1 + 3) & ~3u);
+            if (entlen > buflen) {
+                break;
+            }
+            if (e->type == 0) {
+                load = exec = 0;
+                e->len = 0;
+                e->attr = 3;
+            } else {
+                stamp_load_exec(e->type, 0, 0, &load, &exec);
+            }
+            {
+                uint32_t *w = (uint32_t *)buf;
+                w[0] = load;
+                w[1] = exec;
+                w[2] = e->len;
+                w[3] = e->attr;
+                w[4] = e->type;
+            }
+            for (uint32_t k = 0; k < ((namelen + 1 + 3) & ~3u); k++) {
+                buf[20 + k] = k <= namelen ? e->name[k] : 0;
+            }
+            buf += entlen;
+            buflen -= entlen;
+            off++;
+            done++;
+        }
+        r->r[3] = (int)done;
+        r->r[4] = (off >= n) ? -1 : (int)off;
+        return NULL;
+    }
+
+    default:
+        return &err_unsupported;
+    }
+}
+
+/* ---- module lifecycle ---------------------------------------------- */
+
+static int registered;
+
+/* the cmhg-generated FS entry veneers, defined in the header object */
+extern void fsentry_open(void);
+extern void fsentry_get(void);
+extern void fsentry_put(void);
+extern void fsentry_args(void);
+extern void fsentry_close(void);
+extern void fsentry_file(void);
+extern void fsentry_func(void);
+
+static const char FilingSystemName[] = "HostFS";
+static void *hostfs_pw;
+
+#define OUR_FS_NUMBER 220
+#define INFO_FSFILE9_NOLEN 0x04000000u  /* LowFSI:121 fsinfo_fsfilereadinfonolen */
+#define INFO_WORD (OUR_FS_NUMBER | (16u << 8) | INFO_FSFILE9_NOLEN)
+
+_kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    uint32_t base;
+    unsigned int InfoBlk[12];
+
+    (void)cmd_tail;
+    (void)podule_base;
+
+    /* line the request block up to the doorbell's 16-byte mask */
+    req = (struct vmreq *)(((uint32_t)reqstore + 15u) & ~15u);
+
+    /* Both ends must be present: the doorbell in the peripheral
+     * window, and its root= property (features bit 0) for FS work. */
+    if (vmch_reg(VMCH_MAGIC / 4) != VMCH_MAGIC_VALUE) {
+        return &err_nodev;
+    }
+    if (!(vmch_reg(VMCH_FEATURES / 4) & VMCH_FEATURE_FS)) {
+        return &err_nofs;
+    }
+
+    /* Our own load address, for the base-relative FSInfo offsets.
+     * OS_Module 18: R1 = module number, R3 = pointer to module code
+     * (Kernel/s/ModHand:1411). R3 is the base FileSwitch must store. */
+    r.r[0] = 18;                         /* OS_Module 18: enumerate by title */
+    r.r[1] = (int)"HostFS";
+    e = _kernel_swi(XOS_Module, &r, &r);
+    if (e != NULL || r.r[3] == 0) {
+        return &err_nodev;
+    }
+    base = (uint32_t)r.r[3];
+
+    /* The filing system information block, built at runtime from live
+     * addresses (PRM2 2-532: FileSwitch copies it immediately) */
+    InfoBlk[0]  = (unsigned int)((unsigned long)FilingSystemName - base);
+    InfoBlk[1]  = 0;                     /* no startup banner */
+    InfoBlk[2]  = (unsigned int)((unsigned long)fsentry_open  - base);
+    InfoBlk[3]  = (unsigned int)((unsigned long)fsentry_get   - base);
+    InfoBlk[4]  = (unsigned int)((unsigned long)fsentry_put   - base);
+    InfoBlk[5]  = (unsigned int)((unsigned long)fsentry_args  - base);
+    InfoBlk[6]  = (unsigned int)((unsigned long)fsentry_close - base);
+    InfoBlk[7]  = (unsigned int)((unsigned long)fsentry_file  - base);
+    InfoBlk[8]  = INFO_WORD;             /* fs 220, 16 streams, File 9 */
+    InfoBlk[9]  = (unsigned int)((unsigned long)fsentry_func  - base);
+    InfoBlk[10] = 0;                     /* gbpb: FileSwitch synthesises */
+    InfoBlk[11] = 0;
+
+    r.r[0] = 12;                         /* FSControl_AddFS */
+    r.r[1] = (int)base;
+    r.r[2] = (int)((unsigned long)InfoBlk - base);
+    r.r[3] = (int)pw;
+    e = _kernel_swi(XOS_FSControl, &r, &r);
+    if (e != NULL) {
+        return e;                        /* loud: never register silently */
+    }
+
+    registered = 1;
+    hostfs_pw = pw;
+    return NULL;
+}
+
+_kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw)
+{
+    (void)fatal;
+    (void)podule_base;
+    (void)pw;
+    if (registered) {
+        _kernel_swi_regs r;
+        uint32_t h;
+
+        /* hand back any host descriptors the device still holds */
+        for (h = 1; h <= VMCH_MAX_OPEN; h++) {
+            (void)vmch_req_close(h);
+        }
+        r.r[0] = 16;                     /* FSControl_RemoveFS, by name */
+        r.r[1] = (int)FilingSystemName;
+        (void)_kernel_swi(XOS_FSControl, &r, &r);
+        registered = 0;
+    }
+    return NULL;
+}
+
+_kernel_oserror *hostfs_commands(const char *arg_string, int argc,
+                                 int cmd_no, void *pw)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    (void)arg_string;
+    (void)argc;
+    (void)pw;
+
+    /* cmd_no is cmhg's index into the command-keyword-table, in table
+     * order: 0 = HostFSPing, 1 = HostFSStatus.  Keep this switch and
+     * dde/cmhg/HostFS in lockstep if the table is reordered. */
+    if (cmd_no == 1) {                   /* *HostFSStatus */
+        uint32_t magic = vmch_reg(VMCH_MAGIC / 4);
+        uint32_t feats = vmch_reg(VMCH_FEATURES / 4);
+
+        printf("HostFS magic=%08X features=%08X registered=%d pw=%08X\r\n",
+               magic, feats, registered, (unsigned int)pw);
+        r.r[0] = 0;                      /* our own base, via OS_Module 18 */
+        r.r[1] = (int)"HostFS";
+        e = _kernel_swi(XOS_Module, &r, &r);
+        printf("OS_Module 18: e=%d R1(num)=%08X R3(base)=%08X R4(pw)=%08X\r\n",
+               e != NULL, r.r[1], r.r[3], r.r[4]);
+        r.r[0] = 13;                     /* FSControl_LookupFS, by name */
+        r.r[1] = (int)"HostFS";
+        e = _kernel_swi(XOS_FSControl, &r, &r);
+        printf("FSControl 13: e=%d", e != NULL);
+        if (e != NULL) {
+            printf(" num=%d %s", e->errnum, e->errmess);
+        } else {
+            printf(" R1=%08X R2=%08X R3=%08X", r.r[1], r.r[2], r.r[3]);
+        }
+        printf("\r\n");
+        r.r[0] = 20;                     /* FSControl_ReadModuleBase */
+        r.r[1] = (int)"HostFS";
+        e = _kernel_swi(XOS_FSControl, &r, &r);
+        printf("FSControl 20: e=%d", e != NULL);
+        if (e != NULL) {
+            printf(" num=%d %s", e->errnum, e->errmess);
+        } else {
+            printf(" R1=%08X", r.r[1]);
+        }
+        printf("\r\n");
+        return NULL;
+    }
+
+    if (cmd_no != 0) {                   /* only HostFSPing besides */
+        return &err_unsupported;
+    }
+
+    req->cmd = C_PING;
+    req->handle = 0;
+    req->arglen = 4;
+    req->data[0] = 'P';
+    req->data[1] = 'N';
+    req->data[2] = 'G';
+    req->data[3] = '!';
+    if (vmch_go() != RC_OK || vmch_arglen() != 4) {
+        return &err_nodev;
+    }
+    return NULL;
+}

@@ -1,0 +1,6 @@
+# Assembler/build outputs. Sources are the .s.in templates, benchfb.s, *.py.
+*.o
+*.bin
+bench.s
+bench2.s
+vmchtest.s

@@ -1,0 +1,10 @@
+| Build — compile and link the HostFS module with the DDE.
+| Produces <Obey$Dir>.HostFS,ffa.  Obey halts at the first failing
+| command, so any error below is the one to read.  The o directory is
+| expected to exist already.
+Set HostFS$Dir <Obey$Dir>
+Dir <Obey$Dir>
+cc -c -zM -zps1 -ffah -IC: -o o.hostfs c.hostfs
+cmhg cmhg.HostFS -o o.head
+link -rmf -o HostFS,ffa o.head o.hostfs C:o.stubs
+Echo Built <HostFS$Dir>.HostFS,ffa
