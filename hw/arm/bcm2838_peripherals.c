@@ -67,6 +67,12 @@ static void bcm2838_peripherals_init(Object *obj)
                             TYPE_SPLIT_IRQ);
     object_initialize_child(obj, "armtmr-irq-splitter",
                             &s->armtmr_irq_splitter, TYPE_SPLIT_IRQ);
+
+    /* The HostFS doorbell; realised in bcm2838_peripherals_realize with
+     * the root the machine was given, if any ("vmchannel-root" is a
+     * plain qdev string property, set by the machine from -M or by
+     * -global). */
+    object_initialize_child(obj, "vmchannel", &s->vmchannel, TYPE_VMCHANNEL);
 }
 
 static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
@@ -213,6 +219,22 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->peri_low_mr, BCM2711_GENET_OFFSET,
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->genet), 0), -1000);
 
+    /*
+     * The HostFS doorbell (riscos-pi4/FSDESIGN.md) at 0xfd400000: a hole
+     * the HAL does not name.  Always mapped, so the guest can probe the
+     * magic; file commands only when a root was configured.
+     */
+    if (s->vmchannel_root && s->vmchannel_root[0]) {
+        qdev_prop_set_string(DEVICE(&s->vmchannel), "root",
+                             s->vmchannel_root);
+    }
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->vmchannel), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_low_mr, VMCHANNEL_OFFSET,
+                                sysbus_mmio_get_region(
+                                     SYS_BUS_DEVICE(&s->vmchannel), 0));
+
     /* Map MPHI to BCM2838 memory map */
     mphi_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s_base->mphi), 0);
     memory_region_init_alias(&s->mphi_mr_alias, OBJECT(s), "mphi", mphi_mr, 0,
@@ -293,6 +315,13 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
     create_unimp(s_base, &s->asb, "bcm2838-asb", BRDG_OFFSET, 0x24);
 }
 
+static const Property bcm2838_peripherals_props[] = {
+    /* The HostFS doorbell's root directory; unset = doorbell answers
+     * PING only (no file commands until a root is given). */
+    DEFINE_PROP_STRING("vmchannel-root", BCM2838PeripheralState,
+                       vmchannel_root),
+};
+
 static void bcm2838_peripherals_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -302,6 +331,7 @@ static void bcm2838_peripherals_class_init(ObjectClass *oc, const void *data)
     bc->peri_low_size = 0x2000000;
     bc_base->peri_size = 0x1800000;
     dc->realize = bcm2838_peripherals_realize;
+    device_class_set_props(dc, bcm2838_peripherals_props);
 }
 
 static const TypeInfo bcm2838_peripherals_type_info = {

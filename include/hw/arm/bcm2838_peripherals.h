@@ -13,6 +13,7 @@
 #include "hw/sd/sdhci.h"
 #include "hw/gpio/bcm2838_gpio.h"
 #include "hw/intc/bcm2838_ic.h"
+#include "hw/misc/vmchannel.h"
 
 /* SPI */
 /*
@@ -76,6 +77,15 @@
 #define BCM2711_GENET_OFFSET    0x1580000
 #define BCM2711_GENET_SIZE      0x10000
 
+/*
+ * The HostFS doorbell (riscos-pi4/FSDESIGN.md): 0xfd400000, a hole in the
+ * BCM2711 low-peripheral map that RISC OS's HAL device table does not
+ * name (nothing at &014xxxxx) and that no other model maps, so the guest
+ * discovers it by magic alone.
+ */
+#define VMCHANNEL_OFFSET        0x1400000
+#define VMCHANNEL_SIZE          0x4000
+
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
 
@@ -94,6 +104,10 @@ struct BCM2838PeripheralState {
 
     UnimplementedDeviceState pcie;
     UnimplementedDeviceState genet;
+
+    /* The HostFS doorbell, mapped at VMCHANNEL_OFFSET in the low window */
+    VMChannelState vmchannel;
+    char *vmchannel_root;          /* forwarded to the doorbell's root= */
 
     SDHCIState emmc2;
     BCM2838GpioState gpio;

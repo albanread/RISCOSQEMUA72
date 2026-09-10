@@ -74,12 +74,15 @@ fixed header then command-specific fields, then inline data:
     +8   u32  rc        (response: 0 = OK, else a host errno-ish code)
     +12  u32  handle    (open file handle, or scratch)
     +16  u32  arg_len   (bytes of inline data following the header)
-    +20   ..   command-specific words, zero-padded to +64
+    +20   ..   command-specific words, zero-padded to +64 (the PING
+                   response leaves the magic here, proving the
+                   device->guest direction)
     +64   ..   arg_len bytes: path text, file data, catalogue entries
 
 Commands, version 0:
 
-    0  PING          arg: 4 bytes; response echoes them.  The smoke test.
+    0  PING          arg is read and written back (both DMA directions),
+                     and +20 receives the magic.  The smoke test.
     1  OPEN          arg: path; +16: RISC OS open flags.  Response:
                      handle, or rc = not-found / access.
     2  CLOSE         handle.  No response data.
@@ -92,9 +95,10 @@ Commands, version 0:
                      addresses derived from the host mtime, size, type,
                      attributes — the shape `OS_File 17` expects, so the
                      Filer and *Cat show honest information.
-    7  CAT           path (a directory).  Response: array of entries,
-                     each 48 bytes: name[40], type, size, attributes.
-                     One level, like *Cat.
+    7  CAT           path (a directory).  Response: array of 64-byte
+                     entries — name[48], type, size, attributes, pad —
+                     until the response length is exhausted.  One level,
+                     like *Cat.
     8  CREATE        path, +16: type, +20: size.  (Files; directories by
                      creating a file inside them.)
     9  DELETE        path.

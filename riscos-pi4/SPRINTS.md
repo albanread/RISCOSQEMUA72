@@ -304,6 +304,23 @@ Two routes, in order of cheapness:
    *Done when:* the bare-metal guest pings the device and gets its bytes
    back over the serial port.
 
+   **Done.**  The hole is 0xfd400000 (peri_low +0x1400000): nothing in
+   the HAL's device table lives at &014xxxxx and nothing else maps there.
+   `hw/misc/vmchannel.c` implements the FSDESIGN protocol — PING plus
+   the file command set, paths clamped under root= by construction (a
+   guest path must be `$`-rooted with plain `.`-separated components) —
+   and lives behind `-global bcm2838-peripherals.vmchannel-root=DIR`.
+   The smoke test `tools/vmchtest.s` (bench-harness style, 196 bytes)
+   prints, over the PL011:
+
+       48434d56   magic: the guest found the doorbell
+       00000000   rc: a poisoned deadbeef was cleared by the device
+       48434d56   scratch word: device -> guest write proven
+       11223344   arg bytes echoed: both DMA directions work
+       00000001   STATUS
+
+   No vmstate: registers only, nothing persists between requests.
+
    **6B — the HostFS module (2–3 days).**  Module on the mojomod
    pattern, FS registration (`HostFS`, unclaimed number), the FSEntry
    points the desktop exercises, metadata synthesised from host mtime,

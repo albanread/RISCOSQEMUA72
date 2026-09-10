@@ -1,0 +1,63 @@
+    .arch armv7-a
+    .text
+    .global _start
+_start:
+    mrc  p15, 0, r0, c0, c0, 5   @ MPIDR: only core 0 runs the test
+    ands r0, r0, #3
+    bne  .
+
+    movw r9, #:lower16:UART
+    movt r9, #:upper16:UART
+    mov  r0, #0x301
+    str  r0, [r9, #0x30]         @ UARTCR = UARTEN|TXE|RXE
+
+    @ ---- read the doorbell's MAGIC ------------------------------------
+    movw r1, #:lower16:VMCH
+    movt r1, #:upper16:VMCH
+    ldr  r0, [r1, #0]
+    bl   phex                    @ expect 48434d56
+
+    @ ---- PING: request block at 0x4000 --------------------------------
+    movw r2, #:lower16:0x4000
+    movt r2, #:upper16:0x4000
+    mov  r0, #0
+    str  r0, [r2, #0]            @ cmd = 0 (PING)
+    mov  r0, #1
+    str  r0, [r2, #4]            @ seq = 1
+    ldr  r0, =0xdeadbeef
+    str  r0, [r2, #8]            @ rc = garbage; the device must clear it
+    mov  r0, #4
+    str  r0, [r2, #16]           @ arglen = 4
+    ldr  r0, =0x11223344
+    str  r0, [r2, #64]           @ arg bytes
+    mov  r0, #0
+    str  r0, [r2, #20]           @ scratch word; the device writes magic
+
+    str  r2, [r1, #12]           @ CMD = block address: the doorbell
+
+    ldr  r0, [r2, #8]
+    bl   phex                    @ expect 00000000 (rc = OK)
+    ldr  r0, [r2, #20]
+    bl   phex                    @ expect 48434d56 (device -> guest write)
+    ldr  r0, [r2, #64]
+    bl   phex                    @ expect 11223344 (arg bytes preserved)
+    ldr  r0, [r1, #16]
+    bl   phex                    @ STATUS: expect 00000001
+
+3:  b    3b
+
+    @ ---- print r0 as 8 hex digits + newline ---------------------------
+    @ clobbers r4, r6 only; r1 (doorbell), r2 (block), r9 (UART) survive
+phex:
+    mov  r6, #28
+1:  lsr  r4, r0, r6
+    and  r4, r4, #0xf
+    cmp  r4, #10
+    addlt r4, r4, #48
+    addge r4, r4, #87
+    str  r4, [r9]
+    subs r6, r6, #4
+    bge  1b
+    mov  r4, #10
+    str  r4, [r9]
+    bx   lr
