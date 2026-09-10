@@ -140,14 +140,19 @@ void dx11_glue_fb_done(void)
 
 void dx11_glue_key(bool down, uint32_t lparam)
 {
+    /*
+     * Bits 16-23 of a WM_KEY* lParam are the AT set 1 scan code and bit 24
+     * the 0xE0 prefix, which is exactly how the atset1 keymap is indexed.
+     * (The win32 keymap is keyed by virtual-key codes: index it with a scan
+     * code and 'z', 0x2c, becomes VK_SNAPSHOT -- the Print key.)
+     */
     uint32_t scancode = (lparam >> 16) & 0xff;
-    uint32_t extended = (lparam & (1u << 24)) ? 0x80 : 0;
-    uint32_t win32 = scancode | extended;
+    uint32_t code = (lparam & (1u << 24)) ? (0xe000 | scancode) : scancode;
 
-    if (win32 >= qemu_input_map_win32_to_linux_len) {
+    if (code >= qemu_input_map_atset1_to_linux_len) {
         return;
     }
-    unsigned int lnx = qemu_input_map_win32_to_linux[win32];
+    unsigned int lnx = qemu_input_map_atset1_to_linux[code];
     if (lnx == 0) {
         return;
     }
