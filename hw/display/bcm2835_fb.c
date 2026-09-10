@@ -456,10 +456,26 @@ static int bcm2835_fb_post_load(void *opaque, int version_id)
      * The generation counter is not part of the snapshot: it exists only to
      * tell the display backend that the config it cached is stale. Move it
      * here so a loaded state forces a re-read.
+     *
+     * The cached console mapping (fbsection) is not migrated either; it is
+     * rebuilt on the next update only when invalidate is set.  A session
+     * that had refreshed its console once saved invalidate=false, and the
+     * restored process then walked a zeroed section -- a segfault on the
+     * first screendump or console refresh after loadvm.
      */
     BCM2835FBState *s = opaque;
 
     s->generation += 2;
+    s->invalidate = true;
+    /*
+     * A restored machine never passes through bcm2835_fb_reconfigure, so
+     * the console would keep its placeholder surface and the first
+     * screendump or refresh would draw into it (draw_line saw dst=
+     * 0x448fc000, unmapped).  Size it to the restored mode here.
+     */
+    if (s->config.xres && s->config.yres) {
+        qemu_console_resize(s->con, s->config.xres, s->config.yres);
+    }
     return 0;
 }
 
