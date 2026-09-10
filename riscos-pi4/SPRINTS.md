@@ -200,6 +200,24 @@ document what a frame costs.
 *Done when:* instruction-rate figures with the window open match those
 without.
 
+**Done.** `bench`/`bench2` (register-only and load/store loops, timed by
+the guest's own 1 MHz system timer, printed over the PL011) ran
+headless, with the window clearing, and with the window's full pipeline
+live — `benchfb` is the variant that programs a 800×600×32 framebuffer
+over mailbox channel 1 before timing, so upload+decode+scale+present
+run at 60 Hz while the loop is measured.  Interleaved pairs (the
+desktop was also running; single samples wobble ±10 %):
+
+    headless                ~1580 MIPS
+    window, full pipeline   ~1540 MIPS   (-2.3 %, within the noise)
+
+The 1.9 MB-per-frame upload costs the guest nothing measurable — the UI
+thread and the GPU are off the vCPU's core — so dirty-row uploads are
+not asked for and were not built.  For scale against real silicon:
+~1580 MIPS register-only and ~455 MIPS memory-bound is between a
+quarter and a half of one real Pi 4 core on synthetics (best case par),
+NEON-heavy code worse; that is TCG's usual standing, not the window's.
+
 ---
 
 ## 5 — snapshots: the desktop in under a second (3 days)
