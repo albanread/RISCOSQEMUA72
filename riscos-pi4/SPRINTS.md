@@ -522,6 +522,95 @@ one-page quick start that says where to get the ROM and the image and what
 
 ---
 
+## 15 — frame coherence: no torn or half-moved windows (2–3 days)
+
+What is seen: brief tearing, and windows that sit in the wrong place for a
+frame during a drag. Where it comes from: the UI thread copies the guest
+framebuffer once per host frame without any lock, while the vCPU thread is
+drawing into it and, since the DMA fix, moving whole windows through it in
+one instantaneous 2D copy under the BQL. A copy that starts mid-move shows
+a window half in each place. RISC OS itself never double-buffers the Wimp,
+so its intermediate states are real, but on a Pi they last a scanout; here
+the guest draws two to three times slower and the capture is unsynchronised,
+so they are seen.
+
+- The frame is captured on the timer thread at the guest's vsync, into a
+  staging buffer, *before* the vsync interrupt is raised, with the BQL
+  held: the DMA copy cannot interleave, and anything RISC OS does "at
+  vsync" (pointer redraw, palette and screen-start updates, a game's
+  bank swap after OS_Byte 19) lands after the capture, so bank-switched
+  games are tear-free by construction. The UI thread uploads the staging
+  buffer at the next host vsync.
+- Capture rate follows the vsync rate; 60 by default once this is in, so
+  the window shows every guest frame the guest could have shown a monitor.
+- The pointer stops being drawn into the framebuffer: Sprint 13's host
+  sprite (the mailbox cursor tags answered for real) removes the pointer
+  save-and-restore, which is the other visible flicker.
+- Measured: a torn-frame counter in the debug log (the capture compares a
+  row checksum before and after) reads zero over a drag session.
+
+Done when a window dragged across the desktop is never seen in two places,
+and a bank-switching game shows no tear.
+
+## 16 — modes: what the Display Manager is allowed to see (2 days)
+
+RISC OS builds its mode list from the monitor's EDID, filtered by what
+BCMVideo can drive, and BCMVideo drives any size the GPU scales. Today the
+EDID the property channel answers with carries one detailed timing
+(800×600) and two established timings, so the Display Manager offers three
+sizes. The window's decoders cover every depth in the firmware contract;
+the guest driver asks only for 8, 16 and 32 bpp, and that is BCMVideo's
+choice, not a limit of ours.
+
+- The EDID becomes data: a table of modes (640×480 through 3840×2160,
+  including 1280×720, 1280×800, 1366×768, 1440×900, 1600×1200, 1920×1080,
+  1920×1200, 2560×1440) rendered into the base block's standard timings
+  and detailed timings and a CTA-861 extension block for the rest, with
+  checksums computed, and block 1 answered by GET_EDID_BLOCK.
+- The preferred timing is a setting (Sprint 17): it is the desktop's
+  default mode at boot. `-display dx11,mode=1920x1080` for the command
+  line.
+- The window's default size follows the preferred mode times the DPI
+  scale, so a 1:1 desktop is readable on a scaled display.
+- Verified with the Display Manager's list and a mode change into each
+  size, and the pipeline log showing the new pitch.
+
+Done when the Display Manager lists the table and every entry displays.
+
+## 17 — settings: one window, and a page that explains itself (4–5 days)
+
+The main window stays minimal: no toolbars, no panes. A key chord
+(Ctrl+Alt+S, alongside Ctrl+Alt+G and Alt+Enter) or the system menu's
+"Settings…" replaces the guest view with a full-client settings page while
+the machine keeps running; the same chord or Escape brings the desktop
+back. Large type, sections down the left, one setting per row with a line
+of help beside it, and a mark on anything that needs a restart.
+
+- The settings model is a JSON document (`%APPDATA%\RISCOSQEMU\settings.json`)
+  that the launcher and the emulator both read: machine (RAM, ROM, CMOS
+  choices via mkcmos), display (mode, window size, fullscreen, scaling,
+  scanlines, vsync rate), input (grab policy, key chords, tablet or
+  mouse), storage (card image, overlay, snapshots), network (user-mode,
+  port forwards, HostFS root), diagnostics (fps and MIPS in the title,
+  logs). Tier two drives the same document.
+- The page is drawn in the existing D3D11 swap chain (Dear ImGui, MIT,
+  with its Win32 and DX11 backends), so there is still one window and no
+  second toolkit; live settings apply at once, restart settings offer
+  "Apply and restart", which relaunches with the new command line.
+- Every setting has its help text in the model, so the page and the
+  command-line reference are generated from one source.
+
+Done when a new user can pick a mode, a card image and a HostFS folder
+without the command line, and the page reads as help rather than as a
+form.
+
+## Tier two, noted for later
+
+The IDE-embedded developer emulator reuses everything above: the settings
+document, QMP as the control plane, the snapshot menu, and a window that
+can render into a child HWND or a shared DXGI surface the IDE composes.
+Nothing in tier one should assume it owns the top-level window.
+
 ## Days, added up
 
 U0–U4: 12–14 days. Sprints 5–8: 15–20. Sprint 13: 5–8. Sprint 9 runs
