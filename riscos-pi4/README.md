@@ -40,15 +40,39 @@ debugged and tested on a desktop.
 
 ## Status
 
-Working: HAL and kernel bring-up, the MMU, secondary cores, the centisecond
-tick and interrupt dispatch, I2C, the VCHIQ connect handshake, a framebuffer
-allocated through the VideoCore property channel; **SDFS** from a card image
-on EMMC2, and the `!Boot` sequence of the ROOL image running off it; **USB**
-through the DWC2 controller — keyboard and mouse, on the root port or behind
-a hub — which on a Pi 4 means the FIQ path RISC OS drives it from; and
-**networking**, RISC OS's `EtherUSB` binding a CDC-Ethernet `usb-net` on
-QEMU's user-mode network. Twelve seconds from power-on to the end of
-PreDesk; 27 to an idle desktop with the network up.
+Working: HAL and kernel bring-up, the MMU, secondary cores, I2C, the VCHIQ
+connect handshake, a framebuffer allocated through the VideoCore property
+channel; **SDFS** from a card image on EMMC2, and the `!Boot` sequence of
+the ROOL image running off it; **USB** through the DWC2 controller —
+keyboard and mouse, on the root port or behind a hub — which on a Pi 4
+means the FIQ path RISC OS drives it from; and **networking**, RISC OS's
+`EtherUSB` binding a CDC-Ethernet `usb-net` on QEMU's user-mode network.
+
+The machine now has its own **window**: `-display dx11` (Sprints U0–U2)
+puts a Win32 window on the main thread with the guest framebuffer decoded
+on the GPU each frame — raw bytes uploaded from mapped guest RAM, an
+8bpp-palette/32bpp pixel shader, and a scale pass that stretches any mode
+to the client area, because the window is the monitor. PrintScreen writes
+the decoded surface to a PNG. The keyboard and mouse in that window reach
+the guest: scan codes through the AT set 1 keymap, mouse deltas with the
+cursor warped to centre while grabbed, grab released with Ctrl+Alt+G or by
+losing focus. Window moves and scrolls redraw completely — the DMA engine
+now performs the 2D, 128-bit-wide, negative-stride copies RISC OS's video
+driver issues for them, where it previously refused the transfer and the
+Wimp redrew only the exposed strips.
+
+**Timers are exact.** RISC OS is interrupt-driven: the 100 Hz ticker waits
+on a system-timer compare, the desktop's vertical sync on the SMI
+interrupt the GPU firmware raises, and BCMVideo's half-frame update on the
+ARM timer once it has seen a vsync. Main-loop timers lost one tick in nine
+(88.7 Hz, worst gap 222 ms). One host thread — `system/hrtimer.c` — now
+waits on a high-resolution waitable timer on Windows and fires under the
+BQL; the system timer's compares, the vsync generator and the ARM timer's
+half-frame pulse are deadlines on it, and a vsync generator pulses an SMI
+latch and an ARM-timer latch (thin registers that record what the guest
+writes). Measured over an idle desktop: **100.0 ticks a second, worst gap
+11.6 ms**. The vsync rate is `-display dx11,vsync=N`, default 30; the
+render loop sends nothing.
 
 The screen is 800×600 because the firmware channel now answers
 `GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
@@ -57,7 +81,10 @@ MonitorType EDID; RISC OS's ScreenModes does the rest.
 Not working yet: `SET_CLOCK_RATE` is still NYI. There is no way to get files
 into a running guest except through the card image. The boot spends about
 five seconds reading the card at a millisecond per stall for reasons that
-are measured but not yet understood (DESIGN.md §12).
+are measured but not yet understood (DESIGN.md §12). A 256-colour mode and
+a mid-session mode change are implemented but not yet driven through the
+new input path. The networking claim above predates the window work and
+wants re-verifying against a fetch.
 
 ## What it changes
 
@@ -72,11 +99,19 @@ are candidates for upstream:
 | `hw/arm/bcm2838`: connect the system timer to the GIC | Any guest using the system timer through the GIC on `raspi4b`; its compare outputs only ever reached the legacy interrupt controller |
 | `hw/arm/bcm2838`: put the SD card on EMMC2 | Any `raspi4b` guest that uses the card — the BCM2711 keeps it on EMMC2 and Linux's device tree says so too; QEMU had it on the GPIO block's legacy mux |
 | `hw/intc/arm_gic`: legacy nFIQ inputs, through the GICv2 interrupt-signal bypass | Any SoC that wires an older interrupt controller into a GIC-400's legacy inputs; the BCM2711 does, and RISC OS relies on it |
+| `hw/dma/bcm2835`: 2D transfers of any width, rows moved whole | Any guest using the DMA engine's 2D mode — width bits and alignment are bus-transfer choices, not reasons to fail a transfer, and a failed copy read as "complete" to drivers that never check |
 | `hw/usb/hcd-dwc2`: keep `GINTSTS.HCHINT` in step with `HAINTMSK`, and the IRQ level per device | Any guest whose driver defers a channel interrupt by masking it — the FIQ state machine RISC OS inherited from the Pi Linux driver does |
 | `hw/usb/dev-network`: `rndis=off`, a CDC-only `usb-net` | Any guest whose USB stack announces a device in its first configuration only |
 
-The rest are missing devices and unanswered firmware calls:
+The rest are missing devices, unanswered firmware calls, and fork
+infrastructure:
 
+- `system/hrtimer.c`: the **high-resolution timer thread** — one host
+  thread, a high-res waitable timer on Windows, callbacks fired under the
+  BQL; everything RISC OS waits on in a timer is a deadline on it
+- `hw/misc`: the **vsync generator** that pulses the SMI vsync latch and
+  the ARM timer's half-frame input, and the thin register files behind
+  both latches
 - `hw/misc`: BCM2835 mailbox **channel 0** (power management) — defined since
   the mailbox was first modelled, never given a peer
 - `hw/misc`: a **VCHIQ peer** for mailbox channel 3, plus the VC→ARM and
