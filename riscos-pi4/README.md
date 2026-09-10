@@ -48,9 +48,9 @@ keyboard and mouse, on the root port or behind a hub — which on a Pi 4
 means the FIQ path RISC OS drives it from; and **networking**, RISC OS's
 `EtherUSB` binding a CDC-Ethernet `usb-net` on QEMU's user-mode network.
 
-The machine now has its own **window**: `-display dx11` (Sprints U0–U2)
-puts a Win32 window on the main thread with the guest framebuffer decoded
-on the GPU each frame — raw bytes uploaded from mapped guest RAM, an
+The machine now has its own **window** on both hosts: `-display dx11`
+(Sprints U0–U2) puts a Win32 window on the main thread with the guest
+framebuffer decoded on the GPU each frame — raw bytes uploaded from mapped guest RAM, an
 8bpp-palette/32bpp pixel shader, and a scale pass that stretches any mode
 to the client area, because the window is the monitor. PrintScreen writes
 the decoded surface to a PNG. The keyboard and mouse in that window reach
@@ -73,6 +73,17 @@ latch and an ARM-timer latch (thin registers that record what the guest
 writes). Measured over an idle desktop: **100.0 ticks a second, worst gap
 11.6 ms**. The vsync rate is `-display dx11,vsync=N`, default 30; the
 render loop sends nothing.
+
+**macOS runs the same machine**, on Apple silicon, with `-display metal`:
+`ui/metal.{h,c,m}`, the twin of the D3D11 front end, down to the same
+eleven-call boundary — a Cocoa window on the main thread, the guest
+framebuffer decoded by an MSL shader specialised per pixel format, the
+same three scalers and the same optional scanlines, ⌘S or F13 for a PNG.
+The emulation itself needed no changes at all: it boots the ROOL image to
+a networked desktop in under 20 seconds on an M4, and the centisecond
+ticker measures 100.0 a second with a worst gap of 12.5 ms on the POSIX
+branch of `system/hrtimer.c`, so the Windows timer thread's precision did
+not have to be reproduced. `riscos-pi4/MACOS.md` is that record.
 
 The screen is 800×600 because the firmware channel now answers
 `GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
@@ -124,6 +135,11 @@ infrastructure:
 - `hw/arm/bcm2838`: the same over the **GENET Ethernet MAC** register block
   at `0xfd580000` — no MAC is modelled, but a driver that probes it must
   read "no silicon", not abort
+- `ui/metal.c`, `ui/metal.m`: the **Metal windowed display** (`-display
+  metal`), macOS-only — a Cocoa window and a `CAMetalLayer` on the main
+  thread, QEMU's loop on a worker, joined at the same boundary `ui/dx11.h`
+  declares; MSL compiled at start-up and specialised with function
+  constants, where the Windows side compiles HLSL with `D3DCompile`
 - `ui/dx11.c`, `ui/dx11.cpp`: the **D3D 11 windowed display** (`-display
   dx11`), Windows-only — a Win32 window and flip-model swap chain on the
   main thread, QEMU's loop on a worker, joined at an `extern "C"` boundary
@@ -152,6 +168,27 @@ That refusal is deliberate rather than lazy — accepting the sound service walk
 the guest into another blocking wait, while declining leaves the GPU mode path
 switched off so display setup falls back to the property channel, which QEMU
 already models completely.
+
+## Building on macOS
+
+Apple clang and Homebrew; `riscos-pi4/MACOS.md` has the whole of it,
+including what `-display metal` takes and what is not done yet.
+
+```bash
+brew install meson ninja pkgconf glib pixman capstone libslirp libpng
+
+mkdir build-macos && cd build-macos
+../configure --target-list=aarch64-softmmu --enable-plugins --disable-werror \
+    --disable-gtk --disable-sdl --disable-vnc --disable-docs \
+    --disable-guest-agent --enable-capstone --disable-spice --enable-slirp \
+    --enable-cocoa \
+    --cc=/usr/bin/clang --cxx=/usr/bin/clang++ --objcc=/usr/bin/clang
+ninja
+```
+
+Pass Apple's clang explicitly: a Homebrew clang on `PATH` is picked up
+otherwise, and the Objective-C wants the system compiler and the system
+SDK to agree.
 
 ## Building on Windows
 

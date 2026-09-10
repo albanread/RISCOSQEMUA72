@@ -1231,6 +1231,14 @@ if host_os == 'windows'
   endif
 endif
 
+metal = not_found
+if host_os == 'darwin'
+  metal = dependency('appleframeworks',
+                     modules: ['Cocoa', 'Metal', 'QuartzCore', 'ImageIO',
+                               'CoreGraphics'],
+                     required: get_option('metal'))
+endif
+
 vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
 if vmnet.found() and not cc.has_header_symbol('vmnet/vmnet.h',
                                               'VMNET_BRIDGED_MODE',
@@ -2443,6 +2451,7 @@ config_host_data.set('CONFIG_FREEBSD', host_os == 'freebsd')
 config_host_data.set('CONFIG_CAPSTONE', capstone.found())
 config_host_data.set('CONFIG_COCOA', cocoa.found())
 config_host_data.set('CONFIG_DX11', dx11.found())
+config_host_data.set('CONFIG_METAL', metal.found())
 config_host_data.set('CONFIG_DARWIN', host_os == 'darwin')
 config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))
@@ -4906,6 +4915,7 @@ summary(summary_info, bool_yn: true, section: 'Crypto')
 summary_info = {}
 if host_os == 'darwin'
   summary_info += {'Cocoa support':           cocoa}
+  summary_info += {'Metal support':           metal}
 endif
 summary_info += {'D-Bus display':     dbus_display}
 summary_info += {'SDL support':       sdl}

@@ -23,3 +23,8 @@ GTAGS
 
 # Working files from the RISC OS Pi 4 work
 /*.log
+/build-macos/
+/build-*/
+
+# ROOL material: never committed. See riscos-pi4/README.md, "Licence".
+/riscos-images/

@@ -1513,6 +1513,8 @@
 #
 # @dx11: The Direct3D 11 windowed user interface (Windows).
 #
+# @metal: The Metal windowed user interface (macOS).
+#
 # @spice-app: Set up a Spice server and run the default associated
 #     application to connect to it.  The server will redirect the
 #     serial console and QEMU monitors.  (Since 4.0)
@@ -1531,6 +1533,7 @@
     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
     { 'name': 'dx11', 'if': 'CONFIG_DX11' },
+    { 'name': 'metal', 'if': 'CONFIG_METAL' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
     { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
   ]
@@ -1580,6 +1583,49 @@
   'if'      : 'CONFIG_DX11' }
 
 ##
+# @DisplayMetalScaling:
+#
+# How the guest screen is magnified to the window's content view.
+#
+# @linear: plain bilinear filtering over the whole image.
+#
+# @sharp: sharp bilinear -- bilinear within a narrowed band at each
+#     source pixel edge, so a 1:1 image passes through untouched and a
+#     magnified one stays crisp (default).
+#
+# @nearest: nearest-neighbour, hard pixel edges.
+#
+# Since: 11.1
+##
+{ 'enum'    : 'DisplayMetalScaling',
+  'data'    : ['linear', 'sharp', 'nearest'],
+  'if'      : 'CONFIG_METAL' }
+
+##
+# @DisplayMetal:
+#
+# Metal display options.
+#
+# @vsync: how many vertical-sync interrupts a second the guest
+#     receives, each raised on the machine's vsync line after a
+#     presented frame (0 disables them; default 30).  Raspberry Pi
+#     guests see it as the firmware's SMI interrupt.
+#
+# @scaling: how the guest screen is magnified to the window
+#     (default sharp).
+#
+# @scanlines: darken every other output row, CRT flavour, when the
+#     image is magnified at least twice (default off).
+#
+# Since: 11.1
+##
+{ 'struct'  : 'DisplayMetal',
+  'data'    : { '*vsync' : 'int',
+                '*scaling' : 'DisplayMetalScaling',
+                '*scanlines' : 'bool' },
+  'if'      : 'CONFIG_METAL' }
+
+##
 # @DisplayOptions:
 #
 # Display (user interface) options.
@@ -1610,6 +1656,7 @@
       'gtk': { 'type': 'DisplayGTK', 'if': 'CONFIG_GTK' },
       'cocoa': { 'type': 'DisplayCocoa', 'if': 'CONFIG_COCOA' },
       'dx11': { 'type': 'DisplayDx11', 'if': 'CONFIG_DX11' },
+      'metal': { 'type': 'DisplayMetal', 'if': 'CONFIG_METAL' },
       'curses': { 'type': 'DisplayCurses', 'if': 'CONFIG_CURSES' },
       'egl-headless': { 'type': 'DisplayEGLHeadless',
                         'if': 'CONFIG_OPENGL' },

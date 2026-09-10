@@ -39,6 +39,27 @@ that state (the qcow2 is fine — the filesystem *inside* the disc is
 what tore; only the guest can see it).  Recovery is to quarantine the
 overlay and let `run.py` mint a fresh one from the pristine image.
 
+## macOS: the launch, and the ticker
+
+`run-macos.sh` is the launch line from `../README.md` with `-display
+metal` in place of `-display dx11`; `riscos-pi4/MACOS.md` is the port's
+record. It expects the ROM, the CMOS blob and (optionally) the card
+image in `riscos-images/` beside the repo root, which `RISCOS_IMAGES`
+overrides:
+
+    riscos-pi4/tools/run-macos.sh
+    DISPLAY_OPT=cocoa riscos-pi4/tools/run-macos.sh   # QEMU's own display
+    DISPLAY_OPT=metal,scaling=nearest,scanlines=on riscos-pi4/tools/run-macos.sh
+
+`ticks.py` measures what the guest's 100 Hz ticker is actually worth, by
+counting the system timer's compare-1 expiries over a settled desktop:
+
+    python riscos-pi4/tools/ticks.py 30 30
+    timer #1:  100.0/s over 30.0s   gap median 9.96 ms, p99 12.38 ms, worst 12.54 ms
+
+It works on any host with the `log` trace backend, not only macOS, so the
+two platforms' clocks can be compared with the same instrument.
+
 ## Boot probe
 
     python probe.py raspi4b RISCOS.IMG 30 -- -cpu cortex-a72,aarch64=off
