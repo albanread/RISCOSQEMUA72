@@ -268,6 +268,19 @@ Two routes, in order of cheapness:
    share (its SMB2 support is the thing to verify), host files arrive with
    no guest code at all. One day to find out, and if it works this is the
    answer for the developer loop.
+
+   **Dead, and proven from both ends.**  The guest reaches the host fine
+   (NetSurf browses the wider internet through slirp; a `*PING 10.0.2.2`
+   answers in 2 ms; NetSurf fetched a listing from a host-side HTTP
+   server).  But Windows 11 here runs `EnableSMB1Protocol: False` with
+   signing required, and the ROM's LanManFS offers exactly two dialects —
+   `PC NETWORK PROGRAM` and `NT LM 0.12`, both SMB1 (the strings in
+   RISCOS.IMG; no SMB2/3 dialect exists in the ROM).  `*LMount` brings up
+   the login dialogue, and the logon attempt fails as `Error: Bad
+   authentication` — LanManFS's mapping of a refused negotiation.
+   Re-enabling SMB1 on the host would "work" but is a deprecated
+   protocol with signing disabled; not recommended, not the answer.
+
 2. **The VM compatibility module.** A doorbell device in QEMU at an address
    the HAL does not name, and a RISC OS module that lives on the card image
    in `!Boot.Choices.Boot.PreDesk` — loaded by the boot sequence, so no ROM
