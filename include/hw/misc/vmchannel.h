@@ -86,10 +86,11 @@
 
 /* FILEARGS response, inline after the header:
  *   +64 u32 size
- *   +68 u32 type (RISC OS 12-bit type; 0xFFF for plain data)
+ *   +68 u32 type (RISC OS 12-bit type; 0xFFF for plain data, 0 = dir)
  *   +72 u32 attrs (RISC OS-style: bit0 owner-read, 1 write, 2 locked...)
- *   +76 u32 date, centiseconds since 1900 (0 = unknown)
- * The module synthesises load/exec from type and date. */
+ *   +76 u32 date low, centiseconds since 1900
+ *   +80 u32 date high (the instant is 40 bits; 0 = unknown)
+ * The module synthesises load/exec from type and the 40-bit date. */
 
 /* CAT response: array of 64-byte entries until arglen is exhausted:
  *   +0  48 bytes: name, NUL padded

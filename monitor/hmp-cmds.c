@@ -40,7 +40,6 @@
 #include "system/memory.h"
 #include "system/system.h"
 #include "disas/disas.h"
-#include "hw/display/bcm2835_fb.h"
 
 /* Please update hmp-commands.hx when adding or changing commands */
 static HMPCommand hmp_info_cmds[] = {
@@ -142,18 +141,27 @@ void hmp_stop(Monitor *mon, const QDict *qdict)
     qmp_stop(NULL);
 }
 
+/* The device registers its implementation at class-init time; nothing
+ * link-time, which the archives reorder.  Unregistered means "not on
+ * this machine", so no target-specific ifdefs here (which the monitor
+ * poisons anyway). */
+static int (*synthfb_impl)(int bpp, int xres, int yres);
+
+void hmp_register_synthfb(int (*impl)(int bpp, int xres, int yres))
+{
+    synthfb_impl = impl;
+}
+
 void hmp_synthfb(Monitor *mon, const QDict *qdict)
 {
-    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
     int bpp = qdict_get_int(qdict, "bpp");
     int xres = qdict_get_try_int(qdict, "xres", 640);
     int yres = qdict_get_try_int(qdict, "yres", 480);
 
-    if (!obj) {
+    if (!synthfb_impl || !synthfb_impl(bpp, xres, yres)) {
         monitor_printf(mon, "no bcm2835 framebuffer in this machine\n");
         return;
     }
-    bcm2835_fb_synth_mode(BCM2835_FB(obj), bpp, xres, yres);
     monitor_printf(mon, "synthfb: %dx%d, %d bpp\n", xres, yres, bpp);
 }
 

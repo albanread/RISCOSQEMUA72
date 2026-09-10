@@ -104,20 +104,65 @@ def qmp_call(cmd, timeout=30):
             raise RuntimeError(msg["error"]["desc"])
 
 
+def post_escape():
+    """Press Escape in the emulator window: the stock boot's Internet
+    startup waits on DHCP until it appears or Escape — without this the
+    machine sits on the waiting screen, which is not a desktop."""
+    import ctypes
+    u32 = ctypes.windll.user32
+    hwnd = u32.FindWindowW("qemu-dx11", None)
+    if hwnd:
+        lp = 1 | (0x01 << 16)          # scan 0x01, one repeat
+        u32.PostMessageW(hwnd, 0x0100, 0x1B, lp)
+        time.sleep(0.05)
+        u32.PostMessageW(hwnd, 0x0101, 0x1B,
+                         lp | (1 << 30) | (1 << 31))
+
+
 def wait_for_desktop(qemu_path, deadline_s=300):
-    """Poll screendumps until the desktop is painted."""
-    poll = os.path.join(os.path.dirname(os.path.abspath(qemu_path)),
-                        "run-poll.ppm")
+    """The real desktop, not the first lit pixel: the window's log must
+    show a pipeline heartbeat for the desktop mode (800x600 32bpp), and
+    the frame must then be stable for two seconds (the DHCP wait screen
+    is also 800x600x32, but it does not go quiet on its own)."""
+    builddir = os.path.dirname(os.path.abspath(qemu_path))
+    poll = os.path.join(builddir, "run-poll.ppm")
+    log = os.path.join(builddir, "dx11-debug.txt")
     deadline = time.time() + deadline_s
+    escaped = False
+    prev = None
+    stable_since = None
+
     while time.time() < deadline:
         try:
             qmp_call("screendump run-poll.ppm", timeout=5)
-            body = open(poll, "rb").read()
-            # any image content at all: boot messages count, then desktop
-            if any(body.split(b"\n", 3)[3][:48000]):
-                return True
+            body = open(poll, "rb").read().split(b"\n", 3)[3]
         except (OSError, RuntimeError):
-            pass
+            time.sleep(0.5)
+            continue
+
+        if any(body[:48000]):
+            if not escaped:
+                escaped = True
+                post_escape()          # skip the DHCP wait, once
+        else:
+            prev = None
+            stable_since = None
+            time.sleep(0.5)
+            continue
+
+        if body == prev:
+            if stable_since is None:
+                stable_since = time.time()
+            if time.time() - stable_since >= 2.0:
+                try:
+                    hb = open(log, "r", errors="replace").read()
+                    if "800x600 bpp 32" in hb:
+                        return True
+                except OSError:
+                    pass
+        else:
+            prev = body
+            stable_since = None
         time.sleep(0.5)
     return False
 

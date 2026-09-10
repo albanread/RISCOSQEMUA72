@@ -145,10 +145,38 @@ static void bcm2835_systmr_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static int bcm2835_systmr_post_load(void *opaque, int version_id)
+{
+    BCM2835SystemTimerState *s = opaque;
+
+    /*
+     * The compares are migrated but the armed deadlines are not: the
+     * timer thread (or upstream, the QEMU timer) had them in flight.
+     * Without re-arming, every compare sits below the counter with no
+     * match possible — the 100 Hz ticker is dead after -loadvm, the
+     * guest spins on a clock that never moves, and typed keys are
+     * ignored.  The virtual clock is restored to the save-time value,
+     * so a compare that was armed for the future still is; one that is
+     * due (or was never armed — delay negative — the HAL has already
+     * self-corrected past it) stays quiet.
+     */
+    uint64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    for (int index = 0; index < BCM2835_SYSTIMER_COUNT; index++) {
+        int32_t delay = (int32_t)(s->reg.compare[index] - (uint32_t)now);
+
+        if (delay > 0) {
+            hrtimer_mod_ns(s->tmr[index].timer,
+                           (now + (uint64_t)delay) * SCALE_US);
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription bcm2835_systmr_vmstate = {
     .name = "bcm2835_sys_timer",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = bcm2835_systmr_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(reg.ctrl_status, BCM2835SystemTimerState),
         VMSTATE_UINT32_ARRAY(reg.compare, BCM2835SystemTimerState,

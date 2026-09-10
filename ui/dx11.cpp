@@ -136,6 +136,7 @@ static void dx11_mouse_send_abs(int gx, int gy);
 static struct {
     bool have_last;
     int last_x, last_y;
+    bool swallow_up;                /* the middle-up of a grab click */
     /* the guest pointer position we last sent, in guest pixels: the
      * anchor for relative motion while grabbed (absolute while not) */
     int gx, gy;
@@ -240,12 +241,18 @@ static void dx11_mouse_move(HWND h, int x, int y)
         return;
     }
     /* Grabbed: delta from the last position, accumulated into the
-     * virtual guest position.  The warp-to-centre after each move
-     * bounds the host cursor without ending the motion. */
+     * virtual guest position — scaled by guest-per-host pixels, so a
+     * window larger than the guest screen does not run the pointer
+     * into the edges at double speed.  The warp-to-centre after each
+     * move bounds the host cursor without ending the motion. */
     if (mouse.have_last) {
         int dx = x - mouse.last_x, dy = y - mouse.last_y;
         if (dx || dy) {
-            dx11_mouse_send_abs(mouse.gx + dx, mouse.gy + dy);
+            int cw = c.right - c.left;
+            int ch = c.bottom - c.top;
+            int gdx = (int)((long long)dx * mouse.gxres / (cw > 0 ? cw : 1));
+            int gdy = (int)((long long)dy * mouse.gyres / (ch > 0 ? ch : 1));
+            dx11_mouse_send_abs(mouse.gx + gdx, mouse.gy + gdy);
         }
     }
     mouse.last_x = x;
@@ -355,10 +362,13 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_RBUTTONDOWN:
-        if (!kbd.on) {
-            /* A click into the window captures the pointer, like every
-             * other emulator; the capturing click is not forwarded. */
+        if (!kbd.on && msg == WM_MBUTTONDOWN) {
+            /* Middle click captures the pointer (Ctrl+Alt+G or focus
+             * loss releases).  Left clicks go straight through to the
+             * guest now that the tablet keeps the two arrows together,
+             * so entering the window costs nothing. */
             dx11_set_grab(true);
+            mouse.swallow_up = true;   /* balance: the down was ours */
             return 0;
         }
         SetCapture(h);                  /* the up arrives even outside */
@@ -369,6 +379,10 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONUP:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP:
+        if (msg == WM_MBUTTONUP && mouse.swallow_up) {
+            mouse.swallow_up = false;
+            return 0;
+        }
         dx11_glue_mouse_btn(msg == WM_LBUTTONUP ? 0
                             : msg == WM_MBUTTONUP ? 1 : 2, false);
         if (!(w & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON))) {
@@ -405,8 +419,24 @@ static bool dx11_create_window(void)
         return false;
     }
 
-    /* Default client size: the EDID mode the firmware answers with. */
-    RECT r = { 0, 0, 800, 600 };
+    /* Default client size: the EDID mode the firmware answers with,
+     * scaled by the system DPI — the process is DPI-aware, so at 150%
+     * an 800x600 client is physically small.  The scaler stretches any
+     * size; this is just a readable default. */
+    UINT dpi = 96;
+    {
+        typedef UINT (WINAPI *GDA)(void);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        GDA gda = u ? (GDA)GetProcAddress(u, "GetDpiForSystem") : nullptr;
+        if (gda) {
+            dpi = gda();
+        }
+    }
+    int scale = dpi / 96;
+    if (scale < 1) {
+        scale = 1;
+    }
+    RECT r = { 0, 0, 800 * scale, 600 * scale };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     dx11.hwnd = CreateWindowExW(
         0, DX11_CLASS, DX11_TITLE, WS_OVERLAPPEDWINDOW,

@@ -33,6 +33,7 @@
 #include "hw/misc/bcm2835_mbox_defs.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "monitor/hmp.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
@@ -572,10 +573,24 @@ static const Property bcm2835_fb_props[] = {
                        initial_config.alpha, 2), /* alpha ignored */
 };
 
+static int bcm2835_synthfb_impl(int bpp, int xres, int yres)
+{
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+
+    if (!obj) {
+        return 0;
+    }
+    bcm2835_fb_synth_mode(BCM2835_FB(obj), bpp, xres, yres);
+    return 1;
+}
+
 static void bcm2835_fb_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    /* the monitor's synthfb command reaches the device through this
+     * registration: nothing link-time, which the archives reorder */
+    hmp_register_synthfb(bcm2835_synthfb_impl);
     device_class_set_props(dc, bcm2835_fb_props);
     dc->realize = bcm2835_fb_realize;
     device_class_set_legacy_reset(dc, bcm2835_fb_reset);

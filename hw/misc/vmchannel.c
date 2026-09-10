@@ -54,6 +54,32 @@ static void block_write(hwaddr a, const void *buf, uint32_t len)
 /* Host paths                                                          */
 
 /*
+ * A component that names a Windows device (CON, NUL, COM1...) would be
+ * redirected to the device even under root/, so they are refused like
+ * any other escape attempt.
+ */
+static bool win32_reserved(const char *name, size_t len)
+{
+    static const char *dev[] = { "CON", "PRN", "AUX", "NUL",
+                                 "COM1", "COM2", "COM3", "COM4", "COM5",
+                                 "COM6", "COM7", "COM8", "COM9",
+                                 "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+                                 "LPT6", "LPT7", "LPT8", "LPT9", NULL };
+    size_t stem = 0;
+
+    while (stem < len && name[stem] != '.') {
+        stem++;
+    }
+    for (int i = 0; dev[i]; i++) {
+        if (stem == strlen(dev[i])
+            && g_ascii_strncasecmp(name, dev[i], stem) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * Translate the guest's RISC OS path into a host path under root and
  * validate it.  Returns a newly allocated host path, or NULL with *rc
  * set.  The guest path must start with '$' and consist of plain
@@ -62,7 +88,7 @@ static void block_write(hwaddr a, const void *buf, uint32_t len)
 static char *host_path(VMChannelState *s, const char *guest, int *rc)
 {
     size_t len = strlen(guest);
-    char *p, *out;
+    char *p, *out, *end;
 
     if (!s->root) {
         *rc = VMCH_RC_NOROOT;
@@ -73,9 +99,20 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         return NULL;
     }
 
-    p = g_strdup_printf("%s%s", s->root,
-                        guest[1] ? G_DIR_SEPARATOR_S : "");
+    /*
+     * The translated path is never longer than the guest path ('.' maps
+     * to one separator, '$' to the root), so root + separator + len + 1
+     * is a true upper bound.  The first version of this wrote the
+     * components past an allocation of root+separator and corrupted the
+     * heap on the first real OPEN/CAT/FILEARGS.
+     */
+    p = g_malloc(strlen(s->root) + 1 + len + 1);
+    strcpy(p, s->root);
     out = p + strlen(s->root);
+    end = p + strlen(s->root) + 1 + len;
+    if (guest[1]) {
+        *out++ = G_DIR_SEPARATOR;
+    }
 
     /* walk the rest: each component until '.' must be a plain name */
     const char *c = guest + 1;
@@ -83,10 +120,11 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         c++;                            /* leading dots are separators */
     }
     bool fresh = true;                  /* true: at component start */
+    char *comp = out;                   /* start of the current component */
     for (; *c; c++) {
         if (*c == '.') {
-            if (fresh) {                /* ".." or empty component */
-                g_free(p);
+            if (fresh || win32_reserved(comp, out - comp)) {
+                g_free(p);              /* "..", empty, or a device name */
                 *rc = VMCH_RC_BADPATH;
                 return NULL;
             }
@@ -97,11 +135,20 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
             *rc = VMCH_RC_BADPATH;
             return NULL;
         } else {
+            if (fresh) {
+                comp = out;             /* remember where this name began */
+                fresh = false;
+            }
             *out++ = *c;
-            fresh = false;
         }
+        g_assert(out <= end);
     }
-    if (fresh && out != p + strlen(s->root)) {
+    if (!fresh && win32_reserved(comp, out - comp)) {
+        g_free(p);
+        *rc = VMCH_RC_BADPATH;
+        return NULL;
+    }
+    if (fresh && out != p + strlen(s->root) + 1) {
         g_free(p);                      /* trailing '.' */
         *rc = VMCH_RC_BADPATH;
         return NULL;
@@ -319,7 +366,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         char *path = arg_text(base, arglen);
         char *hp;
         GStatBuf st;
-        uint8_t resp[16];
+        uint8_t resp[20];
 
         if (!path) {
             rc = VMCH_RC_BADPATH;
@@ -336,11 +383,13 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             uint32_t size = (uint32_t)st.st_size;
             uint32_t type = S_ISDIR(st.st_mode) ? 0
                            : (uint32_t)riscos_type_for(path, &st);
+            uint64_t cs = date_cs_for(&st);
 
             stl_le_p(resp + 0, size);
             stl_le_p(resp + 4, type);
             stl_le_p(resp + 8, attrs_for(&st));
-            stl_le_p(resp + 12, date_cs_for(&st));
+            stl_le_p(resp + 12, (uint32_t)cs);
+            stl_le_p(resp + 16, (uint32_t)(cs >> 32));
             block_write(base + VMCH_HDR_SIZE, resp, sizeof(resp));
             st32(base + VMCH_HDR_ARGLEN, sizeof(resp));
         }
@@ -502,20 +551,27 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             break;
         }
         block_read(base + VMCH_HDR_SIZE, buf, arglen);
-        /* v0: console output is the emulator's stderr; the launcher
-         * captures it.  Line-buffered by the C library already. */
-        fwrite(buf, 1, arglen, stderr);
-        fflush(stderr);
+        /*
+         * A log file next to the other debug output: stderr is no use,
+         * the launcher sends it to DEVNULL.
+         */
+        {
+            FILE *log = fopen("vmchannel-console.txt", "ab");
+            if (log) {
+                fwrite(buf, 1, arglen, log);
+                fclose(log);
+            }
+        }
         g_free(buf);
         break;
     }
 
     case VMCH_CMD_TIME: {
-        uint8_t resp[4];
-        uint32_t cs = (uint32_t)((uint64_t)(time(NULL) + 2208988800ULL)
-                                 * 100);
+        uint8_t resp[8];
+        uint64_t cs = (uint64_t)(time(NULL) + 2208988800ULL) * 100;
 
-        stl_le_p(resp, cs);
+        stl_le_p(resp + 0, (uint32_t)cs);
+        stl_le_p(resp + 4, (uint32_t)(cs >> 32));
         block_write(base + VMCH_HDR_SIZE, resp, sizeof(resp));
         st32(base + VMCH_HDR_ARGLEN, sizeof(resp));
         break;
