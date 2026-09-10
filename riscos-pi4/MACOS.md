@@ -198,12 +198,7 @@ needed yet.
 - **`vsync=` is a display suboption, as on Windows.** The generator is a
   qdev property (`-global bcm2835-vsyncgen.hz=N`), so `-display cocoa`
   can have the right rate too; that is how the Cocoa fallback was run.
-- **The instruction rate is not chased.** Two single runs of the
-  bare-metal benchmarks, on a machine that was doing other things:
-  `bench` about 1630 M/s and `bench2` about 980 M/s, against roughly 2000
-  and 500 quoted for an i7-12700. The second number is twice as fast and
-  the first is not; neither has been re-run on an idle host, and neither
-  should be quoted until it has.
+- **The instruction rate is not chased**, only measured; see §8.
 
 ## 7. Building and running on macOS
 
@@ -253,3 +248,28 @@ closing the window powers the machine down cleanly. Failures land in
 
 `-display cocoa` remains as a fallback: it goes through QEMU's own display
 path, converting the framebuffer on the CPU, and it works.
+
+## 8. Speed, measured
+
+Best of three for the benchmarks, and one run of the boot, all on an M4
+with a *second* full machine running in a window on the same host — so
+every macOS figure here is a floor, not a best case. The Windows column
+is the README's, on an i7-12700.
+
+| | i7-12700 | M4 | |
+| --- | --- | --- | --- |
+| Power-on to a screen that stops changing | ~27 s | **20.8 s** | 1.3× |
+| Centisecond ticker, worst gap | 11.6 ms | 12.5 ms | — |
+| `bench` — 2 instructions, registers only | ~2000 M/s | 1673 M/s | 0.84× |
+| `bench2` — 6 instructions, a load and a store per iteration | ~500 M/s | 895 M/s | 1.8× |
+
+The split is the interesting part. A two-instruction register loop is
+almost pure TCG dispatch, and the i7's clock wins it. Add a load and a
+store — which is what real code does — and the M4 is nearly twice as
+fast. The boot, which is device emulation, block I/O and the Wimp rather
+than a spin loop, goes with the second number.
+
+`riscos-pi4/tools/ticks.py` measures the ticker on either host with the
+same instrument. The boot figure came from sampling `screendump` over QMP
+twice a second and taking the moment the image stopped changing for three
+seconds; there is no tool for it yet.

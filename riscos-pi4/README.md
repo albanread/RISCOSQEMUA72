@@ -79,11 +79,13 @@ render loop sends nothing.
 eleven-call boundary — a Cocoa window on the main thread, the guest
 framebuffer decoded by an MSL shader specialised per pixel format, the
 same three scalers and the same optional scanlines, ⌘S or F13 for a PNG.
-The emulation itself needed no changes at all: it boots the ROOL image to
-a networked desktop in under 20 seconds on an M4, and the centisecond
-ticker measures 100.0 a second with a worst gap of 12.5 ms on the POSIX
-branch of `system/hrtimer.c`, so the Windows timer thread's precision did
-not have to be reproduced. `riscos-pi4/MACOS.md` is that record.
+The emulation itself needed no changes at all. Power-on to a settled,
+networked desktop is **20.8 seconds** on an M4 against about 27 on the
+i7-12700, and the centisecond ticker measures 100.0 a second with a worst
+gap of 12.5 ms on the POSIX branch of `system/hrtimer.c` against 11.6 ms
+from the Windows waitable timer — so that thread's precision did not have
+to be reproduced. `riscos-pi4/MACOS.md` is that record, with the rest of
+the numbers.
 
 The screen is 800×600 because the firmware channel now answers
 `GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
