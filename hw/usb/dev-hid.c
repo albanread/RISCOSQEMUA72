@@ -622,17 +622,25 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         }
         break;
     case HID_GET_PROTOCOL:
-        if (hs->kind != HID_KEYBOARD && hs->kind != HID_MOUSE) {
+        if (hs->kind == HID_KEYBOARD || hs->kind == HID_MOUSE ||
+            hs->kind == HID_TABLET) {
+            data[0] = hs->protocol;
+            p->actual_length = 1;
+        } else {
             goto fail;
         }
-        data[0] = hs->protocol;
-        p->actual_length = 1;
         break;
     case HID_SET_PROTOCOL:
-        if (hs->kind != HID_KEYBOARD && hs->kind != HID_MOUSE) {
+        /* The tablet is a boot-capable HID device too (subclass 1,
+         * protocol 2), and guests like RISC OS insist on switching it
+         * to report protocol before they will open the interrupt pipe
+         * -- stalling here makes them drop the device entirely. */
+        if (hs->kind == HID_KEYBOARD || hs->kind == HID_MOUSE ||
+            hs->kind == HID_TABLET) {
+            hs->protocol = value;
+        } else {
             goto fail;
         }
-        hs->protocol = value;
         break;
     case HID_GET_IDLE:
         data[0] = hs->idle;

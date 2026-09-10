@@ -203,7 +203,7 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -netdev user,id=n0 \
     -device usb-hub,bus=usb-bus.0,port=1 \
     -device usb-kbd,bus=usb-bus.0,port=1.1 \
-    -device usb-mouse,bus=usb-bus.0,port=1.2 \
+    -device usb-tablet,bus=usb-bus.0,port=1.2 \
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 \
     -display dx11 \
     -qmp tcp:127.0.0.1:4455,server,nowait
@@ -218,6 +218,12 @@ Three things about that line:
 - The DWC2 controller has one root port, hence the hub. A lone `usb-kbd` can
   sit on `port=1` directly. Name the ports: a bare `-device usb-kbd` lands
   behind an automatic hub, which works but hides what you are testing.
+- The pointer is a `usb-tablet`, not a `usb-mouse`: RISC OS's USB mouse
+  driver claims absolute HID devices too, and an absolute pointer is what
+  lets the dx11 window place the guest arrow exactly under the host
+  cursor. While the pointer is grabbed the window integrates the host
+  deltas into that same absolute position, so it still moves like a
+  relative mouse but cannot drift.
 - The ROOL image's `Choices:Internet.Startup` runs `DHCPExecute -w ej0` and
   waits for that Ethernet-over-USB interface until it appears or Escape is
   pressed — stock RISC OS behaviour on a Pi with no network. `usb-net` with
