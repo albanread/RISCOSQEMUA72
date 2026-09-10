@@ -163,14 +163,16 @@ void dx11_glue_key(bool down, uint32_t lparam)
     bql_unlock();
 }
 
-void dx11_glue_mouse_rel(int dx, int dy)
+void dx11_glue_mouse_abs(int gx, int gy, int xres, int yres)
 {
-    if (!dx && !dy) {
+    if (xres < 2 || yres < 2) {
         return;
     }
     bql_lock();
-    qemu_input_queue_rel(NULL, INPUT_AXIS_X, dx);
-    qemu_input_queue_rel(NULL, INPUT_AXIS_Y, dy);
+    /* Scaled by the input layer onto the tablet's 0..32767 axes, which
+     * the guest's absolute-mouse driver maps onto the whole screen. */
+    qemu_input_queue_abs(NULL, INPUT_AXIS_X, gx, 0, xres - 1);
+    qemu_input_queue_abs(NULL, INPUT_AXIS_Y, gy, 0, yres - 1);
     qemu_input_event_sync();
     bql_unlock();
 }

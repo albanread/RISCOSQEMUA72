@@ -58,7 +58,9 @@ void dx11_glue_fb_done(void);
 /* lParam of WM_KEYDOWN/UP/SYSKEYDOWN/UP: scan code bits 16..23, extended
  * bit 24; repeats are already dropped by the caller. */
 void dx11_glue_key(bool down, uint32_t lparam);
-void dx11_glue_mouse_rel(int dx, int dy);
+/* Guest pointer position in guest pixels on a xres x yres screen: sent
+ * absolutely, the way the guest's tablet driver maps onto the screen. */
+void dx11_glue_mouse_abs(int gx, int gy, int xres, int yres);
 void dx11_glue_mouse_btn(int button, bool down); /* 0 left, 1 middle, 2 right */
 void dx11_glue_mouse_wheel(int notches);         /* positive = away from user */
 /* Keyboard grab: while on, the low-level hook swallows Alt+Tab and the

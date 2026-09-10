@@ -23,6 +23,7 @@
 #include <windowsx.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_3.h>
 #include <d3dcompiler.h>
 #include <zlib.h>
 
@@ -42,6 +43,14 @@ static struct {
     ID3D11DeviceContext *context;
     IDXGISwapChain *swap;
     ID3D11RenderTargetView *rtv;
+    /* The flip chain is waitable: the frame-latency slot is waited for
+     * with MsgWaitForMultipleObjectsEx so the message pump keeps running
+     * while Present would otherwise block on DWM.  A plain Present(1)
+     * that stalls five seconds gets the window ghosted by Windows, DWM
+     * stops flipping it and the block becomes permanent.  Blt-model
+     * fallback chains have no waitable object (swap_wait is null). */
+    HANDLE swap_wait;
+    UINT swap_flags;
     bool ready;
     bool lost;
     /* mouse messages forwarded, for the debug log */
@@ -102,10 +111,16 @@ static struct {
 } kbd;
 
 static void dx11_mouse_centre(HWND h);
+static void dx11_mouse_send_abs(int gx, int gy);
 /* mouse state, see the Mouse section */
 static struct {
     bool have_last;
     int last_x, last_y;
+    /* the guest pointer position we last sent, in guest pixels: the
+     * anchor for relative motion while grabbed (absolute while not) */
+    int gx, gy;
+    bool have_guest;
+    int gxres, gyres;            /* guest screen size, from the fb view */
 } mouse;
 
 static void dx11_set_grab(bool on)
@@ -120,20 +135,42 @@ static void dx11_set_grab(bool on)
         GetWindowRect(dx11.hwnd, &r);
         ClipCursor(&r);             /* the pointer lives in the window */
         ShowCursor(FALSE);
+        if (!mouse.have_guest && mouse.gxres > 1) {
+            mouse.gx = mouse.gxres / 2;
+            mouse.gy = mouse.gyres / 2;
+            mouse.have_guest = true;
+        }
         dx11_mouse_centre(dx11.hwnd);
     } else {
         ClipCursor(nullptr);
         ShowCursor(TRUE);
         mouse.have_last = false;
+        /* Re-align the guest arrow with the host cursor, which is where
+         * the grab left it (the centre), not where motion ended. */
+        if (mouse.have_guest) {
+            POINT p;
+            GetCursorPos(&p);
+            ScreenToClient(dx11.hwnd, &p);
+            RECT c;
+            GetClientRect(dx11.hwnd, &c);
+            if (c.right > 0 && mouse.gxres > 1) {
+                mouse.gx = p.x * (mouse.gxres - 1) / (c.right - 1);
+                mouse.gy = p.y * (mouse.gyres - 1) / (c.bottom - 1);
+                dx11_mouse_send_abs(mouse.gx, mouse.gy);
+            }
+        }
     }
     dx11_log("grab %s", on ? "on" : "off");
 }
 
 /* ------------------------------------------------------------------ */
-/* Mouse: ordinary window messages, turned into the relative motion a  */
-/* USB mouse reports. Grabbed, the host cursor is warped back to the   */
-/* centre after every move so motion is unbounded; ungrabbed, the      */
-/* deltas are simply the cursor's movement over the client area.       */
+/* Mouse: ordinary window messages.  The guest device is an absolute   */
+/* tablet, so the pointer position is always sent as a coordinate:     */
+/* ungrabbed that is simply the host cursor's place in the client area */
+/* scaled to the guest screen (the two arrows never diverge); grabbed */
+/* the host cursor is warped back to the centre after every move so    */
+/* motion is unbounded, and the deltas accumulate into a virtual       */
+/* position that is sent absolutely -- it cannot drift.                */
 
 static void dx11_mouse_centre(HWND h)
 {
@@ -150,26 +187,52 @@ static void dx11_mouse_centre(HWND h)
     SetCursorPos(c.x, c.y);
 }
 
+static void dx11_mouse_send_abs(int gx, int gy)
+{
+    if (mouse.gxres > 1 && mouse.gyres > 1) {
+        if (gx < 0) gx = 0;
+        if (gy < 0) gy = 0;
+        if (gx > mouse.gxres - 1) gx = mouse.gxres - 1;
+        if (gy > mouse.gyres - 1) gy = mouse.gyres - 1;
+        dx11_glue_mouse_abs(gx, gy, mouse.gxres, mouse.gyres);
+        mouse.gx = gx;
+        mouse.gy = gy;
+        mouse.have_guest = true;
+        dx11.mouse_moves++;
+    }
+}
+
 static void dx11_mouse_move(HWND h, int x, int y)
 {
-    /* No leave tracking: a return after leaving the window is one large
-     * delta, which is the motion the user actually made. */
+    if (mouse.gxres < 2 || mouse.gyres < 2) {
+        return;                     /* no guest screen to map onto yet */
+    }
+    RECT c;
+    GetClientRect(h, &c);
+    if (c.right < 1 || c.bottom < 1) {
+        return;
+    }
+    if (!kbd.on) {
+        /* Ungrabbed: host cursor and guest arrow coincide. */
+        dx11_mouse_send_abs(x * (mouse.gxres - 1) / (c.right - 1),
+                            y * (mouse.gyres - 1) / (c.bottom - 1));
+        mouse.have_last = false;
+        return;
+    }
+    /* Grabbed: delta from the last position, accumulated into the
+     * virtual guest position.  The warp-to-centre after each move
+     * bounds the host cursor without ending the motion. */
     if (mouse.have_last) {
         int dx = x - mouse.last_x, dy = y - mouse.last_y;
         if (dx || dy) {
-            dx11_glue_mouse_rel(dx, dy);
-            dx11.mouse_moves++;
+            dx11_mouse_send_abs(mouse.gx + dx, mouse.gy + dy);
         }
     }
     mouse.last_x = x;
     mouse.last_y = y;
     mouse.have_last = true;
-    if (kbd.on) {
-        RECT r;
-        GetClientRect(h, &r);
-        if (x != (r.right - r.left) / 2 || y != (r.bottom - r.top) / 2) {
-            dx11_mouse_centre(h);   /* its own WM_MOUSEMOVE is a zero delta */
-        }
+    if (x != (c.right - c.left) / 2 || y != (c.bottom - c.top) / 2) {
+        dx11_mouse_centre(h);       /* its own WM_MOUSEMOVE is a zero delta */
     }
 }
 
@@ -190,7 +253,8 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
                 dx11.rtv = nullptr;
             }
             dx11.swap->ResizeBuffers(0, LOWORD(l), HIWORD(l),
-                                     DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+                                     DXGI_FORMAT_B8G8R8A8_UNORM,
+                                     dx11.swap_flags);
         }
         return 0;
     case WM_ACTIVATE:
@@ -233,6 +297,12 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_RBUTTONDOWN:
+        if (!kbd.on) {
+            /* A click into the window captures the pointer, like every
+             * other emulator; the capturing click is not forwarded. */
+            dx11_set_grab(true);
+            return 0;
+        }
         SetCapture(h);                  /* the up arrives even outside */
         dx11_glue_mouse_btn(msg == WM_LBUTTONDOWN ? 0
                             : msg == WM_MBUTTONDOWN ? 1 : 2, true);
@@ -332,6 +402,8 @@ static bool dx11_create_device(void)
     scd.OutputWindow      = dx11.hwnd;
     scd.Windowed          = TRUE;
     scd.SwapEffect        = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.Flags             = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    dx11.swap_flags       = scd.Flags;
 
     /* The factory must come from the device's adapter or ResizeBuffers
      * is refused later: IDXGIDevice -> IDXGIAdapter -> IDXGIFactory. */
@@ -350,9 +422,40 @@ static bool dx11_create_device(void)
     if (dxdev) dxdev->Release();
     hr = factory->CreateSwapChain(dx11.device, &scd, &dx11.swap);
     factory->Release();
-    if (FAILED(hr)) {
-        /* Older drivers: the blt model still clears a window. */
+    if (SUCCEEDED(hr)) {
+        /* Make the chain waitable: one latency slot, and the handle the
+         * frame loop blocks on instead of blocking inside Present. */
+        IDXGISwapChain2 *swap2 = nullptr;
+        if (FAILED(dx11.swap->QueryInterface(IID_PPV_ARGS(&swap2)))) {
+            dx11_log("swap chain: no IDXGISwapChain2 (hr=%08lx), "
+                     "falling back to blt model", (unsigned long)hr);
+            dx11.swap->Release();
+            dx11.swap = nullptr;
+        } else {
+            HRESULT hrl = swap2->SetMaximumFrameLatency(1);
+            dx11.swap_wait = swap2->GetFrameLatencyWaitableObject();
+            if (FAILED(hrl) || dx11.swap_wait == nullptr) {
+                dx11_log("swap chain: waitable setup failed, "
+                         "falling back to blt model");
+                if (dx11.swap_wait) {
+                    CloseHandle(dx11.swap_wait);
+                    dx11.swap_wait = nullptr;
+                }
+                swap2->Release();
+                dx11.swap->Release();
+                dx11.swap = nullptr;
+            } else {
+                swap2->Release();
+            }
+        }
+    }
+    if (!dx11.swap) {
+        /* Older drivers: the blt model still clears a window, and its
+         * Present copies rather than flips so it cannot wedge on DWM;
+         * it just has no waitable object to pace on. */
         scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        scd.Flags      = 0;
+        dx11.swap_flags = 0;
         IDXGIFactory *f2 = nullptr;
         CreateDXGIFactory(IID_PPV_ARGS(&f2));
         hr = f2->CreateSwapChain(dx11.device, &scd, &dx11.swap);
@@ -793,6 +896,8 @@ static bool dx11_render_frame(void)
         }
         return false;
     }
+    mouse.gxres = v.xres;            /* the mouse maps onto this screen */
+    mouse.gyres = v.yres;
     if (!fb.up || v.generation != fb.generation) {
         if (fb_failed && v.generation == fb_failed_generation) {
             return false;               /* same mode, same failure */
@@ -973,11 +1078,37 @@ extern "C" int dx11_backend_main(void)
         if (dx11.lost) {
             break;
         }
+        /* Minimized: DWM flips nothing, so present nothing. */
+        if (IsIconic(dx11.hwnd)) {
+            Sleep(50);
+            continue;
+        }
+        /* Wait for a free frame-latency slot with the message queue
+         * armed, so input keeps flowing while the display is stalled
+         * (occlusion, DWM hiccup) instead of ghosting the window.
+         * Present is only called once a slot is free, which is what
+         * keeps it from blocking: presenting after a mere timeout is
+         * how the window wedged inside Present when DWM stopped
+         * compositing it.  A blt-model fallback chain paces on a
+         * plain sleep instead (its Present copies, it cannot wedge). */
+        if (dx11.swap_wait) {
+            DWORD w9 = MsgWaitForMultipleObjectsEx(
+                1, &dx11.swap_wait, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (w9 != WAIT_OBJECT_0) {
+                continue;           /* message or timeout: no free slot */
+            }
+        } else {
+            Sleep(1);
+        }
         if (dx11_acquire_target()) {
             if (!dx11_render_frame()) {
                 dx11.context->ClearRenderTargetView(dx11.rtv, clear);
             }
-            dx11.swap->Present(1 /* vsync */, 0);
+            HRESULT hr = dx11.swap->Present(1 /* vsync */, 0);
+            if (FAILED(hr)) {
+                dx11_log("present failed hr=%08lx", (unsigned long)hr);
+                Sleep(10);
+            }
         } else {
             Sleep(1);
         }
@@ -995,6 +1126,7 @@ extern "C" int dx11_backend_main(void)
     }
     fb_release_pipeline();
     if (dx11.rtv) dx11.rtv->Release();
+    if (dx11.swap_wait) CloseHandle(dx11.swap_wait);
     if (dx11.swap) dx11.swap->Release();
     if (dx11.context) dx11.context->Release();
     if (dx11.device) dx11.device->Release();
