@@ -9,9 +9,11 @@
 #include "qapi/error.h"
 #include "hw/dma/bcm2835_dma.h"
 #include "hw/core/irq.h"
+#include "system/dma.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "trace.h"
 
 /* DMA CS Control and Status bits */
 #define BCM2708_DMA_ACTIVE      (1 << 0)
@@ -58,6 +60,8 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
     BCM2835DMAChan *ch = &s->chan[c];
     uint32_t data, xlen, xlen_td, ylen;
     int16_t dst_stride, src_stride;
+    uint8_t *row = NULL;
+    bool bulk;
 
     if (!(s->enable & (1 << c))) {
         return;
@@ -86,52 +90,60 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
         }
         xlen_td = xlen;
 
-        if (ch->ti & BCM2708_DMA_D_WIDTH) {
-            qemu_log_mask(LOG_UNIMP, "%s: 128bit transfers not yet supported", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
-            break;
-        }
-
         /*
-         * Datasheet implies 32bit or 128bit transfers only
-         *
-         * TODO: test on real HW and report back.
+         * The width bits pick the bus transfer size on hardware; the bytes
+         * moved are the same either way, so they are not a reason to
+         * refuse, and neither is alignment: a transfer is whatever length
+         * the guest asked for. RISC OS's video driver moves window images
+         * this way, 128-bit wide, in 2D mode, with negative row strides
+         * when the destination is below the source.
          */
-        if (xlen & 0x3) {
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: bad transfer size\n", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
-            break;
+        bulk = (ch->ti & (BCM2708_DMA_S_INC | BCM2708_DMA_D_INC))
+               == (BCM2708_DMA_S_INC | BCM2708_DMA_D_INC)
+               && !(ch->ti & (BCM2708_DMA_S_IGNORE | BCM2708_DMA_D_IGNORE));
+        if (bulk) {
+            row = g_realloc(row, xlen_td);
+        }
+        if (ch->ti & BCM2708_DMA_TDMODE) {
+            trace_bcm2835_dma_2d(c, ch->source_ad, ch->dest_ad, xlen, ylen,
+                                 src_stride, dst_stride);
         }
 
         while (ylen != 0) {
-            /* Normal transfer mode */
+            if (bulk && xlen) {
+                /* both ends advance: move the row whole */
+                dma_memory_read(&s->dma_as, ch->source_ad, row, xlen,
+                                MEMTXATTRS_UNSPECIFIED);
+                dma_memory_write(&s->dma_as, ch->dest_ad, row, xlen,
+                                 MEMTXATTRS_UNSPECIFIED);
+                ch->source_ad += xlen;
+                ch->dest_ad += xlen;
+                xlen = 0;
+            }
             while (xlen != 0) {
-                if (ch->ti & BCM2708_DMA_S_IGNORE) {
-                    /* Ignore reads */
-                    data = 0;
-                } else {
-                    data = ldl_le_phys(&s->dma_as, ch->source_ad);
+                unsigned n = MIN(xlen, 4u);
+
+                data = 0;
+                if (!(ch->ti & BCM2708_DMA_S_IGNORE)) {
+                    dma_memory_read(&s->dma_as, ch->source_ad, &data, n,
+                                    MEMTXATTRS_UNSPECIFIED);
                 }
                 if (ch->ti & BCM2708_DMA_S_INC) {
-                    ch->source_ad += 4;
+                    ch->source_ad += n;
                 }
-
-                if (ch->ti & BCM2708_DMA_D_IGNORE) {
-                    /* Ignore writes */
-                } else {
-                    stl_le_phys(&s->dma_as, ch->dest_ad, data);
+                if (!(ch->ti & BCM2708_DMA_D_IGNORE)) {
+                    dma_memory_write(&s->dma_as, ch->dest_ad, &data, n,
+                                     MEMTXATTRS_UNSPECIFIED);
                 }
                 if (ch->ti & BCM2708_DMA_D_INC) {
-                    ch->dest_ad += 4;
+                    ch->dest_ad += n;
                 }
-
-                /* update remaining transfer length */
-                xlen -= 4;
-                if (ch->ti & BCM2708_DMA_TDMODE) {
-                    ch->txfr_len = (ylen << 16) | xlen;
-                } else {
-                    ch->txfr_len = xlen;
-                }
+                xlen -= n;
+            }
+            if (ch->ti & BCM2708_DMA_TDMODE) {
+                ch->txfr_len = ((ylen - 1) << 16);
+            } else {
+                ch->txfr_len = 0;
             }
 
             if (--ylen != 0) {
@@ -151,6 +163,7 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
         ch->conblk_ad = ch->nextconbk;
     }
 
+    g_free(row);
     ch->cs &= ~BCM2708_DMA_ACTIVE;
     ch->cs |= BCM2708_DMA_ISPAUSED;
 }
