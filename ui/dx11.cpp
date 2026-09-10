@@ -998,6 +998,25 @@ static bool dx11_render_frame(void)
                  fb.generation, fb.xres, fb.yres, fb.bpp,
                  dx11.mouse_moves, dx11.mouse_buttons);
     }
+    /* The status line: window title carries the guest's mode and the
+     * presented frame rate, once a second.  (The sprint's instruction
+     * rate needs TCG counters plumbed to the UI; still open.) */
+    if (frame_count % 60 == 0) {
+        static uint32_t last_second_frame;
+        static uint64_t last_tick;
+        uint64_t now = GetTickCount64();
+        if (last_tick && now > last_tick) {
+            unsigned fps = (unsigned)((frame_count - last_second_frame)
+                                      * 1000 / (now - last_tick));
+            wchar_t title[128];
+            _snwprintf(title, ARRAYSIZE(title),
+                       L"RISC OS 5 — %ux%u, %u bpp · %u fps — Raspberry Pi 4 (QEMU)",
+                       fb.xres, fb.yres, fb.bpp, fps);
+            SetWindowTextW(dx11.hwnd, title);
+        }
+        last_tick = now;
+        last_second_frame = frame_count;
+    }
 
     if (!dx11_glue_fb_view(&v)) {
         if (frame_count % 300 == 0) {
