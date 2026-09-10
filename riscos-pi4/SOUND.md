@@ -228,12 +228,10 @@ every sound.
 
 ## 7. The shape of the work
 
-- **S1 — accept, and answer.** Accept the `AUDS` open (keep refusing
-  `GCMD`, `DISP`, `TVSV`), decode the nine audio message types, answer
-  `RESULT{0}` to `CLOSE`, `CONFIG` and `CONTROL`. Discard the audio.
-  *Proves the hang is gone and RISC OS's sound system comes up.* The
-  `Sound` module's `*Speaker` and a `*Play` should complete rather than
-  wedge, with silence.
+- **S1 — accept, and answer. Done; see section 10.** Accept the `AUDS`
+  open (keep refusing `GCMD`, `DISP`, `TVSV`), decode the nine audio
+  message types, answer `RESULT{0}` to `CLOSE`, `CONFIG` and `CONTROL`.
+  Discard the audio.
 - **S2 — bulk receive.** `BULK_TX` → walk the pagelist → copy → reply
   `BULK_TX_DONE`. Reply `COMPLETE` immediately for the full count.
   *Proves the data arrives and the guest keeps feeding.* Dump the PCM to a
@@ -301,3 +299,78 @@ Read for this design, all of them primary:
   implementation of the same protocol, useful for telling what is required
   from what BCMSound merely happens to do
 - `riscos-pi4/DESIGN.md` §11 — why the services are refused today
+
+## 10. Sprint 1, as built
+
+Accepting `AUDS` cost the boot nothing, exactly as section 2 predicted:
+the desktop arrives unchanged, and the trace is the researched sequence
+message for message.
+
+```
+vchiq AUDS opened by port 0 -- accepting
+vchiq AUDS message type 4        <- OPEN, module init, no result wanted
+vchiq AUDS message type 5        <- CLOSE  \  AudioSetRate: the pair that
+vchiq AUDS message type 4        <- OPEN   /  used to hang, now answered
+vchiq AUDS message type 2        <- CONFIG
+vchiq AUDS config 2 channels, 44100 Hz, 16 bits
+vchiq AUDS message type 6        <- START
+vchiq AUDS message type 8 x6     <- the priming burst, ~50 ms
+vchiq AUDS complete 2048 bytes   <- and the loop turns
+```
+
+Two things had to come with it, because a bare accept would have left
+the machine worse off than refusing:
+
+**The bulk transfers must be acknowledged.** Once the service is open the
+guest starts sending them, and an unacknowledged bulk queue blocks
+BCMSound inside `BulkQueueTransmit` — a new hang where there was none.
+They are answered with `BULK_TX_DONE{size}` without the pagelist being
+walked or a byte being read, which is enough to keep the queue moving and
+leaves the reading to the sprint that plays the sound.
+
+**`COMPLETE` must be paced**, or the guest generates audio as fast as the
+emulator can run it. It is paced on the virtual clock at the rate
+`CONFIG` asked for. See below for how well.
+
+### The bug only sound could find
+
+The first build stalled after exactly **1265 buffers**. Three runs, three
+times 1265 — headless and windowed, so not a race. No error, no `STOP`
+from the guest (`AudioPreDisable` sends one, and none arrived, so RISC OS
+had not turned the sound off), and our last act each time was a `COMPLETE`
+that the guest simply never answered.
+
+**VCHIQ's slot protocol is symmetrical and the peer only ever did half of
+it.** Each side hands the other's spent slots back — appends the index to
+the owner's queue, bumps its recycle counter, fires its recycle event —
+and the guest was doing that for our slots faithfully. We had never done
+it for the guest's. It had never mattered: before sound, the peer received
+a `CONNECT` and four `OPEN`s in its entire life, comfortably inside one
+4 KB slot. Sound sends 48 bytes per buffer, and after about fifteen slots
+the guest ran out and blocked in `VCHIQ_MsgQueue` with nothing to say.
+
+`vchiq_recycle_slot` is nine lines. It is the kind of bug that sits
+harmless in a peer that barely talks and becomes a hard stop the moment
+one does, and it would have been just as invisible in sprint 2 or 3.
+
+### Pacing, measured
+
+With the stall fixed the loop runs indefinitely — 5883 buffers over a
+100-second run, against 1265 before — and the desktop is unaffected. The
+pacing is not right yet:
+
+| | delivered | of 96 s available |
+| --- | --- | --- |
+| a deadline booked per buffer | 73.4 s | 0.76x |
+| one clock, reporting what has played | 68.3 s | 0.71x |
+
+Both start at about 1.0x and decay; the second holds real time for the
+first 45 seconds and then slips. The cause has not been chased, because
+**sprint 3 deletes this clock**: once the voice is open, `audio_be_write`
+returns what the host's sound card actually took, and that number is the
+report. A pacer built out of virtual-clock deadlines is scaffolding for
+the sprint that has no audio device to ask, and tuning it would be work
+thrown away. It is recorded here so the number is not a surprise later.
+
+Nothing is audible yet, by design: the samples are acknowledged where
+they lie in guest memory and never read.

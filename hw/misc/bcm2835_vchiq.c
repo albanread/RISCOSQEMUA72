@@ -30,6 +30,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "trace.h"
 
 static uint32_t vchiq_ld(BCM2835VchiqState *s, uint32_t addr)
@@ -51,32 +52,306 @@ static void vchiq_signal_guest(BCM2835VchiqState *s, uint32_t event)
     qemu_set_irq(s->bell_irq, 1);
 }
 
-/* Append a message to our slot and return true if it fitted */
-static bool vchiq_queue_msg(BCM2835VchiqState *s, uint32_t msgid, uint32_t size)
+/*
+ * The slot our next message goes in. tx_pos is a monotonic byte position
+ * across the whole stream, exactly as the guest treats its own, and the
+ * slot for it comes from the queue we published at connect time and the
+ * guest appends to as it finishes with our slots.
+ */
+static bool vchiq_tx_slot(BCM2835VchiqState *s, uint32_t *slot)
+{
+    uint32_t index = s->tx_pos / s->slot_size;
+    uint32_t published, entry;
+
+    published = vchiq_ld(s, s->master_base + VCHIQ_SS_SLOT_QUEUE_RECYCLE);
+    if (index >= published) {
+        /* The guest has not given this one back yet. It only happens if it
+         * has stopped reading us, which is a fault on its side, not ours. */
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: slot %u not yet recycled "
+                      "(%u published)\n", __func__, index, published);
+        return false;
+    }
+    entry = vchiq_ld(s, s->master_base + VCHIQ_SS_SLOT_QUEUE
+                        + (index % s->per_side) * 4);
+    if (entry >= s->max_slots) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: slot queue entry %u out of "
+                      "range\n", __func__, entry);
+        return false;
+    }
+    *slot = entry;
+    return true;
+}
+
+/*
+ * Hand a slot of the guest's back to it, now that we have read every
+ * message in it. The guest does exactly this for our slots -- appends the
+ * index to the owner's queue, bumps its recycle counter and fires its
+ * recycle event -- and it blocks in VCHIQ_MsgQueue once it has run out,
+ * so this is not housekeeping: without it the guest stops talking after
+ * as many messages as its slots hold, silently and with nothing to see.
+ */
+static void vchiq_recycle_slot(BCM2835VchiqState *s, uint32_t slot)
+{
+    uint32_t n = vchiq_ld(s, s->slave_base + VCHIQ_SS_SLOT_QUEUE_RECYCLE);
+
+    vchiq_st(s, s->slave_base + VCHIQ_SS_SLOT_QUEUE + (n % s->per_side) * 4,
+             slot);
+    vchiq_st(s, s->slave_base + VCHIQ_SS_SLOT_QUEUE_RECYCLE, n + 1);
+    trace_bcm2835_vchiq_recycle(slot, n + 1);
+    vchiq_signal_guest(s, s->slave_base + VCHIQ_SS_RECYCLE);
+}
+
+/*
+ * Append a message, with an optional payload of whole words, and return
+ * true if it went. A message never straddles a slot: the rest of the slot
+ * is filled with a padding message and the next one started, which is what
+ * the guest's own sender does and what its parser expects.
+ */
+static bool vchiq_queue_msg_data(BCM2835VchiqState *s, uint32_t msgid,
+                                 const uint32_t *payload, uint32_t size)
 {
     uint32_t stride = QEMU_ALIGN_UP(size + VCHIQ_MSG_HDR_SIZE, 8);
-    uint32_t hdr;
+    uint32_t space = s->slot_size - (s->tx_pos % s->slot_size);
+    uint32_t slot, hdr, i;
 
-    if (s->tx_pos + stride > s->slot_size) {
-        /*
-         * We never recycle slots: this peer only ever emits one CONNECT and a
-         * handful of CLOSEs, which is a few dozen bytes of a 4K slot. Running
-         * out means the guest is doing something this model was not built for,
-         * and silently wrapping would corrupt its ring.
-         */
-        qemu_log_mask(LOG_UNIMP, "%s: message slot full, dropping msgid 0x%08x\n",
-                      __func__, msgid);
+    if (stride > s->slot_size) {
+        qemu_log_mask(LOG_UNIMP, "%s: message of %u bytes exceeds a slot\n",
+                      __func__, size);
+        return false;
+    }
+    if (space < stride) {
+        if (!vchiq_tx_slot(s, &slot)) {
+            return false;
+        }
+        hdr = s->slot0 + slot * s->slot_size + (s->tx_pos % s->slot_size);
+        vchiq_st(s, hdr, VCHIQ_MAKE_MSG(VCHIQ_MSG_PADDING, 0, 0));
+        vchiq_st(s, hdr + 4, space - VCHIQ_MSG_HDR_SIZE);
+        s->tx_pos += space;
+    }
+    if (!vchiq_tx_slot(s, &slot)) {
         return false;
     }
 
-    hdr = s->slot0 + s->tx_slot * s->slot_size + s->tx_pos;
+    hdr = s->slot0 + slot * s->slot_size + (s->tx_pos % s->slot_size);
     vchiq_st(s, hdr, msgid);
     vchiq_st(s, hdr + 4, size);
+    for (i = 0; i < size; i += 4) {
+        vchiq_st(s, hdr + VCHIQ_MSG_HDR_SIZE + i, payload[i / 4]);
+    }
+    s->tx_slot = slot;
     s->tx_pos += stride;
     vchiq_st(s, s->master_base + VCHIQ_SS_TX_POS, s->tx_pos);
 
     trace_bcm2835_vchiq_tx(msgid, VCHIQ_MSG_TYPE(msgid), size);
     return true;
+}
+
+static bool vchiq_queue_msg(BCM2835VchiqState *s, uint32_t msgid, uint32_t size)
+{
+    return vchiq_queue_msg_data(s, msgid, NULL, size);
+}
+
+/* ------------------------------------------------------------------ */
+/*
+ * The AUDS audio service.
+ *
+ * RISC OS reaches the speaker through this and nothing else: BCMSound is
+ * a "VCHIQ audio service controller" in its own words, so there is no
+ * audio hardware to model -- riscos-pi4/SOUND.md is the research.
+ *
+ * Two things make it work. The first is that three of the messages are
+ * sent from an unbounded spin on a byte -- BCMSound's SendWithResult,
+ * with interrupts forced on, no timeout and no deadline -- so CLOSE,
+ * CONFIG and CONTROL must be answered with a RESULT or the guest never
+ * comes back. That is why the service was refused until now.
+ *
+ * The second is that COMPLETE is the clock. BCMSound counts the bytes we
+ * report in it and calls SoundDMA once per buffer's worth, so the rate we
+ * send COMPLETE is the rate RISC OS generates sound at. Here that is
+ * paced on the virtual clock from the format CONFIG asked for; sprint 3
+ * moves it onto the audio backend, whose own consumption is the host's
+ * real sound card and cannot drift against it.
+ *
+ * This sprint plays nothing. It takes the bulk transfers and reports them
+ * complete without reading a byte, which is enough to prove the guest's
+ * whole sound path comes up and keeps turning.
+ */
+
+static void auds_reply(BCM2835VchiqState *s, const uint32_t *msg)
+{
+    vchiq_queue_msg_data(s, VCHIQ_MAKE_MSG(VCHIQ_MSG_DATA,
+                                           VCHIQ_AUDS_VC_PORT, s->auds_port),
+                         msg, VC_AUDIO_MSG_SIZE);
+}
+
+static void auds_result(BCM2835VchiqState *s, int32_t success)
+{
+    uint32_t msg[VC_AUDIO_MSG_WORDS] = { 0 };
+
+    msg[0] = VC_AUDIO_MSG_TYPE_RESULT;
+    msg[1] = (uint32_t)success;
+    auds_reply(s, msg);
+}
+
+static void auds_complete(BCM2835VchiqState *s, uint32_t bytes)
+{
+    uint32_t msg[VC_AUDIO_MSG_WORDS] = { 0 };
+
+    /* count, then the two cookies from the WRITE this answers. BCMSound
+     * sends zeroes and ignores them coming back; Linux's driver checks
+     * them, so echo what arrived rather than invent anything. */
+    msg[0] = VC_AUDIO_MSG_TYPE_COMPLETE;
+    msg[1] = bytes;
+    msg[2] = s->auds_cookie1;
+    msg[3] = s->auds_cookie2;
+    trace_bcm2835_vchiq_auds_complete(bytes);
+    auds_reply(s, msg);
+}
+
+/* Bytes a second of the format the guest last configured, 0 if none */
+static uint32_t auds_byte_rate(const BCM2835VchiqState *s)
+{
+    return s->auds_channels * (s->auds_bps / 8) * s->auds_rate;
+}
+
+/*
+ * Report the audio that has played since we last looked.
+ *
+ * The earlier shape of this booked a deadline per buffer, which could be
+ * overrun by a guest that ran ahead and then never caught up -- measured
+ * at 146 reports a second early and 44 late, against the 86 the format
+ * asks for. This holds one number instead: the virtual time at which
+ * everything taken so far will have finished playing. What has played is
+ * whatever that leaves behind, so the pacing cannot run fast, and a slow
+ * tick is made up on the next one rather than lost.
+ */
+static void auds_timer_fire(void *opaque)
+{
+    BCM2835VchiqState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t rate = auds_byte_rate(s);
+    uint64_t played;
+
+    if (!rate || !s->auds_outstanding) {
+        return;
+    }
+    if (now >= s->auds_played_ns) {
+        played = s->auds_outstanding;           /* all of it, and then some */
+    } else {
+        uint64_t left = (uint64_t)(s->auds_played_ns - now) * rate
+                        / NANOSECONDS_PER_SECOND;
+
+        played = left < s->auds_outstanding ? s->auds_outstanding - left : 0;
+    }
+
+    if (played) {
+        s->auds_outstanding -= played;
+        auds_complete(s, played);
+        vchiq_signal_guest(s, s->slave_base + VCHIQ_SS_TRIGGER);
+    }
+    if (s->auds_outstanding) {
+        hrtimer_mod_ns(s->auds_timer, now + VCHIQ_AUDS_TICK_NS);
+    }
+}
+
+/* Take a buffer's worth of audio and put it on the clock */
+static void auds_queue_playback(BCM2835VchiqState *s, uint32_t bytes)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t rate = auds_byte_rate(s);
+
+    if (!rate || !bytes) {
+        /* No format yet: answer at once rather than lose the buffer */
+        auds_complete(s, bytes);
+        vchiq_signal_guest(s, s->slave_base + VCHIQ_SS_TRIGGER);
+        return;
+    }
+
+    /* Where the audio already taken runs out, or now if it has */
+    if (s->auds_played_ns < now) {
+        s->auds_played_ns = now;
+    }
+    s->auds_played_ns += (int64_t)bytes * NANOSECONDS_PER_SECOND / rate;
+    s->auds_outstanding += bytes;
+    hrtimer_mod_ns(s->auds_timer, now + VCHIQ_AUDS_TICK_NS);
+}
+
+static void auds_close(BCM2835VchiqState *s)
+{
+    s->auds_open = false;
+    s->auds_running = false;
+    s->auds_outstanding = 0;
+    s->auds_played_ns = 0;
+    if (s->auds_timer) {
+        hrtimer_del(s->auds_timer);
+    }
+}
+
+/* One audio message out of a DATA carrying it. Returns replies queued. */
+static unsigned auds_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
+                                uint32_t size)
+{
+    uint32_t body = hdr + VCHIQ_MSG_HDR_SIZE;
+    uint32_t type;
+
+    if (size < 4) {
+        return 0;
+    }
+    type = vchiq_ld(s, body);
+    trace_bcm2835_vchiq_auds_msg(type, size);
+
+    switch (type) {
+    case VC_AUDIO_MSG_TYPE_CONFIG:
+        if (size >= 16) {
+            s->auds_channels = vchiq_ld(s, body + 4);
+            s->auds_rate = vchiq_ld(s, body + 8);
+            s->auds_bps = vchiq_ld(s, body + 12);
+            trace_bcm2835_vchiq_auds_config(s->auds_channels, s->auds_rate,
+                                            s->auds_bps);
+        }
+        auds_result(s, 0);
+        return 1;
+
+    case VC_AUDIO_MSG_TYPE_CONTROL:
+        /* Volume and destination. Acknowledged, not yet applied. */
+        auds_result(s, 0);
+        return 1;
+
+    case VC_AUDIO_MSG_TYPE_CLOSE:
+        /* The audio session, not the VCHIQ service: BCMSound closes and
+         * reopens it around every rate change. */
+        s->auds_running = false;
+        s->auds_outstanding = 0;
+        s->auds_played_ns = 0;
+        auds_result(s, 0);
+        return 1;
+
+    case VC_AUDIO_MSG_TYPE_OPEN:
+        return 0;               /* sent without waiting for a result */
+
+    case VC_AUDIO_MSG_TYPE_START:
+        s->auds_running = true;
+        s->auds_played_ns = 0;
+        return 0;
+
+    case VC_AUDIO_MSG_TYPE_STOP:
+        s->auds_running = false;
+        return 0;
+
+    case VC_AUDIO_MSG_TYPE_WRITE:
+        /* The header only: the samples follow as a bulk transfer. Keep
+         * the cookies to echo in the COMPLETE that answers it. */
+        if (size >= 16) {
+            s->auds_cookie1 = vchiq_ld(s, body + 8);
+            s->auds_cookie2 = vchiq_ld(s, body + 12);
+        }
+        return 0;
+
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unhandled audio message type %u\n",
+                      __func__, type);
+        return 0;
+    }
 }
 
 /*
@@ -235,26 +510,94 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
             break;
         }
 
-        s->rx_pos += QEMU_ALIGN_UP(size + VCHIQ_MSG_HDR_SIZE, 8);
+        /*
+         * Advance, and if that leaves this slot behind, give it back: the
+         * guest cannot send us anything more once its slots are all with
+         * us.
+         */
+        {
+            uint32_t was = s->rx_pos / s->slot_size;
+
+            s->rx_pos += QEMU_ALIGN_UP(size + VCHIQ_MSG_HDR_SIZE, 8);
+            if (s->rx_pos / s->slot_size != was) {
+                vchiq_recycle_slot(s, slot);
+            }
+        }
 
         switch (type) {
         case VCHIQ_MSG_OPEN:
         {
             /*
-             * Payload is { fourcc, client_id, version, version_min }. We have
-             * no services, so close it straight back; the guest treats that as
-             * a clean refusal and carries on.
+             * Payload is { fourcc, client_id, version, version_min }.
+             * 'AUDS' is the sound path and we answer it; the rest are
+             * closed straight back, which the guest treats as a clean
+             * refusal and carries on. Refusing them is deliberate --
+             * DESIGN.md section 11 has why.
              */
             uint32_t fourcc = vchiq_ld(s, hdr + VCHIQ_MSG_HDR_SIZE);
             uint32_t srcport = VCHIQ_MSG_SRCPORT(msgid);
 
-            trace_bcm2835_vchiq_open(fourcc, srcport);
-            replies += vchiq_queue_msg(s,
-                VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE, 0, srcport), 0);
+            if (fourcc == VCHIQ_FOURCC_AUDS && !s->auds_open) {
+                uint32_t ack = VCHIQ_AUDS_VERSION;   /* a short, low half */
+
+                s->auds_open = true;
+                s->auds_port = srcport;
+                trace_bcm2835_vchiq_auds_open(srcport);
+                replies += vchiq_queue_msg_data(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_OPENACK,
+                                   VCHIQ_AUDS_VC_PORT, srcport),
+                    &ack, 4);
+            } else {
+                trace_bcm2835_vchiq_open(fourcc, srcport);
+                replies += vchiq_queue_msg(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE, 0, srcport), 0);
+            }
             break;
         }
-        case VCHIQ_MSG_CONNECT:
+        case VCHIQ_MSG_DATA:
+            trace_bcm2835_vchiq_rx(msgid, type, size);
+            if (s->auds_open &&
+                VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_AUDS_VC_PORT) {
+                replies += auds_handle_msg(s, hdr, size);
+            }
+            break;
+        case VCHIQ_MSG_BULK_TX:
+        {
+            /*
+             * The samples themselves. The payload is { data, size } where
+             * data is the bus address of a pagelist, not of the buffer --
+             * this sprint acknowledges the transfer without reading it,
+             * so the pagelist can wait for the one that plays the sound.
+             * The transfer must still be completed or the guest's bulk
+             * queue fills and BCMSound blocks in BulkQueueTransmit.
+             */
+            uint32_t bulk_size = size >= 8
+                               ? vchiq_ld(s, hdr + VCHIQ_MSG_HDR_SIZE + 4) : 0;
+
+            trace_bcm2835_vchiq_rx(msgid, type, size);
+            if (s->auds_open &&
+                VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_AUDS_VC_PORT) {
+                replies += vchiq_queue_msg_data(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_BULK_TX_DONE,
+                                   VCHIQ_AUDS_VC_PORT, s->auds_port),
+                    &bulk_size, 4);
+                auds_queue_playback(s, bulk_size);
+            }
+            break;
+        }
         case VCHIQ_MSG_CLOSE:
+            trace_bcm2835_vchiq_rx(msgid, type, size);
+            if (s->auds_open &&
+                VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_AUDS_VC_PORT) {
+                /* Closing the service, not the audio session: answer so
+                 * the guest's own close completes rather than times out. */
+                replies += vchiq_queue_msg(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE,
+                                   VCHIQ_AUDS_VC_PORT, s->auds_port), 0);
+                auds_close(s);
+            }
+            break;
+        case VCHIQ_MSG_CONNECT:
         case VCHIQ_MSG_PADDING:
             trace_bcm2835_vchiq_rx(msgid, type, size);
             break;
@@ -382,8 +725,8 @@ static const MemoryRegionOps bcm2835_vchiq_bell_ops = {
 
 static const VMStateDescription vmstate_bcm2835_vchiq = {
     .name = TYPE_BCM2835_VCHIQ,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(bell0, BCM2835VchiqState),
         VMSTATE_UINT32(slot0, BCM2835VchiqState),
@@ -396,6 +739,14 @@ static const VMStateDescription vmstate_bcm2835_vchiq = {
         VMSTATE_UINT32(tx_pos, BCM2835VchiqState),
         VMSTATE_UINT32(rx_pos, BCM2835VchiqState),
         VMSTATE_BOOL(connected, BCM2835VchiqState),
+        VMSTATE_BOOL(auds_open, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_port, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_rate, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_channels, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_bps, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_cookie1, BCM2835VchiqState),
+        VMSTATE_UINT32(auds_cookie2, BCM2835VchiqState),
+        VMSTATE_BOOL(auds_running, BCM2835VchiqState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -432,6 +783,13 @@ static void bcm2835_vchiq_reset(DeviceState *dev)
     s->tx_pos = 0;
     s->rx_pos = 0;
     s->connected = false;
+    auds_close(s);
+    s->auds_port = 0;
+    s->auds_rate = 0;
+    s->auds_channels = 0;
+    s->auds_bps = 0;
+    s->auds_cookie1 = 0;
+    s->auds_cookie2 = 0;
 }
 
 static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
@@ -442,6 +800,10 @@ static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_VCHIQ "-memory");
+
+    /* The audio clock. One deadline list, fired under the BQL, the same
+     * thread the vsync generator and the system timer run on. */
+    s->auds_timer = hrtimer_new(auds_timer_fire, s);
 
     bcm2835_vchiq_reset(dev);
 }

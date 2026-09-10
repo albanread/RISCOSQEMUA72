@@ -9,6 +9,7 @@
 #define BCM2835_VCHIQ_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/hrtimer.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_VCHIQ "bcm2835-vchiq"
@@ -62,11 +63,51 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835VchiqState, BCM2835_VCHIQ)
 #define VCHIQ_MSG_OPEN              2
 #define VCHIQ_MSG_OPENACK           3
 #define VCHIQ_MSG_CLOSE             4
+#define VCHIQ_MSG_DATA              5
+#define VCHIQ_MSG_BULK_RX           6
+#define VCHIQ_MSG_BULK_TX           7
+#define VCHIQ_MSG_BULK_RX_DONE      8
+#define VCHIQ_MSG_BULK_TX_DONE      9
 
 #define VCHIQ_MSG_HDR_SIZE          8
 #define VCHIQ_MAKE_MSG(t, src, dst) (((t) << 24) | ((src) << 12) | (dst))
 #define VCHIQ_MSG_TYPE(id)          ((id) >> 24)
 #define VCHIQ_MSG_SRCPORT(id)       (((id) >> 12) & 0xfff)
+#define VCHIQ_MSG_DSTPORT(id)       ((id) & 0xfff)
+
+/*
+ * The audio service. RISC OS reaches the speaker through this and nothing
+ * else: BCMSound calls itself a "VCHIQ audio service controller", opens
+ * 'AUDS' and ships PCM over it, so there is no audio hardware to model --
+ * see riscos-pi4/SOUND.md. Message layout is Linux's
+ * vc_vchi_audioserv_defs.h, which BCMSound's own equates agree with.
+ */
+#define VCHIQ_FOURCC_AUDS           0x41554453  /* 'AUDS' */
+#define VCHIQ_AUDS_VERSION          2
+/* Our port for the service. Any value the guest can hold; it records this
+ * as the service's remoteport from our OPENACK and checks it thereafter. */
+#define VCHIQ_AUDS_VC_PORT          1
+
+#define VC_AUDIO_MSG_TYPE_RESULT    0
+#define VC_AUDIO_MSG_TYPE_COMPLETE  1
+#define VC_AUDIO_MSG_TYPE_CONFIG    2
+#define VC_AUDIO_MSG_TYPE_CONTROL   3
+#define VC_AUDIO_MSG_TYPE_OPEN      4
+#define VC_AUDIO_MSG_TYPE_CLOSE     5
+#define VC_AUDIO_MSG_TYPE_START     6
+#define VC_AUDIO_MSG_TYPE_STOP      7
+#define VC_AUDIO_MSG_TYPE_WRITE     8
+
+/* s32 type plus 16 bytes of payload, which is what BCMSound dequeues */
+#define VC_AUDIO_MSG_WORDS          5
+#define VC_AUDIO_MSG_SIZE           (VC_AUDIO_MSG_WORDS * 4)
+
+/*
+ * How often the reports go out. Well under a buffer, so the guest's byte
+ * count moves smoothly rather than in steps; BCMSound accumulates them
+ * and does not care how they are chopped up.
+ */
+#define VCHIQ_AUDS_TICK_NS          (5 * 1000 * 1000)
 
 /* Doorbell registers, relative to the region base (mailbox base + 0x40) */
 #define VCHIQ_BELL0                 0x00  /* VC -> ARM, read to clear */
@@ -91,10 +132,31 @@ struct BCM2835VchiqState {
     uint32_t slot_size;
     uint32_t max_slots;         /* from slot zero, bound every slot index by */
     uint32_t per_side;          /* entries in each side's slot queue */
-    uint32_t tx_slot;           /* the slot we write our messages into */
-    uint32_t tx_pos;
+    uint32_t tx_slot;           /* the slot we last wrote a message into */
+    uint32_t tx_pos;            /* monotonic byte position in our stream */
     uint32_t rx_pos;            /* our cursor into the guest's message stream */
     bool connected;
+
+    /* The audio service, while the guest has it open */
+    bool auds_open;
+    uint32_t auds_port;         /* the guest's port for it */
+    uint32_t auds_rate;         /* from CONFIG: Hz, channels, bits */
+    uint32_t auds_channels;
+    uint32_t auds_bps;
+    uint32_t auds_cookie1;      /* echoed back in COMPLETE */
+    uint32_t auds_cookie2;
+    bool auds_running;          /* between START and STOP */
+
+    /*
+     * COMPLETE is the clock RISC OS makes sound on -- it counts the bytes
+     * we report and calls SoundDMA once per buffer's worth -- so the
+     * reports are paced on the virtual clock at the rate CONFIG asked
+     * for. Sprint 3 moves the pacing onto the audio backend, which is
+     * the host's real sound card and cannot drift against it.
+     */
+    HRTimer *auds_timer;
+    uint64_t auds_outstanding;  /* bytes taken but not yet reported played */
+    int64_t auds_played_ns;     /* when the audio queued so far runs out */
 };
 
 #endif

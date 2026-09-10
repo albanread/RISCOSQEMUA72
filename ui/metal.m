@@ -188,6 +188,7 @@ static void metal_cursor_sync(void)
 
 static struct {
     bool swallow_up;                /* the middle-up of a grab click */
+    int held_left, held_right;      /* button actually sent, per stream */
     /* the guest pointer position we last sent, in guest pixels: the
      * anchor for relative motion while grabbed (absolute while not) */
     int gx, gy;
@@ -1032,40 +1033,66 @@ static void metal_screenshot(void)
 - (void)rightMouseDragged:(NSEvent *)e { metal_mouse_move(e); }
 - (void)otherMouseDragged:(NSEvent *)e { metal_mouse_move(e); }
 
+/*
+ * RISC OS wants three buttons -- Select, Menu and Adjust -- and a Mac
+ * has one. Shift-click is Adjust and Control-click is Menu, which is the
+ * usual bargain on this platform. Two things make it fiddlier than it
+ * looks: macOS turns a Control-click into a right click before we ever
+ * see it, so Menu has to be recognised on that stream too; and the
+ * modifier may be let go before the button is, so the button actually
+ * sent is latched at press time and that is what gets released.
+ *
+ * The cost is Shift-Select and Control-Select, which RISC OS does use.
+ * Menu is worth more: there is no reaching a menu without it.
+ */
+static int metal_button_for(NSEvent *e, int plain)
+{
+    NSUInteger f = [e modifierFlags];
+
+    if (f & NSEventModifierFlagControl) {
+        return 1;                       /* Menu */
+    }
+    if (f & NSEventModifierFlagShift) {
+        return 2;                       /* Adjust */
+    }
+    return plain;
+}
+
 - (void)mouseDown:(NSEvent *)e
 {
-    (void)e;
-    metal_glue_mouse_btn(0, true);
+    mouse.held_left = metal_button_for(e, 0);
+    metal_glue_mouse_btn(mouse.held_left, true);
     m.mouse_buttons++;
 }
 
 - (void)mouseUp:(NSEvent *)e
 {
     (void)e;
-    metal_glue_mouse_btn(0, false);
+    metal_glue_mouse_btn(mouse.held_left, false);
 }
 
 - (void)rightMouseDown:(NSEvent *)e
 {
-    (void)e;
-    metal_glue_mouse_btn(2, true);
+    mouse.held_right = metal_button_for(e, 2);
+    metal_glue_mouse_btn(mouse.held_right, true);
     m.mouse_buttons++;
 }
 
 - (void)rightMouseUp:(NSEvent *)e
 {
     (void)e;
-    metal_glue_mouse_btn(2, false);
+    metal_glue_mouse_btn(mouse.held_right, false);
 }
 
+/*
+ * A real middle button is Menu, not a grab toggle: the Windows front end
+ * spends it on capturing the pointer, but the tablet already keeps the
+ * two arrows together here, so there is nothing to capture and Menu is
+ * the better use of it. Ctrl+Alt+G still grabs.
+ */
 - (void)otherMouseDown:(NSEvent *)e
 {
     if ([e buttonNumber] != 2) {
-        return;
-    }
-    if (!kbd.on) {
-        metal_set_grab(true);
-        mouse.swallow_up = true;        /* balance: the down was ours */
         return;
     }
     metal_glue_mouse_btn(1, true);
@@ -1075,10 +1102,6 @@ static void metal_screenshot(void)
 - (void)otherMouseUp:(NSEvent *)e
 {
     if ([e buttonNumber] != 2) {
-        return;
-    }
-    if (mouse.swallow_up) {
-        mouse.swallow_up = false;
         return;
     }
     metal_glue_mouse_btn(1, false);
