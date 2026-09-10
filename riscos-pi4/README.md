@@ -197,7 +197,17 @@ after the OS image — and under emulation QEMU *is* the firmware. Without one
 the HAL blanks the settings and the machine boots unconfigured; without
 `--unplug 106` the EtherGENET driver dereferences a null pointer and RISC OS
 prints a data abort on its own console. `mkcmos.py` derives both the blob and
-the address to load it at from RISC OS's own headers and ROM image.
+the address to load it at from RISC OS's own headers and ROM image; it also
+takes `--unplug EtherGENET` by title instead of number (it walks the ROM's
+module chain exactly as `Kernel/s/ModHand` does), and `--symbols
+tools/cmos-symbols-530.json` in place of `--riscos-src`, so the blob builds
+from the image's own `CMOS` file with no source checkout:
+
+```bash
+python riscos-pi4/tools/mkcmos.py --rom RISCOS.IMG \
+    --base CMOS --unplug EtherGENET \
+    --symbols riscos-pi4/tools/cmos-symbols-530.json -o cmos.bin
+```
 
 If you cannot lay hands on the RISC OS sources that `mkcmos.py` needs,
 `riscos-pi4/tools/patch-rom-nogenet.py` achieves the same by patching the
@@ -213,12 +223,17 @@ filled in. That register block is covered by an unimplemented-device stub
 so the probe reads zero instead of taking an external abort; it does not
 save the boot on its own, hence the unplug bit.
 
-`-display dx11` is the fork's own Windows display (Sprint U0): a Win32
-window on the main thread with a D3D11 flip-model swap chain clearing it
-at vsync, QEMU's main loop running on a worker thread. It shows a blank
-surface for now — the guest framebuffer is decoded onto it in U1 — but the
-boot behind it is pixel-identical to `-display none`, and closing the
-window shuts the emulator down cleanly.
+`-display dx11` is the fork's own Windows display (Sprints U0–U1): a Win32
+window on the main thread with a D3D11 flip-model swap chain, QEMU's main
+loop running on a worker thread. The guest framebuffer is decoded on the
+GPU each frame — raw bytes uploaded lock-free from mapped guest RAM, a
+per-format pixel shader (8 bpp palette and 32 bpp are the two RISC OS
+ever asks for; 16/24 and sub-byte ride along), and a scale pass that
+stretches any mode to the whole client area, because the window is the
+monitor. PrintScreen writes the decoded surface to `dx11-screenshot-N.png`;
+closing the window shuts the emulator down cleanly. Failures land in
+`dx11-debug.txt` next to the process; `DX11_DEBUG=1` in the environment
+asks for the D3D11 debug layer.
 
 `-cpu cortex-a72,aarch64=off` is the load-bearing part. `-M raspi4b` hard-codes
 its CPU, so it is widely assumed `-cpu` does nothing there — but the *property*

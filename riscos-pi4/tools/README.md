@@ -53,7 +53,8 @@ reaches the desktop.
 
 Under emulation QEMU is the firmware, so `-device loader` can supply that blob:
 
-    python mkcmos.py --riscos-src <path>/BCM2835/RiscOS --rom RISCOS.IMG         --unplug 106 -o cmos.bin
+    python mkcmos.py --rom RISCOS.IMG --base CMOS --unplug EtherGENET \
+        --symbols cmos-symbols-530.json -o cmos.bin
 
     qemu-system-aarch64 ... -device loader,file=cmos.bin,addr=0x510000,force-raw=on
 
@@ -64,11 +65,23 @@ header. It cross-checks the layout against the address comments in the header
 and reports any that disagree, and it mirrors the kernel's backwards-indexed
 unplug table rather than assuming the arithmetic.
 
-`--unplug 106` disables **EtherGENET** in RISC OS 5.30. With no Ethernet
-controller to find, its `genet_attach` returns `ENXIO` but leaves `nicifp`
-NULL, and a callback booked during module init then dereferences it -- a data
-abort on address `0x18`. That is a bug in the driver, not in the emulation, and
-no device model can prevent it; the only lever is not to start the module.
+Two options keep a source checkout out of the recipe:
+
+- `--symbols cmos-symbols-530.json` loads the resolved symbol table instead
+  of parsing the headers (build it once with `--dump-symbols FILE` alongside
+  `--riscos-src`); the committed table lives next to this README. With
+  `--base CMOS` the kernel defaults are not needed either.
+- `--unplug EtherGENET` names the module instead of numbering it: with
+  `--rom` it walks the ROM module chain exactly as `Kernel/s/ModHand` does
+  -- size word, module, title at `+0x10`, chunks counted from zero -- and
+  prints the number it resolved to. `--unplug 106` remains valid.
+
+`--unplug EtherGENET` disables the Pi 4's GENET Ethernet driver in RISC OS
+5.30. With no Ethernet controller to find, its `genet_attach` returns `ENXIO`
+but leaves `nicifp` NULL, and a callback booked during module init then
+dereferences it -- a data abort on address `0x18`. That is a bug in the
+driver, not in the emulation, and no device model can prevent it; the only
+lever is not to start the module.
 
 `--language 1` makes the supervisor prompt a deliberate choice. The stock
 default is 11, the Desktop.

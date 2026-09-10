@@ -167,6 +167,55 @@ def unplug_byte(chunk, syms):
         raise SystemExit(f'{name} not found in hdr/CMOS')
     return syms[name] + extra, 1 << bit
 
+
+def rom_module_chunk(rom_path, title):
+    """The chunk number of ROM module `title`, found by walking the chain.
+
+    This is exactly what Kernel/s/ModHand does at boot: start at
+    SysModules_Info+4, read the size word at module-4, add it to get the
+    next module, stop at a zero size word; chunk numbers count from 0 at
+    the first module. The start offset is not written anywhere in the
+    image, so it is found the same way a wrong-length word would be: try
+    every offset, keep the walk that runs cleanly to the terminator with
+    sane module titles throughout. A chain that walks a hundred-plus
+    modules to an exact zero word through printable titles is not an
+    accident, and we additionally insist the asked-for title is on it.
+    """
+    data = open(rom_path, 'rb').read()
+
+    def walk(start):
+        mods, M = [], start
+        while M + 4 <= len(data):
+            L = struct.unpack_from('<I', data, M - 4)[0]
+            if L == 0:
+                return mods                       # exact terminator
+            if L < 0x20 or M + L > len(data):
+                return None
+            t_off = struct.unpack_from('<I', data, M + 0x10)[0]
+            if not 0x10 < t_off < L:               # title inside the module
+                return None
+            t = M + t_off
+            e = data.find(b'\0', t, t + 90)
+            if e <= t:
+                return None
+            s = data[t:e]
+            if not all(32 <= c < 127 for c in s) or len(s) < 2:
+                return None
+            mods.append(s.decode())
+            M += L
+        return None
+
+    best = None
+    for S in range(0x10040, min(len(data), 0x80000), 4):
+        mods = walk(S)
+        if mods and len(mods) >= 40:
+            if title in mods and (best is None or len(mods) > len(best)):
+                best = mods
+    if not best:
+        raise SystemExit(f'{rom_path}: no module chain walks to "{title}" '
+                         '-- not a RISC OS ROM image?')
+    return best.index(title), len(best)
+
 def checksum(cmos):
     total = CHECKSUM_SEED + sum(cmos[0:SKIP_FROM]) + sum(cmos[SKIP_TO:CMOS_SIZE])
     return total & 0xFF
@@ -185,11 +234,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('-o', '--output', default='cmos.bin')
-    ap.add_argument('--riscos-src', required=True,
-                    help='path to .../BCM2835/RiscOS')
-    ap.add_argument('--rom', help='ROM image, to compute the load address')
-    ap.add_argument('--unplug', type=int, action='append', default=[],
-                    metavar='CHUNK', help='disable ROM module chunk (repeatable)')
+    ap.add_argument('--riscos-src', metavar='PATH',
+                    help='path to .../BCM2835/RiscOS, for the CMOS layout '
+                         'and kernel defaults. Not needed when --symbols '
+                         'is given together with --base.')
+    ap.add_argument('--symbols', metavar='FILE',
+                    help='CMOS symbol table previously written by '
+                         '--dump-symbols, instead of parsing the RISC OS '
+                         'headers. With --base the kernel defaults are not '
+                         'needed either, so this runs with no checkout.')
+    ap.add_argument('--dump-symbols', metavar='FILE',
+                    help='with --riscos-src: write the resolved symbol '
+                         'table to FILE as JSON, for --symbols later')
+    ap.add_argument('--rom', help='ROM image, to compute the load address '
+                                  'and to resolve --unplug by module name')
+    ap.add_argument('--unplug', action='append', default=[], metavar='CHUNK|NAME',
+                    help='disable a ROM module, by chunk number or by its '
+                         'title in the ROM given by --rom (repeatable)')
     ap.add_argument('--language', type=int,
                     help='module the kernel starts (stock default 11 = Desktop)')
     ap.add_argument('--filesystem', type=int, metavar='N',
@@ -210,20 +271,28 @@ def main():
         raise SystemExit(f'version must be {VERSION_MIN}..{VERSION_MAX - 1}; '
                          'the HAL blanks the blob otherwise')
 
-    hdr = f'{args.riscos_src}/Sources/Programmer/HdrSrc/hdr/CMOS'
-    knl = f'{args.riscos_src}/Sources/Kernel/s/PMF/i2cutils'
+    if args.symbols:
+        syms = json.load(open(args.symbols))
+        print(f'{len(syms)} symbols from {args.symbols}', file=sys.stderr)
+    elif args.riscos_src:
+        hdr = f'{args.riscos_src}/Sources/Programmer/HdrSrc/hdr/CMOS'
+        fsn = f'{args.riscos_src}/Sources/Programmer/HdrSrc/hdr/FSNumbers'
+        syms, mismatches = read_symbols([hdr, fsn])
+        print(f'{len(syms)} symbols from hdr/CMOS', file=sys.stderr)
+        for name, got, want in mismatches:
+            print(f'  warning: {name} maps to &{got:02X}, its comment says &{want:02X}',
+                  file=sys.stderr)
+    else:
+        raise SystemExit('need --riscos-src or --symbols for the CMOS layout')
 
-    fsn = f'{args.riscos_src}/Sources/Programmer/HdrSrc/hdr/FSNumbers'
-    syms, mismatches = read_symbols([hdr, fsn])
-    print(f'{len(syms)} symbols from hdr/CMOS', file=sys.stderr)
-    for name, got, want in mismatches:
-        print(f'  warning: {name} maps to &{got:02X}, its comment says &{want:02X}',
-              file=sys.stderr)
+    # FirstUnpluggableModule lives in Kernel/hdr/Options, which this tool
+    # does not parse; bake the value into the table so --symbols is
+    # self-contained. (Kernel/hdr/Options: SETA 8.)
+    syms.setdefault('FirstUnpluggableModule', 8)
 
-    defaults, unresolved = read_defaults(knl, syms)
-    print(f'{len(defaults)} defaults from DefaultCMOSTable', file=sys.stderr)
-    for loc, val, why in unresolved:
-        print(f'  warning: skipped {loc} = {val} ({why})', file=sys.stderr)
+    if args.dump_symbols:
+        json.dump(syms, open(args.dump_symbols, 'w'), indent=1, sort_keys=True)
+        print(f'wrote {len(syms)} symbols to {args.dump_symbols}', file=sys.stderr)
 
     if args.base:
         base = open(args.base, 'rb').read()
@@ -232,6 +301,15 @@ def main():
         cmos = bytearray(base[:CMOS_SIZE])
         print(f'starting from {args.base}', file=sys.stderr)
     else:
+        if not args.riscos_src:
+            raise SystemExit('without --base the kernel defaults are needed, '
+                             'which requires --riscos-src')
+        knl = f'{args.riscos_src}/Sources/Kernel/s/PMF/i2cutils'
+        defaults, unresolved = read_defaults(knl, syms)
+        print(f'{len(defaults)} defaults from DefaultCMOSTable', file=sys.stderr)
+        for loc, val, why in unresolved:
+            print(f'  warning: skipped {loc} = {val} ({why})', file=sys.stderr)
+
         cmos = bytearray(CMOS_SIZE)
         for loc, val in defaults.items():
             cmos[loc] = val
@@ -240,7 +318,15 @@ def main():
         for i in range(SKIP_FROM + 1, CMOS_SIZE):
             cmos[i] = 0xFF
 
-    for chunk in args.unplug:
+    for spec in args.unplug:
+        if re.fullmatch(r'\d+', spec):
+            chunk = int(spec)
+        else:
+            if not args.rom:
+                raise SystemExit(f'--unplug {spec!r} by module title needs --rom')
+            chunk, total = rom_module_chunk(args.rom, spec)
+            print(f'{spec} is chunk {chunk} ({total} modules in the ROM chain)',
+                  file=sys.stderr)
         loc, bit = unplug_byte(chunk, syms)
         cmos[loc] |= bit
         print(f'unplugging chunk {chunk}: &{loc:02X} |= {bit:#04x}', file=sys.stderr)

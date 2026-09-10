@@ -86,6 +86,26 @@ mode to the display mode; PNG screenshot from the decoded surface.
 mode shows the right palette; a mode change mid-session is handled without
 touching the window.
 
+**Done, except the two mode-change checks, which need U2's input to test.**
+The config is a seqlock: `bcm2835_fb_reconfigure` bumps the generation odd
+while writing and even on commit, and `bcm2835_fb_get_config` hands the UI
+thread a snapshot that is never torn; a mode change is one rebuild of the
+per-mode pipeline, and the UI never sees the window move. Guest RAM is
+mapped through the fb device's own DMA address space — `cfg.base` for the
+buffer, `vcram_base` for the palette — and read on the UI thread with no
+lock, which is exactly what a monitor does. One HLSL source compiles into
+all seven decoders at start-up (32 and 8 are the RISC OS pair; 16/24 and
+the sub-byte modes ride along); a failed decoder is a log line and a clear
+screen, never a half-built pipeline. PrintScreen writes the decoded
+surface to `dx11-screenshot-N.png`.
+
+Verified on the pristine 5.30 ROM with the unplug CMOS: the 800×600
+desktop renders behind vsync (and in a resized 896×614 window — the scaler
+stretches any mode to the client area); the screenshot decodes to exactly
+the QMP screendump's pixels; closing the window exits the process in
+about a second. A 256-colour mode and a mid-session mode change wait for
+U2's keyboard to drive them.
+
 ## U2 — keyboard and mouse (3 days)
 
 Scan codes to qcodes through the win32 keymap already in the tree; repeats

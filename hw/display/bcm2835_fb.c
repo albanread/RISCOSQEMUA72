@@ -255,13 +255,36 @@ void bcm2835_fb_validate_config(BCM2835FBConfig *config)
 
 void bcm2835_fb_reconfigure(BCM2835FBState *s, BCM2835FBConfig *newconfig)
 {
+    /*
+     * The generation is a seqlock: odd while the config is being written,
+     * even again (incremented once more) once the new one is visible, so a
+     * reader on another thread either sees the old config with the old
+     * generation or retries -- never a torn config under a stable number.
+     */
     s->lock = true;
 
+    s->generation++;                     /* odd: write in flight */
     s->config = *newconfig;
+    s->generation++;                     /* even: committed */
 
     s->invalidate = true;
     qemu_console_resize(s->con, s->config.xres, s->config.yres);
     s->lock = false;
+}
+
+uint32_t bcm2835_fb_get_config(BCM2835FBState *s, BCM2835FBConfig *out)
+{
+    uint32_t gen;
+
+    do {
+        gen = s->generation;
+        if (gen & 1) {
+            continue;                    /* write in flight */
+        }
+        *out = s->config;
+    } while (gen != s->generation);
+
+    return gen;
 }
 
 static void bcm2835_fb_mbox_push(BCM2835FBState *s, uint32_t value)
@@ -352,10 +375,24 @@ static const MemoryRegionOps bcm2835_fb_ops = {
     .valid.max_access_size = 4,
 };
 
+static int bcm2835_fb_post_load(void *opaque, int version_id)
+{
+    /*
+     * The generation counter is not part of the snapshot: it exists only to
+     * tell the display backend that the config it cached is stale. Move it
+     * here so a loaded state forces a re-read.
+     */
+    BCM2835FBState *s = opaque;
+
+    s->generation += 2;
+    return 0;
+}
+
 static const VMStateDescription vmstate_bcm2835_fb = {
     .name = TYPE_BCM2835_FB,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = bcm2835_fb_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(lock, BCM2835FBState),
         VMSTATE_BOOL(invalidate, BCM2835FBState),
@@ -397,6 +434,7 @@ static void bcm2835_fb_reset(DeviceState *dev)
     s->pending = false;
 
     s->config = s->initial_config;
+    s->generation += 2;               /* keep it even, but moved */
 
     s->invalidate = true;
     s->lock = false;

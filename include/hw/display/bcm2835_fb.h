@@ -51,9 +51,29 @@ struct BCM2835FBState {
 
     BCM2835FBConfig config;
     BCM2835FBConfig initial_config;
+
+    /*
+     * Bumped after every committed config change, so a reader on another
+     * thread can tell a stale copy from a current one (see
+     * bcm2835_fb_get_config).
+     */
+    uint32_t generation;
 };
 
 void bcm2835_fb_reconfigure(BCM2835FBState *s, BCM2835FBConfig *newconfig);
+
+/**
+ * bcm2835_fb_get_config: snapshot the config, with its generation
+ * @s: the framebuffer device
+ * @out: where to copy the config
+ *
+ * Copies the current config for a reader that does not hold the BQL. The
+ * generation is read before and after the copy; if the config changed in
+ * between, the copy is repeated, so the caller never sees half a config.
+ * The value returned is the generation of the copy -- compare it against a
+ * previous one to detect a mode change.
+ */
+uint32_t bcm2835_fb_get_config(BCM2835FBState *s, BCM2835FBConfig *out);
 
 /**
  * bcm2835_fb_get_pitch: return number of bytes per line of the framebuffer

@@ -1223,10 +1223,11 @@ dx11 = not_found
 if host_os == 'windows'
   d3d11 = cc.find_library('d3d11', required: get_option('dx11'))
   dxgi = cc.find_library('dxgi', required: get_option('dx11'))
-  if d3d11.found() and dxgi.found()
-    dx11 = declare_dependency(dependencies: [d3d11, dxgi])
+  d3dc = cc.find_library('d3dcompiler_47', required: get_option('dx11'))
+  if d3d11.found() and dxgi.found() and d3dc.found()
+    dx11 = declare_dependency(dependencies: [d3d11, dxgi, d3dc])
   elif get_option('dx11').enabled()
-    error('dx11 requires d3d11 and dxgi')
+    error('dx11 requires d3d11, dxgi and d3dcompiler_47')
   endif
 endif
 
