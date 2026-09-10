@@ -259,6 +259,30 @@ static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)
                         "generator; vsync= ignored");
         }
     }
+
+    /* Scaler and CRT flavour.  The qapi enum order is the integer order
+     * the window expects: 0 linear, 1 sharp, 2 nearest. */
+    {
+        int scaling = 1;                    /* sharp */
+
+        if (opts->u.dx11.has_scaling) {
+            switch (opts->u.dx11.scaling) {
+            case DISPLAY_DX11_SCALING_LINEAR:
+                scaling = 0;
+                break;
+            case DISPLAY_DX11_SCALING_SHARP:
+                scaling = 1;
+                break;
+            case DISPLAY_DX11_SCALING_NEAREST:
+                scaling = 2;
+                break;
+            default:
+                break;
+            }
+        }
+        dx11_glue_video_opts(scaling, opts->u.dx11.has_scanlines
+                                     && opts->u.dx11.scanlines);
+    }
     /* The hand-off: system/main.c sees this set after qemu_init and runs
      * the QEMU main loop on its own thread, giving the UI the main one. */
     qemu_main = dx11_backend_main;

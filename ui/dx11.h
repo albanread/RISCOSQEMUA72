@@ -76,6 +76,11 @@ void dx11_glue_kbd_hook_window(void *hwnd);
  * machine has no generator. */
 bool dx11_glue_set_vsync_hz(int hz);
 
+/* Scaler and CRT options for the window: scaling is 0 linear, 1 sharp
+ * bilinear, 2 nearest; set once at display init, before any shader is
+ * compiled. */
+void dx11_glue_video_opts(int scaling, int scanlines);
+
 #ifdef __cplusplus
 }
 #endif

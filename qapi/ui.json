@@ -1537,6 +1537,25 @@
 }
 
 ##
+# @DisplayDx11Scaling:
+#
+# How the guest screen is magnified to the window's client area.
+#
+# @linear: plain bilinear filtering over the whole image.
+#
+# @sharp: sharp bilinear -- bilinear within a narrowed band at each
+#     source pixel edge, so a 1:1 image passes through untouched and a
+#     magnified one stays crisp (default).
+#
+# @nearest: nearest-neighbour, hard pixel edges.
+#
+# Since: 11.1
+##
+{ 'enum'    : 'DisplayDx11Scaling',
+  'data'    : ['linear', 'sharp', 'nearest'],
+  'if'      : 'CONFIG_DX11' }
+
+##
 # @DisplayDx11:
 #
 # Direct3D 11 display options.
@@ -1546,10 +1565,18 @@
 #     presented frame (0 disables them; default 30).  Raspberry Pi
 #     guests see it as the firmware's SMI interrupt.
 #
+# @scaling: how the guest screen is magnified to the window
+#     (default sharp).
+#
+# @scanlines: darken every other output row, CRT flavour, when the
+#     image is magnified at least twice (default off).
+#
 # Since: 11.1
 ##
 { 'struct'  : 'DisplayDx11',
-  'data'    : { '*vsync' : 'int' },
+  'data'    : { '*vsync' : 'int',
+                '*scaling' : 'DisplayDx11Scaling',
+                '*scanlines' : 'bool' },
   'if'      : 'CONFIG_DX11' }
 
 ##

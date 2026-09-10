@@ -163,6 +163,34 @@ GPU.
 *Done when:* every row of the shader table in `UI-DESIGN.md` has been seen
 working — RISC OS's own formats on real data, the rest on synthetic buffers.
 
+**Done, except the status line.**
+
+- Every decoder row is proven.  8/16/32 on the live desktop (16 bpp was
+  pixel-exact against QMP's own screendump: 0 of 480000 differ; 8 bpp
+  user-confirmed in the Display Manager; 32 bpp the boot default).  For
+  24 and the packed 4/2/1 there is no guest route — BCMVideo programs
+  nothing but 8/16/32 — so `synthfb BPP [XRES [YRES]]` (HMP) forces the
+  framebuffer into any depth and size with a pattern whose bytes are a
+  function of their offset; `tools/synthfb-test.py` freezes the guest,
+  screenshots the window's decoded surface and compares it against the
+  pattern's expected image.  All seven depths pass pixel-exact (0 of
+  307200 differ each).  The sub-byte depths first needed `get_pitch` to
+  round up to whole bytes — it gave them a zero pitch and a zero-sized
+  framebuffer.
+- `-display dx11,scaling=sharp|linear|nearest` (default sharp) and
+  `,scanlines=on|off`.  Sharp bilinear narrows the bilinear band to a
+  1/ratio strip at each source-pixel edge: 1:1 passes through untouched,
+  magnification stays crisp.  Scanlines darken alternate output rows at
+  2x+ magnification only.
+- Alt+Enter is a borderless-fullscreen toggle (Raymond Chen's
+  WINDOWPLACEMENT dance); the process is per-monitor-DPI-aware so the
+  host never bitmap-scales the window on scaled displays; WARP remains
+  the software fallback when there is no GPU.
+- The firmware now clears a freshly-allocated framebuffer, as the real
+  one does: RISC OS boots through a 640×480×16 mode before the desktop,
+  and without the clear the window showed that buffer's garbage RAM
+  until the OS painted (seen live).  A pure pan keeps its buffer.
+
 ## U4 — measure, then dirty rows if needed (2 days)
 
 Profile the UI thread against the guest's instruction rate; add dirty-row

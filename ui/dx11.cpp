@@ -58,6 +58,23 @@ static struct {
     unsigned mouse_buttons;
 } dx11;
 
+/* -display dx11 options, set once at init: how the guest screen is
+ * magnified to the client area (sharp-bilinear by default) and whether
+ * an optional CRT scanline mask rides on top at 2x+ magnification. */
+enum Dx11Scaling { DX11_SCALING_LINEAR = 0, DX11_SCALING_SHARP, DX11_SCALING_NEAREST };
+static struct {
+    int scaling;                    /* Dx11Scaling */
+    bool scanlines;
+} video_opts = { DX11_SCALING_SHARP, false };
+
+extern "C" void dx11_glue_video_opts(int scaling, int scanlines)
+{
+    if (scaling >= DX11_SCALING_LINEAR && scaling <= DX11_SCALING_NEAREST) {
+        video_opts.scaling = scaling;
+    }
+    video_opts.scanlines = scanlines != 0;
+}
+
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
     uint32_t generation;
@@ -237,6 +254,38 @@ static void dx11_mouse_move(HWND h, int x, int y)
 }
 
 /* ------------------------------------------------------------------ */
+/* Fullscreen: Alt+Enter swaps the frame for a borderless window on the
+ * monitor the window is on; the same chord swaps it back.               */
+
+static void dx11_toggle_fullscreen(void)
+{
+    static WINDOWPLACEMENT wp = { sizeof(wp) };
+    DWORD style = GetWindowLongW(dx11.hwnd, GWL_STYLE);
+
+    if (style & WS_OVERLAPPEDWINDOW) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetWindowPlacement(dx11.hwnd, &wp)
+            && GetMonitorInfoW(MonitorFromWindow(dx11.hwnd,
+                                                 MONITOR_DEFAULTTONEAREST), &mi)) {
+            SetWindowLongW(dx11.hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+            SetWindowPos(dx11.hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            dx11_log("fullscreen on");
+        }
+    } else {
+        SetWindowLongW(dx11.hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(dx11.hwnd, &wp);
+        SetWindowPos(dx11.hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        dx11_log("fullscreen off");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Window                                                              */
 
 static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
@@ -267,6 +316,12 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         return DefWindowProcW(h, msg, w, l);
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        /* Alt+Enter is the fullscreen toggle, and never reaches the guest */
+        if (msg == WM_SYSKEYDOWN && w == VK_RETURN
+            && (GetKeyState(VK_MENU) & 0x8000)) {
+            dx11_toggle_fullscreen();
+            return 0;
+        }
         /* Ctrl+Alt+G is the release, and never reaches the guest */
         if (w == 'G' && (GetKeyState(VK_CONTROL) & 0x8000)
                      && (GetKeyState(VK_MENU) & 0x8000)) {
@@ -490,6 +545,7 @@ static const char SHADER_SRC[] = R"xxx(
 struct Params {
     uint4 dim;     /* xres, yres, pitch(bytes), bpp */
     uint4 misc;    /* xoffset(px), yoffset(rows), pixo, unused */
+    uint4 post;    /* client w, client h, scaling, scanlines */
 };
 
 struct VSOut {
@@ -559,9 +615,35 @@ float4 ps_main(VSOut v) : SV_Target
 Texture2D<float4> src : register(t0);
 SamplerState lin : register(s0);
 
+cbuffer params : register(b0) { Params P; }
+
 float4 ps_main(VSOut v) : SV_Target
 {
-    float4 c = src.Sample(lin, v.uv);
+    float2 outPx = float2(P.post.xy);         /* client size */
+    float2 srcPx = float2(P.dim.xy);          /* decoded size */
+    float2 st = v.pos.xy / outPx * srcPx;     /* source-pixel coords */
+#if SCALING == 1
+    /* Sharp bilinear: within each source texel the bilinear transition
+     * is narrowed to a 1/ratio-wide band at the texel edge, so at 1:1
+     * the image passes through untouched and at 2x+ it is crisp with
+     * just enough filtering to avoid hard staircases. */
+    float2 ratio = max(outPx / srcPx, 1.0);
+    float2 halfw = 0.5 - 0.5 / ratio;         /* half the band width */
+    float2 i = floor(st);
+    float2 f = st - i - 0.5;                  /* -0.5..0.5 in-texel */
+    st = i + 0.5 + clamp(f, -halfw, halfw);
+#elif SCALING == 2
+    st = floor(st) + 0.5;                     /* nearest */
+#endif
+    float4 c = src.Sample(lin, st / srcPx);
+#if SCANLINES
+    /* CRT flavour, only when magnified enough for a line to be two */
+    if (P.post.w && outPx.y >= srcPx.y * 1.99) {
+        if ((uint(v.pos.y) & 1)) {
+            c.rgb *= 0.8;
+        }
+    }
+#endif
     return float4(c.rgb, 1);
 }
 
@@ -660,10 +742,17 @@ static bool fb_compile_shaders(void)
 {
     char bppval[16];
     const char *defines[] = { "DECODE", "1", "BPP", bppval };
+    const char *sdef[] = { "SCALING", nullptr, "SCANLINES", nullptr };
+    char scal[8], scan[8];
     size_t ok = 0;
 
+    snprintf(scal, sizeof(scal), "%d", video_opts.scaling);
+    snprintf(scan, sizeof(scan), "%d", video_opts.scanlines ? 1 : 0);
+    sdef[1] = scal;
+    sdef[3] = scan;
+
     fb.vs = compile_vs();
-    fb.scale_ps = compile_ps("ps_4_0", nullptr, 0);
+    fb.scale_ps = compile_ps("ps_4_0", sdef, 2);
     if (!fb.vs || !fb.scale_ps) {
         return false;                   /* nothing works without these */
     }
@@ -790,10 +879,13 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     fb.ps = fb_ps_all[i];
     fb.ps->AddRef();             /* released by fb_release_pipeline */
 
-    /* constant buffer: rebuilt per config, updated on every build */
-    struct { uint32_t dim[4]; uint32_t misc[4]; } cb = {
+    /* constant buffer: dim/misc per config; the post-transform half
+     * (client size and the scaling options) is refreshed every frame in
+     * dx11_render_frame, because the client size moves with resizes */
+    struct { uint32_t dim[4]; uint32_t misc[4]; uint32_t post[4]; } cb = {
         { v->xres, v->yres, v->pitch, v->bpp },
         { v->xoffset, v->yoffset, v->pixo, 0 },
+        { 0, 0, (uint32_t)video_opts.scaling, video_opts.scanlines ? 1u : 0u },
     };
     if (fb.cbuf) {
         dx11.context->UpdateSubresource(fb.cbuf, 0, nullptr, &cb, 0, 0);
@@ -932,6 +1024,18 @@ static bool dx11_render_frame(void)
     dx11.context->PSSetSamplers(0, 1, &fb.linear);
     RECT client;
     GetClientRect(dx11.hwnd, &client);
+    if (fb.cbuf) {
+        /* the post-transform half of the constants: the client size the
+         * scaler maps onto, refreshed here because resizes move it */
+        struct { uint32_t dim[4]; uint32_t misc[4]; uint32_t post[4]; } cb = {
+            { v.xres, v.yres, v.pitch, v.bpp },
+            { v.xoffset, v.yoffset, v.pixo, 0 },
+            { (uint32_t)(client.right - client.left),
+              (uint32_t)(client.bottom - client.top),
+              (uint32_t)video_opts.scaling, video_opts.scanlines ? 1u : 0u },
+        };
+        dx11.context->UpdateSubresource(fb.cbuf, 0, nullptr, &cb, 0, 0);
+    }
     D3D11_VIEWPORT vp2 = { 0, 0,
                            (float)(client.right - client.left),
                            (float)(client.bottom - client.top), 0, 1 };
@@ -1043,6 +1147,29 @@ void dx11_screenshot(void)
 
 extern "C" int dx11_backend_init(void)
 {
+    /* Per-monitor DPI awareness, so the window is not bitmapscaled on
+     * displays with scaling: the emulator scales the guest itself. */
+    {
+        typedef BOOL (WINAPI *SetCtx)(HANDLE);
+        HMODULE u = GetModuleHandleW(L"user32.dll");
+        SetCtx set_ctx = u ? (SetCtx)GetProcAddress(
+            u, "SetProcessDpiAwarenessContext") : nullptr;
+        if (set_ctx) {
+            set_ctx((HANDLE)-4);      /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+        } else {
+            HMODULE sc = LoadLibraryW(L"shcore.dll");
+            if (sc) {
+                typedef HRESULT (WINAPI *SetDpi)(int);
+                SetDpi set_dpi = (SetDpi)GetProcAddress(
+                    sc, "SetProcessDpiAwareness");
+                if (set_dpi) {
+                    set_dpi(2);       /* PROCESS_PER_MONITOR_DPI_AWARE */
+                }
+                FreeLibrary(sc);
+            }
+        }
+    }
+
     if (!dx11_create_window()) {
         return -1;
     }

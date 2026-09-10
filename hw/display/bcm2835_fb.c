@@ -261,11 +261,31 @@ void bcm2835_fb_reconfigure(BCM2835FBState *s, BCM2835FBConfig *newconfig)
      * reader on another thread either sees the old config with the old
      * generation or retries -- never a torn config under a stable number.
      */
+    bool fresh = newconfig->base != s->config.base
+        || newconfig->xres_virtual != s->config.xres_virtual
+        || newconfig->yres_virtual != s->config.yres_virtual
+        || newconfig->bpp != s->config.bpp;
+
     s->lock = true;
 
     s->generation++;                     /* odd: write in flight */
     s->config = *newconfig;
     s->generation++;                     /* even: committed */
+
+    if (fresh) {
+        /*
+         * A real firmware hands out a cleared framebuffer.  Without this
+         * the window decodes whatever was in guest RAM between the OS
+         * programming a mode and painting it -- boot starts with a screen
+         * of garbage.  A pure pan reuses the allocation and must keep it.
+         */
+        uint32_t len = bcm2835_fb_get_size(&s->config);
+        void *zeros = g_malloc0(len);
+
+        address_space_rw(&s->dma_as, s->config.base, MEMTXATTRS_UNSPECIFIED,
+                         zeros, len, true);
+        g_free(zeros);
+    }
 
     s->invalidate = true;
     qemu_console_resize(s->con, s->config.xres, s->config.yres);
