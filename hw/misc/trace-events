@@ -351,6 +351,8 @@ bcm2835_vchiq_auds_msg(uint32_t type, uint32_t size) "vchiq AUDS message type %u
 bcm2835_vchiq_auds_config(uint32_t channels, uint32_t rate, uint32_t bps) "vchiq AUDS config %u channels, %u Hz, %u bits"
 bcm2835_vchiq_auds_complete(uint32_t bytes) "vchiq AUDS complete %u bytes"
 bcm2835_vchiq_recycle(uint32_t slot, uint32_t count) "vchiq recycled slot %u to the guest (%u returned)"
+bcm2835_vchiq_auds_pcm(uint32_t bytes, uint32_t peak) "vchiq AUDS %u bytes of samples, peak %u"
+bcm2835_vchiq_bulk(uint32_t pagelist, uint64_t addr, uint32_t bytes, uint32_t runs) "vchiq bulk pagelist 0x%08x -> 0x%" PRIx64 ", %u bytes in %u runs"
 
 # bcm2835_property.c
 bcm2835_mbox_property(uint32_t tag, uint32_t bufsize, size_t resplen) "mbox property tag:0x%08x in_sz:%u out_sz:%zu"

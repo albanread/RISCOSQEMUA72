@@ -109,6 +109,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835VchiqState, BCM2835_VCHIQ)
  */
 #define VCHIQ_AUDS_TICK_NS          (5 * 1000 * 1000)
 
+/*
+ * The bulk transfers do not carry the samples: they carry the bus address
+ * of a pagelist describing where the samples are. Linux's
+ * vchiq_pagelist.h is the layout, and RISC OS ships a copy of it.
+ *   +0 length (bytes)  +4 type  +6 offset into the first page
+ *   +8 addrs[], each a page-aligned address | (consecutive pages - 1)
+ */
+#define VCHIQ_PAGELIST_LENGTH       0x00
+#define VCHIQ_PAGELIST_TYPE         0x04
+#define VCHIQ_PAGELIST_OFFSET       0x06
+#define VCHIQ_PAGELIST_ADDRS        0x08
+#define VCHIQ_PAGELIST_WRITE        0       /* what a guest transmit uses */
+#define VCHIQ_PAGE_SIZE             4096
+/*
+ * How an addrs[] entry packs an address and a run length depends on
+ * whether the guest is using 36-bit physical addresses, and on a BCM2711
+ * it is. RISC OS's vchiq_riscos.c says it plainly:
+ *
+ *   With 32bit physical addresses, the top 20 bits are the upper 20 bits
+ *   of the address, and the low 12 are the consecutive page count.
+ *   With 36bit physical addresses, the top 24 bits are the upper 24 bits
+ *   of the address, and the low 8 bits are the consecutive page count.
+ *
+ * so the entry is calc_bulk_addr(phys) | (pages - 1) with the address
+ * already shifted down by four. Reading it the 32-bit way rounds two
+ * buffers a page apart to the same address, which is silence that looks
+ * like working code.
+ */
+#define VCHIQ_PL36_COUNT_MASK       0xff
+#define VCHIQ_PL36_ADDR_SHIFT       4
+/* A guest's buffer is a couple of KB; this is only a sanity bound */
+#define VCHIQ_BULK_MAX              (1 << 20)
+
 /* Doorbell registers, relative to the region base (mailbox base + 0x40) */
 #define VCHIQ_BELL0                 0x00  /* VC -> ARM, read to clear */
 #define VCHIQ_BELL2                 0x08  /* ARM -> VC */
@@ -157,6 +190,16 @@ struct BCM2835VchiqState {
     HRTimer *auds_timer;
     uint64_t auds_outstanding;  /* bytes taken but not yet reported played */
     int64_t auds_played_ns;     /* when the audio queued so far runs out */
+
+    /* The samples, gathered out of the pagelist each bulk describes */
+    uint8_t *bulk_buf;
+    uint32_t bulk_buf_size;
+
+    /* -global bcm2835-vchiq.wav=<file>: what the guest is playing, so it
+     * can be looked at before there is anything to listen to */
+    char *wav_path;
+    FILE *wav;
+    uint32_t wav_bytes;
 };
 
 #endif

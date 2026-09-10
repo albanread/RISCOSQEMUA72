@@ -27,6 +27,8 @@
 #include "hw/core/irq.h"
 #include "hw/misc/bcm2835_mbox_defs.h"
 #include "hw/misc/bcm2835_vchiq.h"
+#include "hw/core/qdev-properties.h"
+#include "system/dma.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -36,6 +38,11 @@
 static uint32_t vchiq_ld(BCM2835VchiqState *s, uint32_t addr)
 {
     return ldl_le_phys(&s->dma_as, addr);
+}
+
+static uint16_t vchiq_ld16(BCM2835VchiqState *s, uint32_t addr)
+{
+    return lduw_le_phys(&s->dma_as, addr);
 }
 
 static void vchiq_st(BCM2835VchiqState *s, uint32_t addr, uint32_t val)
@@ -176,6 +183,165 @@ static bool vchiq_queue_msg(BCM2835VchiqState *s, uint32_t msgid, uint32_t size)
  * complete without reading a byte, which is enough to prove the guest's
  * whole sound path comes up and keeps turning.
  */
+
+/*
+ * Gather the bytes a bulk transfer describes.
+ *
+ * The wire carries the bus address of a pagelist, not of the buffer: the
+ * guest's pages are scattered, and the list names their runs. Each entry
+ * is a page-aligned address with the count of further consecutive pages
+ * packed into the low twelve bits -- the same trick, and the same
+ * arithmetic, as create_pagelist on the other side. Everything here
+ * indexes guest memory with numbers the guest chose, so each one is
+ * bounded before it is used.
+ *
+ * Returns the number of bytes gathered into s->bulk_buf, 0 on nonsense.
+ */
+static uint32_t vchiq_bulk_gather(BCM2835VchiqState *s, uint32_t pagelist)
+{
+    uint32_t length, offset, type, got = 0, entry_index = 0;
+    uint64_t first = 0;
+
+    if (!pagelist) {
+        return 0;
+    }
+    length = vchiq_ld(s, pagelist + VCHIQ_PAGELIST_LENGTH);
+    type = vchiq_ld16(s, pagelist + VCHIQ_PAGELIST_TYPE);
+    offset = vchiq_ld16(s, pagelist + VCHIQ_PAGELIST_OFFSET);
+
+    if (!length || length > VCHIQ_BULK_MAX || offset >= VCHIQ_PAGE_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: pagelist at 0x%08x claims "
+                      "%u bytes at offset %u\n", __func__, pagelist,
+                      length, offset);
+        return 0;
+    }
+    if (type != VCHIQ_PAGELIST_WRITE) {
+        /* A transmit from the guest is always a WRITE list; anything else
+         * is a direction we do not implement rather than a broken list. */
+        qemu_log_mask(LOG_UNIMP, "%s: pagelist type %u\n", __func__, type);
+        return 0;
+    }
+
+    if (s->bulk_buf_size < length) {
+        s->bulk_buf = g_realloc(s->bulk_buf, length);
+        s->bulk_buf_size = length;
+    }
+
+    while (got < length) {
+        uint32_t entry, pages;
+        uint64_t base, avail, n;
+
+        /* One entry per run, and a run is at least one page: more entries
+         * than pages means the list is not one. */
+        if (entry_index > length / VCHIQ_PAGE_SIZE + 1) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: pagelist at 0x%08x does not "
+                          "cover its %u bytes\n", __func__, pagelist, length);
+            return 0;
+        }
+        entry = vchiq_ld(s, pagelist + VCHIQ_PAGELIST_ADDRS + entry_index * 4);
+        base = (uint64_t)(entry & ~VCHIQ_PL36_COUNT_MASK)
+               << VCHIQ_PL36_ADDR_SHIFT;
+        pages = (entry & VCHIQ_PL36_COUNT_MASK) + 1;
+
+        avail = (uint64_t)pages * VCHIQ_PAGE_SIZE - offset;
+        n = MIN(avail, length - got);
+        if (dma_memory_read(&s->dma_as, base + offset, s->bulk_buf + got, n,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: unreadable page at 0x%"
+                          PRIx64 "\n", __func__, base + offset);
+            return 0;
+        }
+        if (!entry_index) {
+            first = base + offset;
+        }
+        got += n;
+        offset = 0;             /* only the first run starts part-way in */
+        entry_index++;
+    }
+    trace_bcm2835_vchiq_bulk(pagelist, first, got, entry_index);
+    return got;
+}
+
+/*
+ * The capture file. There is nothing to listen to until sprint 3, so the
+ * way to know whether the samples are real is to look at them: this is a
+ * plain WAV, playable while it is still being written because the sizes
+ * in the header are kept up to date as it grows.
+ */
+static void vchiq_wav_write(BCM2835VchiqState *s, const uint8_t *buf,
+                            uint32_t len)
+{
+    uint8_t hdr[44] = { 0 };
+    uint32_t rate = s->auds_rate;
+    uint32_t channels = s->auds_channels;
+    uint32_t bits = s->auds_bps;
+    uint32_t byte_rate, block_align;
+
+    if (!s->wav_path || !len || !rate || !channels || !bits) {
+        return;
+    }
+    if (!s->wav) {
+        s->wav = fopen(s->wav_path, "wb");
+        if (!s->wav) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: cannot write %s\n",
+                          __func__, s->wav_path);
+            g_free(s->wav_path);
+            s->wav_path = NULL;
+            return;
+        }
+        s->wav_bytes = 0;
+        fseek(s->wav, sizeof(hdr), SEEK_SET);
+    }
+    if (fwrite(buf, 1, len, s->wav) != len) {
+        return;
+    }
+    s->wav_bytes += len;
+
+    byte_rate = rate * channels * (bits / 8);
+    block_align = channels * (bits / 8);
+    memcpy(hdr, "RIFF", 4);
+    stl_le_p(hdr + 4, 36 + s->wav_bytes);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    stl_le_p(hdr + 16, 16);             /* PCM chunk size */
+    stw_le_p(hdr + 20, 1);              /* PCM */
+    stw_le_p(hdr + 22, channels);
+    stl_le_p(hdr + 24, rate);
+    stl_le_p(hdr + 28, byte_rate);
+    stw_le_p(hdr + 32, block_align);
+    stw_le_p(hdr + 34, bits);
+    memcpy(hdr + 36, "data", 4);
+    stl_le_p(hdr + 40, s->wav_bytes);
+
+    /* Rewrite the header every time, so the file is always playable */
+    fseek(s->wav, 0, SEEK_SET);
+    fwrite(hdr, 1, sizeof(hdr), s->wav);
+    fseek(s->wav, 0, SEEK_END);
+    fflush(s->wav);
+}
+
+/* The loudest sample in a buffer, which is how silence is told from a
+ * tune without anything to listen with. 16-bit signed is all RISC OS
+ * ever asks for; anything else reports nothing rather than guessing. */
+static uint32_t vchiq_pcm_peak(const BCM2835VchiqState *s,
+                               const uint8_t *buf, uint32_t len)
+{
+    uint32_t peak = 0, i;
+
+    if (s->auds_bps != 16) {
+        return 0;
+    }
+    for (i = 0; i + 1 < len; i += 2) {
+        int32_t v = (int16_t)lduw_le_p(buf + i);
+
+        if (v < 0) {
+            v = -v;
+        }
+        if ((uint32_t)v > peak) {
+            peak = v;
+        }
+    }
+    return peak;
+}
 
 static void auds_reply(BCM2835VchiqState *s, const uint32_t *msg)
 {
@@ -564,19 +730,27 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
         case VCHIQ_MSG_BULK_TX:
         {
             /*
-             * The samples themselves. The payload is { data, size } where
-             * data is the bus address of a pagelist, not of the buffer --
-             * this sprint acknowledges the transfer without reading it,
-             * so the pagelist can wait for the one that plays the sound.
-             * The transfer must still be completed or the guest's bulk
-             * queue fills and BCMSound blocks in BulkQueueTransmit.
+             * The samples. The payload is { data, size } where data is
+             * the bus address of a pagelist describing where they are,
+             * not of the buffer itself. The transfer must be completed
+             * whatever we do with them, or the guest's bulk queue fills
+             * and BCMSound blocks in BulkQueueTransmit.
              */
+            uint32_t bulk_page = size >= 8
+                               ? vchiq_ld(s, hdr + VCHIQ_MSG_HDR_SIZE) : 0;
             uint32_t bulk_size = size >= 8
                                ? vchiq_ld(s, hdr + VCHIQ_MSG_HDR_SIZE + 4) : 0;
 
             trace_bcm2835_vchiq_rx(msgid, type, size);
             if (s->auds_open &&
                 VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_AUDS_VC_PORT) {
+                uint32_t got = vchiq_bulk_gather(s, bulk_page);
+
+                if (got) {
+                    trace_bcm2835_vchiq_auds_pcm(got,
+                        vchiq_pcm_peak(s, s->bulk_buf, got));
+                    vchiq_wav_write(s, s->bulk_buf, got);
+                }
                 replies += vchiq_queue_msg_data(s,
                     VCHIQ_MAKE_MSG(VCHIQ_MSG_BULK_TX_DONE,
                                    VCHIQ_AUDS_VC_PORT, s->auds_port),
@@ -783,6 +957,11 @@ static void bcm2835_vchiq_reset(DeviceState *dev)
     s->tx_pos = 0;
     s->rx_pos = 0;
     s->connected = false;
+    if (s->wav) {
+        fclose(s->wav);
+        s->wav = NULL;
+        s->wav_bytes = 0;
+    }
     auds_close(s);
     s->auds_port = 0;
     s->auds_rate = 0;
@@ -808,10 +987,17 @@ static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
     bcm2835_vchiq_reset(dev);
 }
 
+static const Property bcm2835_vchiq_props[] = {
+    /* Where to write what the guest plays, for looking at before there
+     * is anything to listen to. Empty means do not capture. */
+    DEFINE_PROP_STRING("wav", BCM2835VchiqState, wav_path),
+};
+
 static void bcm2835_vchiq_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, bcm2835_vchiq_props);
     dc->realize = bcm2835_vchiq_realize;
     device_class_set_legacy_reset(dc, bcm2835_vchiq_reset);
     dc->vmsd = &vmstate_bcm2835_vchiq;

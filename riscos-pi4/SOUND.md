@@ -232,11 +232,9 @@ every sound.
   open (keep refusing `GCMD`, `DISP`, `TVSV`), decode the nine audio
   message types, answer `RESULT{0}` to `CLOSE`, `CONFIG` and `CONTROL`.
   Discard the audio.
-- **S2 — bulk receive.** `BULK_TX` → walk the pagelist → copy → reply
-  `BULK_TX_DONE`. Reply `COMPLETE` immediately for the full count.
-  *Proves the data arrives and the guest keeps feeding.* Dump the PCM to a
-  `.wav` and look at it; the fork already prefers a file it can inspect to
-  a thing it must witness (`METAL_SHOT_EVERY`, `-display none` screendumps).
+- **S2 — bulk receive. Done; see section 11.** `BULK_TX` → walk the
+  pagelist → copy → reply `BULK_TX_DONE`, and write the samples to a
+  `.wav` so they can be looked at.
 - **S3 — real output.** Open the voice from `CONFIG`, write from the ring
   in `audio_cb`, and move `COMPLETE` onto what the backend actually took.
   *This is where it makes a noise.*
@@ -374,3 +372,81 @@ thrown away. It is recorded here so the number is not a surprise later.
 
 Nothing is audible yet, by design: the samples are acknowledged where
 they lie in guest memory and never read.
+
+## 11. Sprint 2, as built
+
+`-global bcm2835-vchiq.wav=<file>` writes what the guest is playing to a
+WAV, in the format `CONFIG` asked for, with the header kept up to date as
+it grows so the file is playable while it is still being written. The
+first capture off a running desktop:
+
+```
+5791744 bytes = 32.8 s, 44100 Hz stereo 16-bit
+    0s    2970 ##############
+    1s    1452 #######
+    2s       0
+    ...
+   31s     369 #
+```
+
+RISC OS's start-up sound, then silence, then something played by hand.
+Nothing goes to a speaker yet; this is the samples on their way past.
+
+### The pagelist entry is not what the header says it is
+
+Section 5 quoted Linux's packing — `addrs[k] = addr | ((len >> PAGE_SHIFT) - 1)`,
+a page-aligned address in the top twenty bits and a page count in the low
+twelve — and building to that produced a WAV full of digital silence
+while the guest was demonstrably playing something.
+
+The trace said why. Two pagelists alternating, as a double buffer should,
+and both resolving to **the same address**:
+
+```
+vchiq bulk pagelist 0xc2c02bdc -> 0x00201000, 2048 bytes in 1 runs
+vchiq bulk pagelist 0xc2c03be8 -> 0x00201000, 2048 bytes in 1 runs
+```
+
+Dumping the structure rather than the interpretation gave
+`len 2048, type 0, offset 0, addrs[0] 0x00201a00`, the other buffer
+`0x00201b00` — 256 bytes apart, which cannot be two 2 KB buffers, and not
+page-aligned, which the encoding requires. `& ~0xfff` was rounding both
+down to `0x201000` and reading a page that happened to be zeroes.
+
+RISC OS's own `vchiq_riscos.c` explains it, and the explanation is that
+the encoding changes with the width of a physical address:
+
+```c
+static uint32_t calc_bulk_addr(uint64_t phys)
+{
+    if (GET_DEV_FLAGS(vchiq_dev) & DEV_FLAG_USE36BIT)
+        return phys >> 4;
+    else
+        return phys + vchiq_dev->arm_to_vc_offset;
+}
+```
+
+> With 32bit physical addresses, the top 20 bits are the upper 20 bits of
+> the address, and the low 12 are the consecutive page count.
+> With 36bit physical addresses, the top 24 bits are the upper 24 bits of
+> the address, and the low 8 bits are the consecutive page count.
+
+A BCM2711 is a 36-bit part, so the entry is `(phys >> 4) | (pages - 1)`
+with **eight** bits of count, and the address is `(entry & ~0xff) << 4`.
+Read that way the two buffers come out at `0x201a000` and `0x201b000` —
+one page apart, alternating 252 to 251 over a boot, which is exactly the
+double buffer `BufferCallback` toggles between.
+
+The lesson is the same one section 5 was already half-telling: Linux's
+`vc04_services` is the specification for the *protocol*, and RISC OS's
+port of it is the specification for what RISC OS actually puts on the
+wire. Where the two differ, only one of them is the guest. It cost a
+build, and the symptom was silence — which is indistinguishable from
+"the guest is not playing anything" unless something makes it play.
+
+### What is measured now
+
+- 2048-byte transfers, one run each, `type 0` (WRITE) and `offset 0`
+- alternating `0x201a000` / `0x201b000`, no unreadable pages over a boot
+- peak amplitude traced per buffer (`bcm2835_vchiq_auds_pcm`), which is
+  how silence is told from a tune without anything to listen with
