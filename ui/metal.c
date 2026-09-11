@@ -1309,7 +1309,7 @@ void metal_glue_mouse_btn(int button, bool down)
     }
     cnt.mouse_buttons++;
     bql_lock();
-    qemu_input_queue_btn(NULL, map[button], true);
+    qemu_input_queue_btn(NULL, map[button], down);
     qemu_input_event_sync();
     bql_unlock();
 }
