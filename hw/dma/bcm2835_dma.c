@@ -61,7 +61,8 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
     uint32_t data, xlen, xlen_td, ylen;
     int16_t dst_stride, src_stride;
     uint8_t *row = NULL;
-    bool bulk;
+    uint32_t pat_len;
+    bool bulk, fill;
 
     if (!(s->enable & (1 << c))) {
         return;
@@ -101,7 +102,23 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
         bulk = (ch->ti & (BCM2708_DMA_S_INC | BCM2708_DMA_D_INC))
                == (BCM2708_DMA_S_INC | BCM2708_DMA_D_INC)
                && !(ch->ti & (BCM2708_DMA_S_IGNORE | BCM2708_DMA_D_IGNORE));
-        if (bulk) {
+
+        /*
+         * A source that does not advance is a pattern fill: every beat
+         * re-reads the same S_WIDTH bytes.  RISC OS's video driver uses this
+         * for GraphicsV_Render FillRectangle, where the pattern is the
+         * rectangle's colour word.  Done a beat at a time it costs one
+         * address-space dispatch per four bytes, which for a full-screen
+         * fill is millions of them; replicate the pattern and write each
+         * row whole instead.  The pattern is re-read per row so a non-zero
+         * source stride still behaves as it does beat by beat.
+         */
+        fill = !bulk
+               && (ch->ti & BCM2708_DMA_D_INC)
+               && !(ch->ti & (BCM2708_DMA_S_INC | BCM2708_DMA_D_IGNORE));
+        pat_len = (ch->ti & BCM2708_DMA_S_WIDTH) ? 16 : 4;
+
+        if (bulk || fill) {
             row = g_realloc(row, xlen_td);
         }
         if (ch->ti & BCM2708_DMA_TDMODE) {
@@ -110,6 +127,23 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
         }
 
         while (ylen != 0) {
+            if (fill && xlen) {
+                /* build one row from the pattern, then write it whole */
+                uint8_t pat[16];
+
+                memset(pat, 0, sizeof(pat));
+                if (!(ch->ti & BCM2708_DMA_S_IGNORE)) {
+                    dma_memory_read(&s->dma_as, ch->source_ad, pat, pat_len,
+                                    MEMTXATTRS_UNSPECIFIED);
+                }
+                for (uint32_t off = 0; off < xlen; off += pat_len) {
+                    memcpy(row + off, pat, MIN(pat_len, xlen - off));
+                }
+                dma_memory_write(&s->dma_as, ch->dest_ad, row, xlen,
+                                 MEMTXATTRS_UNSPECIFIED);
+                ch->dest_ad += xlen;
+                xlen = 0;
+            }
             if (bulk && xlen) {
                 /* both ends advance: move the row whole */
                 dma_memory_read(&s->dma_as, ch->source_ad, row, xlen,

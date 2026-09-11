@@ -14,6 +14,7 @@
 #include "hw/gpio/bcm2838_gpio.h"
 #include "hw/intc/bcm2838_ic.h"
 #include "hw/misc/vmchannel.h"
+#include "hw/misc/riscos_blitter.h"
 
 /* SPI */
 /*
@@ -86,6 +87,12 @@
 #define VMCHANNEL_OFFSET        0x1400000
 #define VMCHANNEL_SIZE          0x4000
 
+/* Next to the HostFS doorbell in the low window.  The FE00 section is
+ * mapped by RISC OS only page by page as the HAL asks for it, so a page
+ * in a hole there is not reachable -- the doorbell is at 0xFD400000 for
+ * that reason and the blitter follows it to 0xFD404000. */
+#define BLITTER_OFFSET          0x1404000
+
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
 
@@ -111,6 +118,9 @@ struct BCM2838PeripheralState {
     VMChannelState vmchannel;
     MemoryRegion vmchannel_mr_alias;
     char *vmchannel_root;          /* forwarded to the doorbell's root= */
+
+    /* The rectangle blitter, one page past the doorbell at 0xFD404000. */
+    RISCOSBlitterState blitter;
 
     SDHCIState emmc2;
     BCM2838GpioState gpio;

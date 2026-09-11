@@ -73,6 +73,7 @@ static void bcm2838_peripherals_init(Object *obj)
      * plain qdev string property, set by the machine from -M or by
      * -global). */
     object_initialize_child(obj, "vmchannel", &s->vmchannel, TYPE_VMCHANNEL);
+    object_initialize_child(obj, "blitter", &s->blitter, TYPE_RISCOS_BLITTER);
 }
 
 static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
@@ -251,6 +252,16 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                                            * hardware at 0x7E007200 */
     memory_region_add_subregion(&s_base->peri_mr, 0x5000,
                                 &s->vmchannel_mr_alias);
+
+    /* The blitter sits in the low window beside the doorbell, which is
+     * the mapping RISC OS actually builds; a page in the FE00 section
+     * aborts unless the HAL asked for that exact page. */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->blitter), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_low_mr, BLITTER_OFFSET,
+                                sysbus_mmio_get_region(
+                                     SYS_BUS_DEVICE(&s->blitter), 0));
 
     /* Map MPHI to BCM2838 memory map */
     mphi_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s_base->mphi), 0);
