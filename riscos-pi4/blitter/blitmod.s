@@ -70,6 +70,14 @@
     .equ    XOS_SpriteOp,          0x2002E
     .equ    XOS_ReadMonotonicTime, 0x20042
     .equ    XOS_WriteC,            0x20000
+    .equ    XOS_Module,            0x2001E
+    .equ    ModClaim,              6
+
+    .equ    BENCH_W,      512             @ pixels, one word each
+    .equ    BENCH_H,      512
+    .equ    BENCH_IMG,    BENCH_W * BENCH_H * 4
+    .equ    BENCH_AREA,   16 + 44 + BENCH_IMG
+    .equ    BENCH_PLOTS,  1000
 
 _start:
 base:
@@ -663,27 +671,73 @@ sv_hexbuf:
 @ host doing it and then with SpriteExtend doing it.  A real sprite at
 @ a real size, and the guest's own clock, because every attempt to time
 @ this from outside was swamped by the pacing of the input driving it.
+@ ------------------------------------------------------------ *SprBench
+@ Plot a sprite this module owns, a thousand times, with the host doing
+@ it and then with SpriteExtend doing it, timed by the guest's own
+@ clock.  Owning the sprite is the point: the first attempt replotted
+@ whichever sprite the desktop had last handed us, and NetSurf moved
+@ its buffer out from under the pointer.
 cmd_sprbench:
     STMFD   sp!, {r0-r9, lr}
-    ADR     r6, sv_lastspr
+    ADR     r6, sb_area
     LDR     r7, [r6]
     TEQ     r7, #0
-    BEQ     sb_none
+    BNE     sb_ready
 
-    MOV     r0, #26                 @ restore default windows: the Wimp
-    SWI     XOS_WriteC              @ leaves one that clips everything away
+    MOV     r0, #ModClaim
+    LDR     r3, =BENCH_AREA
+    SWI     XOS_Module
+    BVS     sb_out
+    ADR     r6, sb_area
+    STR     r2, [r6]
 
-    @ Pass one: the host does the plotting.
+    LDR     r0, =BENCH_AREA
+    STR     r0, [r2, #0]            @ saEnd
+    MOV     r0, #1
+    STR     r0, [r2, #4]            @ saNumber
+    MOV     r0, #16
+    STR     r0, [r2, #8]            @ saFirst
+    LDR     r0, =BENCH_AREA
+    STR     r0, [r2, #12]           @ saFree
+
+    ADD     r1, r2, #16             @ the sprite itself
+    LDR     r0, =44 + BENCH_IMG
+    STR     r0, [r1, #0]            @ spNext
+    LDR     r0, =0x636E6562         @ "benc"
+    STR     r0, [r1, #4]
+    MOV     r0, #0x68               @ "h"
+    STR     r0, [r1, #8]
+    MOV     r0, #0
+    STR     r0, [r1, #12]
+    MOV     r0, #BENCH_W - 1
+    STR     r0, [r1, #16]           @ spWidth, words - 1
+    MOV     r0, #BENCH_H - 1
+    STR     r0, [r1, #20]           @ spHeight, rows - 1
+    MOV     r0, #0
+    STR     r0, [r1, #24]           @ spLBit
+    MOV     r0, #31
+    STR     r0, [r1, #28]           @ spRBit
+    MOV     r0, #44
+    STR     r0, [r1, #32]           @ spImage
+    STR     r0, [r1, #36]           @ spTrans == spImage: unmasked
+    LDR     r0, =0x301680B5         @ type 6, 32bpp, 90dpi
+    STR     r0, [r1, #40]
+
+sb_ready:
+    MOV     r0, #26                 @ the Wimp leaves a graphics window
+    SWI     XOS_WriteC              @ that would clip all of this away
+
+    @ Pass one: the host.
     ADR     r6, sv_accoff
     MOV     r0, #0
     STR     r0, [r6]
     SWI     XOS_ReadMonotonicTime
     MOV     r9, r0
-    MOV     r8, #200
+    LDR     r8, =BENCH_PLOTS
 .Lsb_l1:
-    ADR     r6, sv_lastspr
-    LDR     r2, [r6]
-    LDR     r1, [r6, #4]
+    ADR     r6, sb_area
+    LDR     r1, [r6]
+    ADD     r2, r1, #16
     LDR     r0, =512 + 52
     MOV     r3, #0
     MOV     r4, #0
@@ -698,17 +752,17 @@ cmd_sprbench:
     ADR     r6, sb_host
     STR     r0, [r6]
 
-    @ Pass two: SpriteExtend does it, exactly as before any of this.
+    @ Pass two: SpriteExtend, exactly as before any of this existed.
     ADR     r6, sv_accoff
     MOV     r0, #1
     STR     r0, [r6]
     SWI     XOS_ReadMonotonicTime
     MOV     r9, r0
-    MOV     r8, #200
+    LDR     r8, =BENCH_PLOTS
 .Lsb_l2:
-    ADR     r6, sv_lastspr
-    LDR     r2, [r6]
-    LDR     r1, [r6, #4]
+    ADR     r6, sb_area
+    LDR     r1, [r6]
+    ADD     r2, r1, #16
     LDR     r0, =512 + 52
     MOV     r3, #0
     MOV     r4, #0
@@ -727,8 +781,8 @@ cmd_sprbench:
     MOV     r0, #0
     STR     r0, [r6]
 
-    ADR     r6, sb_host
-    MOV     r8, #2                  @ host centiseconds, then guest
+    ADR     r6, sb_host             @ centiseconds: host, then guest
+    MOV     r8, #2
 .Lsb_print:
     LDR     r0, [r6], #4
     ADR     r1, sv_hexbuf
@@ -739,10 +793,12 @@ cmd_sprbench:
     SUBS    r8, r8, #1
     BNE     .Lsb_print
     SWI     XOS_NewLine
-sb_none:
+sb_out:
     MSR     CPSR_f, #0
     LDMFD   sp!, {r0-r9, pc}
 
+sb_area:
+    .word   0
 sb_host:
     .word   0
 sb_guest:
