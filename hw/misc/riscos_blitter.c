@@ -81,6 +81,65 @@ static bool blit_contiguous(RISCOSBlitterState *s, int32_t stride)
            && s->patlen != 0 && s->width % s->patlen == 0;
 }
 
+/*
+ * The span a strided rectangle covers, from the lowest byte any row
+ * touches to the highest.  A negative stride runs upwards through
+ * memory, so the first row is not always the lowest.
+ */
+static void blit_span(RISCOSBlitterState *s, int32_t stride,
+                      int64_t *lo, uint64_t *span)
+{
+    int64_t last = (int64_t)(s->height - 1) * stride;
+
+    if (stride >= 0) {
+        *lo = 0;
+        *span = (uint64_t)(last + s->width);
+    } else {
+        *lo = last;
+        *span = (uint64_t)(s->width - last);
+    }
+}
+
+/*
+ * The framebuffer is ordinary RAM, so the whole rectangle can be mapped
+ * once and written with plain stores rather than a dma_memory_write per
+ * row.  It matters more than the contiguous case does: a real session
+ * logged 5878 fills averaging 108 KB, and only eleven of them spanned
+ * whole rows -- the rest are windows, hundreds of rows each, and every
+ * row was costing an address-space lookup.
+ *
+ * Returns NULL for anything that is not plain RAM, or that the address
+ * space would only map in pieces, and the caller falls back.
+ */
+static uint8_t *blit_map(uint64_t first, uint64_t span, hwaddr *got)
+{
+    hwaddr len = span;
+    void *p;
+
+    if (span == 0 || span > BLIT_MAX_BYTES) {
+        return NULL;
+    }
+    p = address_space_map(&address_space_memory, first, &len, true,
+                          MEMTXATTRS_UNSPECIFIED);
+    if (p && len == span) {
+        *got = len;
+        return p;
+    }
+    if (p) {
+        address_space_unmap(&address_space_memory, p, len, true, 0);
+    }
+    return NULL;
+}
+
+/*
+ * Unmapping with the full span as the access length is what marks the
+ * pages dirty, which is how the display learns the screen changed.
+ */
+static void blit_unmap(uint8_t *p, hwaddr len)
+{
+    address_space_unmap(&address_space_memory, p, len, true, len);
+}
+
 static uint8_t *blit_scratch(RISCOSBlitterState *s, uint32_t len)
 {
     if (s->scratch_len < len) {
@@ -93,9 +152,12 @@ static uint8_t *blit_scratch(RISCOSBlitterState *s, uint32_t len)
 static uint32_t blit_fill(RISCOSBlitterState *s)
 {
     uint64_t dest = s->dest;
-    uint8_t *row;
+    uint8_t *row, *host;
     uint8_t pat[16];
     uint32_t chunk;
+    hwaddr mapped;
+    uint64_t span;
+    int64_t lo;
 
     if (s->patlen == 0 || s->patlen > sizeof(pat)) {
         return BLIT_RC_BADGEOM;
@@ -115,7 +177,19 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
      * within the pattern does not matter; a positional pattern is not
      * something this interface can express, and should not try.
      */
-    if (blit_contiguous(s, s->dstride)) {
+    row = blit_scratch(s, s->width);
+    for (uint32_t off = 0; off < s->width; off += s->patlen) {
+        memcpy(row + off, pat, MIN(s->patlen, s->width - off));
+    }
+
+    blit_span(s, s->dstride, &lo, &span);
+    host = blit_map(dest + lo, span, &mapped);
+    if (host) {
+        for (uint32_t y = 0; y < s->height; y++) {
+            memcpy(host + ((int64_t)y * s->dstride - lo), row, s->width);
+        }
+        blit_unmap(host, mapped);
+    } else if (blit_contiguous(s, s->dstride)) {
         uint64_t total = (uint64_t)s->width * s->height;
 
         chunk = MIN(total, 1u << 20);
@@ -133,10 +207,6 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
             total -= n;
         }
     } else {
-        row = blit_scratch(s, s->width);
-        for (uint32_t off = 0; off < s->width; off += s->patlen) {
-            memcpy(row + off, pat, MIN(s->patlen, s->width - off));
-        }
         for (uint32_t y = 0; y < s->height; y++) {
             dma_memory_write(&address_space_memory, dest, row, s->width,
                              MEMTXATTRS_UNSPECIFIED);
