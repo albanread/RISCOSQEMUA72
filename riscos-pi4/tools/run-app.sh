@@ -16,6 +16,9 @@
 #                  (default: riscos-images/ beside the repo root)
 #   APP            the bundle (default: build-macos/RISCOSQEMU.app)
 #   WITH_QMP=1     add the developer's QMP socket anyway
+#   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
+#                  guest (FSDESIGN.md); unset leaves the doorbell
+#                  device present but file commands off
 #
 # Anything after the options is passed on as further QEMU arguments.
 #
@@ -48,5 +51,7 @@ args=(
     args+=(-drive file="$IMAGES/card.img",if=sd,format=raw,snapshot=on)
 [[ -n "${WITH_QMP:-}" ]] && \
     args+=(-qmp tcp:127.0.0.1:4455,server,nowait)
+[[ -n "${RISCOS_HOSTFS:-}" ]] && \
+    args+=(-global "bcm2838-peripherals.vmchannel-root=$RISCOS_HOSTFS")
 
 exec open -n "$APP" --args "${args[@]}" "$@"

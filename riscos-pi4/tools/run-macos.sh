@@ -10,6 +10,9 @@
 #                  which converts the framebuffer on the CPU
 #   AUDIODEV       the -audiodev driver (default coreaudio; "none" for
 #                  silence that still keeps the guest's sound loop turning)
+#   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
+#                  guest (FSDESIGN.md); unset leaves the doorbell
+#                  device present but file commands off
 #
 # Anything after the options is passed on to QEMU.
 #
@@ -45,6 +48,8 @@ args=(
 # MODE=1920x1200 etc: the EDID preferred timing, so RISC OS brings the
 # desktop up at that size. Empty keeps the 800x600 default.
 [[ -n "$MODE" ]] && args+=(-global "bcm2835-property.mode=$MODE")
+[[ -n "${RISCOS_HOSTFS:-}" ]] && \
+    args+=(-global "bcm2838-peripherals.vmchannel-root=$RISCOS_HOSTFS")
 
 [[ -e "$IMAGES/card.img" ]] && \
     args+=(-drive file="$IMAGES/card.img",if=sd,format=raw,snapshot=on)

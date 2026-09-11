@@ -157,3 +157,36 @@ the second half of Sprint 6's acceptance, riding the same doorbell.
 From `SPRINTS.md`, unchanged: a file written on the host is readable
 from the RISC OS desktop within a second and without a reboot, and a
 `*Cat` typed in the guest appears on the host.
+
+## On the Mac
+
+The device is portable as written (glib's `g_open`/`g_stat`/`g_dir`
+cover both hosts; `ftruncate` answers `_chsize_s`); what the Mac port
+changed is where the device's own files land and how the root is
+given:
+
+- **Trace and console logs** go to `~/Library/Application Support/
+  RISCOSQEMU/` (`vmch-trace.txt`, `vmchannel-console.txt`) — a
+  properly-launched app has `cwd=/`, so the old bare names and the
+  Windows `F:` scratch were both wrong here.  `VMCH_TRACE` in the
+  environment names the trace file outright, on any host.
+- **The root** is `RISCOS_HOSTFS` in `tools/run-macos.sh` and
+  `tools/run-app.sh`, passed as `-global
+  bcm2838-peripherals.vmchannel-root=`; unset leaves the doorbell
+  present (the guest can probe the magic) with file commands off, and
+  FEATURES reports the difference — verified on the wire through the
+  Apple Events `mem` command: `0x6` without a root, `0x7` with.
+- **The module is guest code** and runs on any host; its *build* lives
+  with the DDE/roscc toolchain (the private tools repository), and the
+  resulting `HostFS,ffa` is what a Mac card needs.  Until it is on the
+  disc image, the Mac side is verified to the doorbell: MAGIC, VERSION
+  and FEATURES read back through `mem`, and every register access
+  lands in the Application Support trace.
+- **TCC**: the Application Support home is not a prompted location;
+  pointing `RISCOS_HOSTFS` at Desktop, Documents or Downloads makes
+  macOS prompt for folder access once — the same consent perimeter the
+  Apple Events surface sits behind, and worth keeping for the app
+  persona.
+- Case sensitivity is the host's own (v0 rule): the Mac's default
+  APFS volume is case-insensitive, like the Windows host, so name-case
+  surprises match what the module was developed against.

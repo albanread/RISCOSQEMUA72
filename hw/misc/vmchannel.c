@@ -189,6 +189,31 @@ static char *arg_text(hwaddr base, uint32_t arglen)
 /* ------------------------------------------------------------------ */
 /* Host file plumbing (glib handles UTF-8 -> wide chars on Windows)   */
 
+/*
+ * Where the device's own files (trace, console log) land.  The Windows
+ * dev box has its F: scratch; the Mac's properly-launched app runs
+ * with cwd=/, so its home is ~/Library/Application Support/RISCOSQEMU
+ * (the same configured directory the scripting surface writes into,
+ * SCRIPTING.md section 7); anywhere else, /tmp.  VMCH_TRACE names the
+ * trace file outright for a dev loop that wants it elsewhere.
+ */
+static char *vmch_dir(void)
+{
+#ifdef _WIN32
+    return g_strdup("F:/RISCOSDEV/.scratch");
+#elif defined(__APPLE__)
+    const char *home = g_get_home_dir();
+
+    if (!home) {
+        return g_strdup("/tmp");
+    }
+    return g_strdup_printf("%s/Library/Application Support/RISCOSQEMU",
+                           home);
+#else
+    return g_strdup("/tmp");
+#endif
+}
+
 static int alloc_handle(VMChannelState *s)
 {
     for (int i = 0; i < VMCH_MAX_OPEN; i++) {
@@ -234,20 +259,26 @@ static uint64_t date_cs_for(const GStatBuf *st)
 }
 
 /* Development trace to a file: stderr proved unreliable under the
- * Windows launcher, so every doorbell access lands here instead.  If
- * the directory is missing, try to create it, and if that also fails,
- * say so once on stderr rather than debugging blind. */
+ * launchers, so every doorbell access lands here instead. */
 static void vmch_trace(const char *fmt, ...)
 {
     static FILE *f;
     va_list ap;
 
     if (!f) {
-        f = fopen("F:/RISCOSDEV/.scratch/vmch-trace.txt", "a");
+        const char *env = getenv("VMCH_TRACE");
+        char *dir = vmch_dir();
+        char *path;
+
+        g_mkdir_with_parents(dir, 0755);
+        path = g_strdup_printf("%s%cvmch-trace.txt", dir,
+                               G_DIR_SEPARATOR);
+        g_free(dir);
+        f = (env && *env) ? fopen(env, "a") : NULL;
         if (!f) {
-            g_mkdir_with_parents("F:/RISCOSDEV/.scratch", 0755);
-            f = fopen("F:/RISCOSDEV/.scratch/vmch-trace.txt", "a");
+            f = fopen(path, "a");
         }
+        g_free(path);
         if (!f) {
             static bool warned;
             if (!warned) {
@@ -622,11 +653,21 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         buf = g_malloc(arglen ? arglen : 1);
         block_read(base + VMCH_HDR_SIZE, buf, arglen);
         /*
-         * A log file next to the other debug output: stderr is no use,
-         * the launcher sends it to DEVNULL.
+         * A log file in the device's home directory: stderr is no use,
+         * the launchers send it to DEVNULL, and a bare name would be
+         * lost where the Mac app's cwd is /.
          */
         {
-            FILE *log = fopen("vmchannel-console.txt", "ab");
+            char *dir = vmch_dir();
+            char *path;
+            FILE *log;
+
+            g_mkdir_with_parents(dir, 0755);
+            path = g_strdup_printf("%s%cvmchannel-console.txt", dir,
+                                   G_DIR_SEPARATOR);
+            g_free(dir);
+            log = fopen(path, "ab");
+            g_free(path);
             if (log) {
                 fwrite(buf, 1, arglen, log);
                 fclose(log);

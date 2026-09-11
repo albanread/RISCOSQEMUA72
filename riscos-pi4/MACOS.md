@@ -234,6 +234,17 @@ needed yet.
   (HMP passthrough, memory in both address spaces, registers, PC,
   disassembly, `capture`) — the capture-vs-QMP disassembly match is
   the acceptance proof. Breakpoints and step are E4.
+- **HostFS is ported to the Mac.** The Windows twin's vmchannel
+  doorbell is host-portable as written; the Mac port moved its trace
+  and console logs into `~/Library/Application Support/RISCOSQEMU/`
+  (a properly-launched app has `cwd=/`), and both launchers take
+  `RISCOS_HOSTFS=<dir>` as the share root.  Verified to the doorbell
+  on the wire: MAGIC/VERSION read back through the Apple Events `mem`
+  command, FEATURES `0x6` without a root and `0x7` with, every access
+  traced into Application Support.  The `HostFS,ffa` module is guest
+  code and runs on any host; its binary comes from the private tools
+  repository (DDE/roscc), and once it is on the Mac's card the
+  FSDESIGN testing ladder runs here unchanged.
 - **The app has its icon.** A silver cog on a navy rounded-square tile,
   drawn entirely from geometry by `riscos-pi4/tools/mkicon.py` (original
   artwork — the repository carries no third-party material — and a nod to
