@@ -424,10 +424,10 @@ promise. E0's answers gate E1's shape; nothing else starts before them.
   Done when a script — written by an agent from `describe` alone, no
   human — cold boots, waits for the desktop by polling `frame_gen`,
   takes a screendump, saves a snapshot, loads it.
-- **E3 — debugging (3 d).** HMP passthrough, `read memory` both
-  address spaces, registers, PC, disassemble, `capture`. Done when a
-  scripted session pauses a running desktop and its `capture`'s
-  disassembly-at-PC matches the same `x/i` over QMP.
+- **E3 — debugging (3 d). *Done; see §16.*** HMP passthrough, `read
+  memory` both address spaces, registers, PC, disassemble, `capture`.
+  Done when a scripted session pauses a running desktop and its
+  `capture`'s disassembly-at-PC matches the same `x/i` over QMP.
 - **E4 — breakpoints and step (2–3 d).** Insert/list/remove on core 0,
   `step` with the gdbstub wait semantics, breakpoint-hit visible as a
   state change. Done when a scripted session breaks at a chosen physical
@@ -669,13 +669,43 @@ only under `~/Library/Application Support/RISCOSQEMU` (§7's configured
 directory, v1: one), a caller `name` is a leaf or `denied`, and the
 periodic `METAL_SHOT_EVERY` path moved there too — a properly-launched
 app has `cwd=/`, so the old bare filename was writing nowhere.
-`listvm` reads `bdrv_snapshot_list` on the vmstate device (the same
-data `info snapshots` prints). `video` applies scaling/scanlines by
-dropping the specialised pipeline for one frame, and `vsync` sets the
-machine's generator or reports `not-capable`. Counters (`keys`,
-`mouse_moves`, `mouse_buttons`, `ae_events`) are taken where input
-enters QEMU, so the window's events and the surface's count together
-— an agent proves causality with one `state` before and after.
+  `listvm` reads `bdrv_snapshot_list` on the vmstate device (the same
+  data `info snapshots` prints). `video` applies scaling/scanlines by
+  dropping the specialised pipeline for one frame, and `vsync` sets the
+  machine's generator or reports `not-capable`. Counters (`keys`,
+  `mouse_moves`, `mouse_buttons`, `ae_events`) are taken where input
+  enters QEMU, so the window's events and the surface's count together
+  — an agent proves causality with one `state` before and after.
+
+## 16. E3, as built
+
+Six debugging commands join the table: `hmp` (the qmp bridge,
+verbatim), `mem` (physical via `address_space_read` on
+`address_space_memory`, virtual via `cpu_memory_rw_debug` on a core,
+hex reply), `regs` and `pc` (straight from the ARMCPU under the BQL —
+the design's v2 shape arrived first, JSON being worth more to an agent
+than `info registers` text), `disa` (`x /ni` sugar over the bridge),
+and `capture` (pause → PC, registers, screendump, envelope counters →
+back to the prior state, all inside one bottom half). The acceptance
+test passed on the wire: a `capture` of the running desktop, then
+`disa` at its PC and the same `x/1i` over QMP, produced byte-identical
+text (`0xfc206208: e8bd8001 pop {r0, pc}`).
+
+Wire notes:
+
+- **Addresses arrive as hex strings.** JSON numbers cannot carry an
+  `0x` prefix, and agents write addresses in hex; `mem` and `disa`
+  take either form (`arg_addr` parses strings with base 0).
+- **A physical read can honestly fail.** `0xfc000000` is the Pi's
+  peripheral window, not RAM — the ROM's `0xfc…` addresses are virtual
+  mappings of a RAM copy, so `mem` with `virtual` is the read that
+  answers there and the physical one reports the unassigned space
+  rather than inventing bytes.
+- **`regs` for a core that does not exist is `not-found`**, the same
+  code an unknown snapshot returns; cores are the one place the
+  surface names QEMU objects by index.
+
+E4's breakpoints and step are the remaining debugging surface.
 
 ## Sources
 

@@ -33,9 +33,19 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "system/reset.h"
+#include "system/hw_accel.h"
 #include "block/snapshot.h"
+#include "hw/core/cpu.h"
+#include "target/arm/cpu.h"     /* the Pi's AArch32 core: regs, cpsr */
 #include "standard-headers/linux/input-event-codes.h"
 #include <zlib.h>
+
+/* monitor/qmp-cmds.c: the HMP bridge the design names, which has no
+ * public header.  Verbatim passthrough is the point (SCRIPTING.md
+ * section 5): x, xp, info, qom-list, gpa2hva, the whole HMP. */
+char *qmp_human_monitor_command(const char *command_line,
+                                bool has_cpu_index, int64_t cpu_index,
+                                Error **errp);
 
 void metal_backend_request_shutdown(void)
 {
@@ -257,6 +267,24 @@ static const ScriptCmd script_cmds[] = {
     { "wheel", "MQemWhl ",
       "Scroll notches; positive is away from the user.",
       "notches int", 'f' },
+    { "hmp", "MQemHmp ",
+      "Run an HMP command line and return its text output: x, xp, info registers, info mtree, qom-list, gpa2hva.",
+      "command str, core int, waiting int s", 'b' },
+    { "mem", "MQemRdMe",
+      "Read guest memory, physical by default or virtual on a core; the reply is hex.",
+      "address int, length int (1 to 1048576), virtual bool, core int", 'f' },
+    { "regs", "MQemRdRg",
+      "The registers of one core as JSON: r0 to r12, sp, lr, pc, cpsr, mode.",
+      "core int", 'f' },
+    { "pc", "MQemRdPc",
+      "The program counter of one core, under the BQL.",
+      "core int", 'f' },
+    { "disa", "MQemDisa",
+      "Disassemble instructions at an address: the HMP x command underneath.",
+      "address int, count int (1 to 256), core int, waiting int s", 'b' },
+    { "capture", "MQemCapr",
+      "One coherent observation: pause, PC and registers, screendump, counters, then back to the prior state.",
+      "name str, core int, waiting int s", 'b' },
 };
 /* SCRIPT-TABLE-END */
 
@@ -438,6 +466,22 @@ static const char *arg_str(const QDict *q, const char *key)
     return q ? qdict_get_try_str(q, key) : NULL;
 }
 
+/* An address argument: a JSON number, or a string with an 0x prefix —
+ * agents write addresses in hex, and JSON numbers cannot. */
+static int64_t arg_addr(const QDict *q, const char *key, int64_t dflt)
+{
+    const char *s;
+
+    if (!q || !qdict_haskey(q, key)) {
+        return dflt;
+    }
+    s = qdict_get_try_str(q, key);
+    if (s && *s) {
+        return (int64_t)g_ascii_strtoll(s, NULL, 0);
+    }
+    return qdict_get_try_int(q, key, dflt);
+}
+
 /*
  * Writes are confined (SCRIPTING.md section 7): screenshots and
  * screendumps land under ~/Library/Application Support/RISCOSQEMU only.
@@ -566,7 +610,8 @@ static bool script_png_write(const char *path, uint32_t w, uint32_t h,
  */
 static BCM2835FBState *script_fb;
 
-static int script_screendump(const char *name, char **data, char **errmsg)
+static int script_screendump(const char *name, const char *prefix,
+                             char **data, char **errmsg)
 {
     BCM2835FBConfig cfg;
     uint32_t gen, pitch, bypp, rowlen, xo, yo;
@@ -654,7 +699,7 @@ static int script_screendump(const char *name, char **data, char **errmsg)
     g_free(raw);
     g_free(pal);
 
-    rc = script_out_path(name, "screendump", path, sizeof(path),
+    rc = script_out_path(name, prefix, path, sizeof(path),
                          (const char **)errmsg);
     if (rc != SCRIPT_OK) {
         g_free(rgb);
@@ -852,6 +897,162 @@ static char *cmd_video(const QDict *q, int *err, const char **errmsg)
 }
 
 /* ------------------------------------------------------------------ */
+/* E3: the debugging commands                                          */
+
+/* One HMP command line, run through the qmp bridge verbatim.  BQL held
+ * (called from the bottom half); the reply is the monitor's text. */
+static int script_hmp(const char *line, bool has_core, int64_t core,
+                      char **out, char **errmsg)
+{
+    Error *verr = NULL;
+    char *text = qmp_human_monitor_command(line, has_core, core, &verr);
+
+    if (verr) {
+        *errmsg = g_strdup(error_get_pretty(verr));
+        error_free(verr);
+        return SCRIPT_E_INVALID;
+    }
+    *out = text ? text : g_strdup("");
+    return SCRIPT_OK;
+}
+
+/* PC and registers straight from the ARMCPU, BQL held.  The gatherers
+ * return a JSON object or NULL with *err set; callers embed or reply. */
+static char *script_pc_gather(int64_t core, int *err)
+{
+    CPUState *cpu = qemu_get_cpu(core);
+    ARMCPU *ac;
+    uint64_t v;
+
+    if (!cpu) {
+        *err = SCRIPT_E_NOT_FOUND;
+        return NULL;
+    }
+    cpu_synchronize_state(cpu);
+    ac = ARM_CPU(cpu);
+    v = is_a64(&ac->env) ? ac->env.pc : ac->env.regs[15];
+    return g_strdup_printf("{\"core\":%d,\"pc\":\"0x%" PRIx64 "\"}",
+                           (int)core, v);
+}
+
+static char *script_regs_gather(int64_t core, int *err)
+{
+    CPUState *cpu = qemu_get_cpu(core);
+    GString *s;
+    ARMCPU *ac;
+    uint32_t cpsr;
+
+    if (!cpu) {
+        *err = SCRIPT_E_NOT_FOUND;
+        return NULL;
+    }
+    cpu_synchronize_state(cpu);
+    ac = ARM_CPU(cpu);
+    cpsr = cpsr_read(&ac->env);
+
+    s = g_string_new(NULL);
+    g_string_printf(s, "{\"core\":%d", (int)core);
+    for (int r = 0; r <= 12; r++) {
+        g_string_append_printf(s, ",\"r%d\":\"0x%" PRIx64 "\"",
+                               r, (uint64_t)ac->env.regs[r]);
+    }
+    g_string_append_printf(s, ",\"sp\":\"0x%" PRIx64 "\",\"lr\":\"0x%"
+                           PRIx64 "\"",
+                           (uint64_t)ac->env.regs[13],
+                           (uint64_t)ac->env.regs[14]);
+    g_string_append_printf(s, ",\"pc\":\"0x%" PRIx64 "\"",
+                           is_a64(&ac->env) ? ac->env.pc
+                                            : ac->env.regs[15]);
+    g_string_append_printf(s, ",\"cpsr\":\"0x%x\",\"mode\":\"0x%x\"",
+                           (unsigned)cpsr, (unsigned)(cpsr & 0x1f));
+    g_string_append(s, "}");
+    return g_string_free(s, FALSE);
+}
+
+static char *cmd_pc(const QDict *q, int *err, const char **errmsg)
+{
+    char *data;
+
+    bql_lock();
+    data = script_pc_gather(arg_int(q, "core", 0), err);
+    bql_unlock();
+    if (!data) {
+        *errmsg = "no such core";
+    }
+    return data;
+}
+
+static char *cmd_regs(const QDict *q, int *err, const char **errmsg)
+{
+    char *data;
+
+    bql_lock();
+    data = script_regs_gather(arg_int(q, "core", 0), err);
+    bql_unlock();
+    if (!data) {
+        *errmsg = "no such core";
+    }
+    return data;
+}
+
+static char *cmd_mem(const QDict *q, int *err, const char **errmsg)
+{
+    int64_t address = arg_addr(q, "address", -1);
+    int64_t length = arg_int(q, "length", -1);
+    int64_t core = arg_int(q, "core", 0);
+    bool virt = arg_bool(q, "virtual", false);
+    uint8_t *buf;
+    GString *hex;
+
+    if (address < 0 || length < 1 || length > 1024 * 1024) {
+        *err = SCRIPT_E_INVALID;
+        *errmsg = "address and length are required, length 1 to 1048576";
+        return NULL;
+    }
+    buf = g_malloc(length);
+    bql_lock();
+    if (virt) {
+        CPUState *cpu = qemu_get_cpu(core);
+
+        if (!cpu) {
+            bql_unlock();
+            g_free(buf);
+            *err = SCRIPT_E_NOT_FOUND;
+            *errmsg = "no such core";
+            return NULL;
+        }
+        cpu_synchronize_state(cpu);
+        if (cpu_memory_rw_debug(cpu, address, buf, length, 0) < 0) {
+            bql_unlock();
+            g_free(buf);
+            *err = SCRIPT_E_INVALID;
+            *errmsg = "the virtual read failed: unmapped or faulting";
+            return NULL;
+        }
+    } else if (address_space_read(&address_space_memory, address,
+                                  MEMTXATTRS_UNSPECIFIED, buf, length)
+               != MEMTX_OK) {
+        bql_unlock();
+        g_free(buf);
+        *err = SCRIPT_E_INVALID;
+        *errmsg = "the physical read failed";
+        return NULL;
+    }
+    bql_unlock();
+
+    hex = g_string_sized_new(length * 2 + 1);
+    for (int64_t i = 0; i < length; i++) {
+        g_string_append_printf(hex, "%02x", buf[i]);
+    }
+    g_free(buf);
+    return g_strdup_printf(
+        "{\"address\":\"0x%" PRIx64 "\",\"length\":%d,\"virtual\":%s,"
+        "\"hex\":\"%s\"}",
+        address, (int)length, virt ? "true" : "false",
+        g_string_free(hex, FALSE));
+}
+
+/* ------------------------------------------------------------------ */
 /* The bottom-half class: schedule on the main loop, wait on the       */
 /* semaphore (SCRIPTING.md section 4's threading rules).  The waiting  */
 /* UI thread holds no lock; the bottom half never calls into it.       */
@@ -966,7 +1167,82 @@ static void script_bh_fn(void *opaque)
             }
         }
     } else if (!strcmp(name, "screendump")) {
-        err = script_screendump(arg_str(args, "name"), &data, &msg);
+        err = script_screendump(arg_str(args, "name"), "screendump",
+                                &data, &msg);
+    } else if (!strcmp(name, "hmp")) {
+        const char *line = arg_str(args, "command");
+        char *out = NULL;
+
+        if (!line || !*line) {
+            err = SCRIPT_E_INVALID;
+            msg = g_strdup("command is required");
+        } else {
+            int64_t core = arg_int(args, "core", -1);
+
+            err = script_hmp(line, core >= 0, core, &out, &msg);
+            if (err == SCRIPT_OK) {
+                g_autofree char *esc = json_escape(out);
+
+                data = g_strdup_printf("{\"output\":\"%s\"}", esc);
+                g_free(out);
+            }
+        }
+    } else if (!strcmp(name, "disa")) {
+        int64_t address = arg_addr(args, "address", -1);
+        int64_t count = arg_int(args, "count", 16);
+        int64_t core = arg_int(args, "core", -1);
+        char line[64];
+        char *out = NULL;
+
+        if (address < 0) {
+            err = SCRIPT_E_INVALID;
+            msg = g_strdup("address is required");
+        } else {
+            count = MIN(MAX(count, 1), 256);
+            snprintf(line, sizeof(line), "x /%" PRId64 "i 0x%" PRIx64,
+                     count, address);
+            err = script_hmp(line, core >= 0, core, &out, &msg);
+            if (err == SCRIPT_OK) {
+                g_autofree char *esc = json_escape(out);
+
+                data = g_strdup_printf(
+                    "{\"address\":\"0x%" PRIx64 "\",\"count\":%"
+                    PRId64 ",\"instructions\":\"%s\"}",
+                    address, count, esc);
+                g_free(out);
+            }
+        }
+    } else if (!strcmp(name, "capture")) {
+        /* Everything gathered while the vCPUs are stopped inside this
+         * one bottom half: no DMA, no timer, no input can interleave
+         * (SCRIPTING.md section 6, capture atomicity).  The counters
+         * ride the reply envelope. */
+        int64_t core = arg_int(args, "core", 0);
+        bool was_running = runstate_check(RUN_STATE_RUNNING);
+        char *pcjs = NULL, *regsjs = NULL, *dump = NULL, *dumpmsg = NULL;
+        int perr = SCRIPT_OK, rerr = SCRIPT_OK, drc;
+
+        vm_stop(RUN_STATE_PAUSED);
+        pcjs = script_pc_gather(core, &perr);
+        regsjs = script_regs_gather(core, &rerr);
+        drc = script_screendump(arg_str(args, "name"), "capture",
+                                &dump, &dumpmsg);
+        if (drc != SCRIPT_OK) {
+            g_free(dumpmsg);
+            g_free(dump);
+            dump = NULL;
+        }
+        if (was_running) {
+            vm_start();
+        }
+        data = g_strdup_printf(
+            "{\"pc\":%s,\"registers\":%s,\"screendump\":%s,"
+            "\"resumed\":%s}",
+            pcjs ?: "null", regsjs ?: "null", dump ?: "null",
+            was_running ? "true" : "false");
+        g_free(pcjs);
+        g_free(regsjs);
+        g_free(dump);
     } else {
         g_assert_not_reached();
     }
@@ -1207,6 +1483,12 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
             metal_glue_mouse_wheel(notches);
             data = g_strdup_printf("{\"scrolled\":%d}", (int)notches);
         }
+    } else if (!strcmp(cmd->name, "pc")) {
+        data = cmd_pc(qdict, &err, &errmsg);
+    } else if (!strcmp(cmd->name, "regs")) {
+        data = cmd_regs(qdict, &err, &errmsg);
+    } else if (!strcmp(cmd->name, "mem")) {
+        data = cmd_mem(qdict, &err, &errmsg);
     } else if (!strcmp(cmd->name, "reset") || !strcmp(cmd->name, "poweroff")) {
         if (!arg_bool(qdict, "dangerous", false)) {
             err = SCRIPT_E_DENIED;

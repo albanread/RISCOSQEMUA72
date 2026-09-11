@@ -128,6 +128,48 @@
       "help": "Scroll notches; positive is away from the user.",
       "args": "notches int",
       "class": "fast"
+    },
+    {
+      "name": "hmp",
+      "code": "MQemHmp ",
+      "help": "Run an HMP command line and return its text output: x, xp, info registers, info mtree, qom-list, gpa2hva.",
+      "args": "command str, core int, waiting int s",
+      "class": "bottom"
+    },
+    {
+      "name": "mem",
+      "code": "MQemRdMe",
+      "help": "Read guest memory, physical by default or virtual on a core; the reply is hex.",
+      "args": "address int, length int (1 to 1048576), virtual bool, core int",
+      "class": "fast"
+    },
+    {
+      "name": "regs",
+      "code": "MQemRdRg",
+      "help": "The registers of one core as JSON: r0 to r12, sp, lr, pc, cpsr, mode.",
+      "args": "core int",
+      "class": "fast"
+    },
+    {
+      "name": "pc",
+      "code": "MQemRdPc",
+      "help": "The program counter of one core, under the BQL.",
+      "args": "core int",
+      "class": "fast"
+    },
+    {
+      "name": "disa",
+      "code": "MQemDisa",
+      "help": "Disassemble instructions at an address: the HMP x command underneath.",
+      "args": "address int, count int (1 to 256), core int, waiting int s",
+      "class": "bottom"
+    },
+    {
+      "name": "capture",
+      "code": "MQemCapr",
+      "help": "One coherent observation: pause, PC and registers, screendump, counters, then back to the prior state.",
+      "args": "name str, core int, waiting int s",
+      "class": "bottom"
     }
   ]
 }

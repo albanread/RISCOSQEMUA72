@@ -157,5 +157,53 @@
 				<type type="text" description="The JSON reply envelope."/>
 			</result>
 		</command>
+		<command name="hmp" code="MQemHmp " description="Run an HMP command line and return its text output: x, xp, info registers, info mtree, qom-list, gpa2hva.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="mem" code="MQemRdMe" description="Read guest memory, physical by default or virtual on a core; the reply is hex.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="regs" code="MQemRdRg" description="The registers of one core as JSON: r0 to r12, sp, lr, pc, cpsr, mode.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="pc" code="MQemRdPc" description="The program counter of one core, under the BQL.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="disa" code="MQemDisa" description="Disassemble instructions at an address: the HMP x command underneath.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="capture" code="MQemCapr" description="One coherent observation: pause, PC and registers, screendump, counters, then back to the prior state.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
 	</suite>
 </dictionary>
