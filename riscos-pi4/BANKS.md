@@ -86,6 +86,38 @@ changes from 0,0 the whole path is live.
 back.  Check by eye during (1): does the pointer survive, do menus
 still restore what was under them.
 
+## Module or ROM?
+
+Probably ROM, and worth deciding early rather than discovering halfway.
+
+**What a module can do.**  RISC OS is cooperative -- one task runs at a
+time -- so a swap and copy in a pre-filter is atomic with respect to
+task drawing: nothing else can draw between a task entering Wimp_Poll
+and the next task being scheduled.  Drawing the Wimp does itself
+(furniture, menus, drag outlines) happens after that point and lands in
+the new back buffer, which by then is correct.  So an external module
+can very likely produce a working double buffer.
+
+**What only the Wimp can do.**  The full-screen copy is needed *only*
+because the Wimp does not know it is double buffered.  A Wimp that did
+would keep the damage from the previous frame as well as this one, and
+redraw their union into the back buffer -- no copy at all.  That is the
+textbook approach and it is strictly better: it turns a fixed
+full-screen cost per frame into a cost proportional to what actually
+changed, which on an idle desktop is nothing.  The damage lists live
+inside the Wimp and nothing outside it can see them.
+
+So the module version is the cheap experiment that proves the idea and
+gives a usable result; the ROM version is the right implementation.  If
+the experiment works, the question becomes whether to carry a Wimp
+patch, which needs the RISC OS build environment rather than the
+clang-and-objcopy route that builds a relocatable module (see
+[[riscos-guest-module-workflow]] and `blitter/README.md`).
+
+Worth noting what this would be worth upstream: the desktop tears on
+real hardware too.  The reason RISC OS does not double buffer is the
+cost of the copy, and the damage-union approach removes that reason.
+
 ## Implementation, once those answer
 
 1. **Front end follows the displayed bank.**  `ui/metal.c` maps and
