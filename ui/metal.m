@@ -1601,6 +1601,10 @@ static void metal_buttons_release_all(void)
 - (void)windowWillClose:(NSNotification *)n
 {
     (void)n;
+    /* Logged unconditionally: a session that ended on its own leaves
+     * nothing else behind saying so, and the two ways out look
+     * identical from the exit status. */
+    metal_log("shutting down: window closed");
     m.lost = true;
 }
 
@@ -1637,6 +1641,7 @@ static void metal_buttons_release_all(void)
     /* Not [NSApp terminate:]: the machine is asked to power off and the
      * UI loop unwinds, which is what gets the disc written back. */
     (void)sender;
+    metal_log("shutting down: Quit (Cmd-Q)");
     m.lost = true;
 }
 
