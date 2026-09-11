@@ -339,6 +339,8 @@ aspeed_hace_hash_addr(const char *s, uint64_t addr) "%s: 0x%" PRIx64
 aspeed_hace_hash_execute_acc_mode(bool final_request) "final request: %d"
 aspeed_hace_hexdump(const char *desc, uint32_t offset, char *s) "%s: 0x%08x: %s"
 
+bcm2835_property_edid(uint32_t w, uint32_t h) "bcm2835 property: EDID preferred timing %ux%u"
+
 # bcm2835_vchiq.c
 bcm2835_vchiq_mbox_write(uint32_t value) "vchiq slot zero posted: 0x%08x"
 bcm2835_vchiq_slot_zero(uint32_t addr, uint32_t magic, uint32_t slot_size, uint32_t max_slots) "vchiq slot zero at 0x%08x magic 0x%08x slot_size %u max_slots %u"
@@ -358,6 +360,7 @@ bcm2835_vchiq_bulk(uint32_t pagelist, uint64_t addr, uint32_t bytes, uint32_t ru
 bcm2835_vchiq_disp_open(uint32_t srcport) "vchiq DISP opened by port %u -- accepting"
 bcm2835_vchiq_disp_msg(uint32_t cmd, uint32_t no_reply) "vchiq DISP command %u noreply %u"
 bcm2835_vchiq_disp_getinfo(uint32_t w, uint32_t h) "vchiq DISP getinfo answered %ux%u"
+bcm2835_vchiq_disp_sprite(uint32_t w, uint32_t h, uint32_t minx, uint32_t miny, uint32_t maxx, uint32_t maxy) "vchiq DISP sprite %ux%u, opaque x %u..%u (arg3,5) y %u..%u (arg4,6)"
 bcm2835_vchiq_disp_pointer(bool visible, int32_t x, int32_t y, uint32_t w, uint32_t h) "vchiq DISP pointer visible %d at %d,%d %ux%u"
 
 # bcm2835_property.c

@@ -234,6 +234,7 @@ static void metal_cursor_sync(void)
 static struct {
     bool swallow_up;                /* the middle-up of a grab click */
     int held_left, held_right;      /* button actually sent, per stream */
+    bool down[3];                   /* what the guest believes is pressed */
     /* the guest pointer position we last sent, in guest pixels: the
      * anchor for relative motion while grabbed (absolute while not) */
     int gx, gy;
@@ -1441,6 +1442,40 @@ static int metal_button_for(NSEvent *e, int plain)
     return plain;
 }
 
+/*
+ * Every button press and release goes through here, so the guest's idea
+ * of what is held is something we know rather than something we hope.
+ * A press that never gets its release leaves RISC OS dragging for ever
+ * -- the Wimp ends a drag on the button going up, and if it never does
+ * the window simply follows the pointer until something else intervenes.
+ */
+static void metal_button(int button, bool down)
+{
+    if ((unsigned)button > 2 || mouse.down[button] == down) {
+        return;                     /* never send the same edge twice */
+    }
+    mouse.down[button] = down;
+    if (metal_debug()) {
+        metal_log("mouse: button %d %s", button, down ? "down" : "up");
+    }
+    metal_glue_mouse_btn(button, down);
+    m.mouse_buttons++;
+}
+
+/* Let go of anything still held. Focus loss, a grab ending and shutdown
+ * all need this: the host stops telling us about a button we never saw
+ * released, and the guest is left holding it. */
+static void metal_buttons_release_all(void)
+{
+    int b;
+
+    for (b = 0; b < 3; b++) {
+        if (mouse.down[b]) {
+            metal_button(b, false);
+        }
+    }
+}
+
 - (void)mouseDown:(NSEvent *)e
 {
     mouse.held_left = metal_button_for(e, 0);
@@ -1448,13 +1483,12 @@ static int metal_button_for(NSEvent *e, int plain)
         metal_log("view: mouseDown -> button %d (flags %#lx)",
                   mouse.held_left, (unsigned long)[e modifierFlags]);
     }
-    metal_glue_mouse_btn(mouse.held_left, true);
-    m.mouse_buttons++;
+    metal_button(mouse.held_left, true);
 }
 
 - (void)mouseUp:(NSEvent *)e
 {
-    metal_glue_mouse_btn(mouse.held_left, false);
+    metal_button(mouse.held_left, false);
     metal_mods_restore(e);
 }
 
@@ -1465,13 +1499,12 @@ static int metal_button_for(NSEvent *e, int plain)
         metal_log("view: rightMouseDown -> button %d (flags %#lx)",
                   mouse.held_right, (unsigned long)[e modifierFlags]);
     }
-    metal_glue_mouse_btn(mouse.held_right, true);
-    m.mouse_buttons++;
+    metal_button(mouse.held_right, true);
 }
 
 - (void)rightMouseUp:(NSEvent *)e
 {
-    metal_glue_mouse_btn(mouse.held_right, false);
+    metal_button(mouse.held_right, false);
     metal_mods_restore(e);
 }
 
@@ -1486,8 +1519,7 @@ static int metal_button_for(NSEvent *e, int plain)
     if ([e buttonNumber] != 2) {
         return;
     }
-    metal_glue_mouse_btn(1, true);
-    m.mouse_buttons++;
+    metal_button(1, true);
 }
 
 - (void)otherMouseUp:(NSEvent *)e
@@ -1495,7 +1527,7 @@ static int metal_button_for(NSEvent *e, int plain)
     if ([e buttonNumber] != 2) {
         return;
     }
-    metal_glue_mouse_btn(1, false);
+    metal_button(1, false);
 }
 
 - (void)scrollWheel:(NSEvent *)e
@@ -1535,6 +1567,7 @@ static int metal_button_for(NSEvent *e, int plain)
     (void)n;
     metal_set_grab(false);          /* never hold the host pointer hostage */
     metal_release_modifiers();
+    metal_buttons_release_all();    /* nor a button it will never release */
     cursor.inside = false;          /* and never a cursor, either */
     metal_cursor_sync();
 }
