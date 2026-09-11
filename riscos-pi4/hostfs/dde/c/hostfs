@@ -716,6 +716,17 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
         r->r[0] = 1;
         return NULL;
 
+    case 1:                            /* write catalogue info */
+    case 2:                            /* write load address */
+    case 3:                            /* write execution address */
+    case 4:                            /* write attributes */
+        /* The host filesystem has no RISC OS metadata store: a file's
+         * type rides its name suffix (name,xxx), set at create.  So
+         * accept these and no-op rather than failing the caller —
+         * *Copy, the Filer and *SetType all stamp the destination here,
+         * and erroring turns a good copy into "unsupported operation". */
+        return NULL;
+
     default:
         return &err_unsupported;
     }
@@ -837,7 +848,12 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                 w[1] = exec;
                 w[2] = e->len;
                 w[3] = e->attr;
-                w[4] = e->type;
+                w[4] = (e->type == 0) ? 2 : 1;   /* object type: dir / file
+                                                  * (the filetype rides
+                                                  * load in w[0]) — not the
+                                                  * filetype, or *Cat and
+                                                  * the Filer read files as
+                                                  * directories (DWR/) */
             }
             for (uint32_t k = 0; k < ((namelen + 1 + 3) & ~3u); k++) {
                 buf[20 + k] = k <= namelen ? e->name[k] : 0;
