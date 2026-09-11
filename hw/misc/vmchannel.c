@@ -157,10 +157,16 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         *rc = VMCH_RC_BADPATH;
         return NULL;
     }
-    if (fresh && out != p + strlen(s->root) + 1) {
-        g_free(p);                      /* trailing '.' */
+    if (fresh && out > p + strlen(s->root) + 1) {
+        g_free(p);                      /* trailing '.' after a component */
         *rc = VMCH_RC_BADPATH;
         return NULL;
+    }
+    /* Bare "$" (out at root) and "$." (out at root + separator) both
+     * name the root itself; strip a lone trailing separator so the host
+     * sees the directory, not "dir/". */
+    if (out > p + strlen(s->root) && out[-1] == G_DIR_SEPARATOR) {
+        out--;
     }
     *out = '\0';
     return p;

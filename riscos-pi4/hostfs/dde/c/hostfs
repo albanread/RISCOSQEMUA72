@@ -36,7 +36,7 @@ typedef unsigned char  uint8_t;
 #define VMCH_MAGIC_VALUE 0x48434D56u
 #define VMCH_FEATURE_FS 0x1u
 
-#define VMCH_MAX_ARG 8192
+#define VMCH_MAX_ARG 4032   /* 64-byte header + 4032 = one 4 KB page */
 #define VMCH_MAX_OPEN 16                 /* device handle slots (1-based) */
 
 /* The request block, mirroring include/hw/misc/vmchannel.h exactly.
@@ -98,8 +98,9 @@ struct vmreq {
 /* the doorbell's logical window, from OS_Memory 13 in init */
 static volatile uint32_t *vmch;
 
-static uint8_t reqstore[sizeof(struct vmreq) + 16];
+static uint8_t reqstore[sizeof(struct vmreq) + 4096];   /* room to page-align */
 static struct vmreq *req;
+static uint32_t req_phys;          /* the block's physical address, for the doorbell */
 static uint32_t seq;
 
 /* Per-handle state, for FSEntry_Args: the doorbell is stateless (each
@@ -138,7 +139,8 @@ static _kernel_oserror *rc_to_error(uint32_t rc)
 static uint32_t vmch_go(void)
 {
     req->seq = ++seq;
-    vmch_reg(VMCH_CMD / 4) = (uint32_t)req;
+    req->rc = 0xFFFFFFFFu;             /* poison: an unanswered request stays visible */
+    vmch_reg(VMCH_CMD / 4) = req_phys; /* the device DMAs physical, not logical */
     return req->rc;
 }
 
@@ -330,6 +332,22 @@ static _kernel_oserror *ensure_vmch(void)
     }
     if (!(v[VMCH_FEATURES / 4] & VMCH_FEATURE_FS)) {
         return &err_nofs;
+    }
+    /* The device DMAs physical addresses.  The block is one page-aligned
+     * page, so a single OS_Memory 0 translation covers all of it. */
+    {
+        struct pbrec pb;
+        _kernel_swi_regs pr;
+        pb.page = -1;
+        pb.log = (uint32_t)req;
+        pb.phys = 0;
+        pr.r[0] = (1u << 9) | (1u << 13);
+        pr.r[1] = (int)&pb;
+        pr.r[2] = 1;
+        if (_kernel_swi(XOS_Memory, &pr, &pr) != NULL || pb.phys == 0) {
+            return &err_nomap;
+        }
+        req_phys = pb.phys;
     }
     vmch = v;
     return NULL;
@@ -869,8 +887,9 @@ _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
     (void)cmd_tail;
     (void)podule_base;
 
-    /* line the request block up to the doorbell's 16-byte mask */
-    req = (struct vmreq *)(((uint32_t)reqstore + 15u) & ~15u);
+    /* page-align the request block: it is exactly one page, so one
+     * logical->physical translation covers every byte the device reads */
+    req = (struct vmreq *)(((uint32_t)reqstore + 4095u) & ~4095u);
 
     /* The doorbell is mapped on first use (see ensure_vmch): mapping
      * from init fails because the IO area is off-limits mid-load. */

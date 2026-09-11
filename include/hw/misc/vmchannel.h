@@ -99,7 +99,7 @@
 
 #define VMCH_MAX_OPEN 16
 #define VMCH_MAX_NAME 48
-#define VMCH_MAX_ARG  8192
+#define VMCH_MAX_ARG  4032   /* one page: 64-byte header + 4032 */
 
 #define TYPE_VMCHANNEL "vmchannel"
 OBJECT_DECLARE_SIMPLE_TYPE(VMChannelState, VMCHANNEL)
