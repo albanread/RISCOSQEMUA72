@@ -30,6 +30,12 @@
 #include "migration/snapshot.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
+#include "qemu/thread.h"
+#include "qemu/timer.h"
+#include "system/reset.h"
+#include "block/snapshot.h"
+#include "standard-headers/linux/input-event-codes.h"
+#include <zlib.h>
 
 void metal_backend_request_shutdown(void)
 {
@@ -202,6 +208,55 @@ static const ScriptCmd script_cmds[] = {
     { "describe", "MQemDesc",
       "The whole command table as JSON: names, help, arguments, classes.",
       NULL, 'f' },
+    { "state", "MQemStat",
+      "Machine counters: run state, uptime, frame gen and count, input and event counters, display mode.",
+      NULL, 'f' },
+    { "video", "MQemVOpt",
+      "Set video options; omitted keys are unchanged. Reply is as applied.",
+      "scaling int (0 linear, 1 sharp, 2 nearest), scanlines bool, vsync int Hz, waiting int s",
+      'f' },
+    { "pause", "MQemPaus",
+      "Stop the virtual CPUs; the reply envelope reports the paused state.",
+      NULL, 'b' },
+    { "resume", "MQemResu",
+      "Continue the virtual CPUs after a pause.",
+      NULL, 'b' },
+    { "reset", "MQemRset",
+      "Reset the machine. Destructive: needs dangerous true.",
+      "dangerous bool", 'b' },
+    { "poweroff", "MQemPowr",
+      "Power off the way the window close does, disc written back. Destructive: needs dangerous true.",
+      "dangerous bool", 'b' },
+    { "savevm", "MQemSnSv",
+      "Save an internal snapshot on the machine disc. Overwriting an existing name needs dangerous true.",
+      "name str, overwrite bool, dangerous bool, waiting int s", 'b' },
+    { "loadvm", "MQemSnLd",
+      "Load an internal snapshot and resume: the Machine menu path, generalised.",
+      "name str, waiting int s", 'b' },
+    { "listvm", "MQemSnLs",
+      "List the internal snapshots on the machine disc.",
+      NULL, 'b' },
+    { "screendump", "MQemDump",
+      "Write the guest framebuffer as PNG into the app support directory: the truth, no decode.",
+      "name str, waiting int s", 'b' },
+    { "screenshot", "MQemShot",
+      "Write the decoded Metal surface as PNG into the app support directory.",
+      "name str", 'f' },
+    { "key", "MQemKeyD",
+      "One key event: a macOS virtual keycode, down or up.",
+      "keycode int, down bool", 'f' },
+    { "type", "MQemType",
+      "Type ASCII text through the US keymap, shifted punctuation included.",
+      "text str", 'f' },
+    { "mouse", "MQemMous",
+      "Move the pointer to guest pixel coordinates on the current screen.",
+      "x int, y int", 'f' },
+    { "click", "MQemClkM",
+      "Press a mouse button (0 left, 1 middle, 2 right); without down, the full click.",
+      "button int, down bool", 'f' },
+    { "wheel", "MQemWhl ",
+      "Scroll notches; positive is away from the user.",
+      "notches int", 'f' },
 };
 /* SCRIPT-TABLE-END */
 
@@ -267,15 +322,34 @@ static char *json_escape(const char *s)
 
 /* The machine block that rides on every reply, so an agent's next
  * decision needs no extra round trip.  E0 measured the whole event at
- * 16.7 ms; this BQL-taking read is not the cost. */
+ * 16.7 ms; this BQL-taking read is not the cost.  The framebuffer view
+ * is gathered after the lock, the way the render loop gathers it (the
+ * mapping is owned by this thread); frame_gen and frames are the two
+ * numbers that answer did anything change. */
 static char *script_machine_block(void)
 {
+    MetalFbView v;
     const char *state;
+    uint64_t uptime;
+    int have_fb;
 
     bql_lock();
     state = RunState_str(runstate_get());
+    uptime = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bql_unlock();
-    return g_strdup_printf("\"machine\":{\"state\":\"%s\"}", state);
+
+    have_fb = metal_glue_fb_view(&v);
+    if (have_fb) {
+        return g_strdup_printf(
+            "\"machine\":{\"state\":\"%s\",\"uptime_ns\":%" PRIu64 ","
+            "\"frame_gen\":%u,\"frames\":%u,\"mode\":\"%ux%ux%u\"}",
+            state, uptime, v.generation, metal_ui_frame_count(),
+            v.xres, v.yres, v.bpp);
+    }
+    return g_strdup_printf(
+        "\"machine\":{\"state\":\"%s\",\"uptime_ns\":%" PRIu64 ","
+        "\"frame_gen\":0,\"frames\":%u,\"mode\":null}",
+        state, uptime, metal_ui_frame_count());
 }
 
 static char *script_envelope(bool ok, const char *data_json, int err,
@@ -331,6 +405,637 @@ static char *script_describe(void)
     return g_string_free(s, FALSE);
 }
 
+/* ------------------------------------------------------------------ */
+/* E2: the control commands                                            */
+
+/* Every event the surface answers, for the state command. */
+static uint32_t script_ae_events;
+
+/* Input injections, counted where they enter QEMU so the count covers
+ * both the window's events and the surface's. */
+static struct {
+    uint32_t keys;
+    uint32_t mouse_moves;
+    uint32_t mouse_buttons;
+} cnt;
+
+/* Argument readers over the direct parameter's JSON object.  A missing
+ * key is simply the default; type mismatches are the qdict helpers'
+ * defaults too, which keeps the surface forgiving in the way the wire
+ * lessons said agents need. */
+static bool arg_bool(const QDict *q, const char *key, bool dflt)
+{
+    return q ? qdict_get_try_bool(q, key, dflt) : dflt;
+}
+
+static int64_t arg_int(const QDict *q, const char *key, int64_t dflt)
+{
+    return q ? qdict_get_try_int(q, key, dflt) : dflt;
+}
+
+static const char *arg_str(const QDict *q, const char *key)
+{
+    return q ? qdict_get_try_str(q, key) : NULL;
+}
+
+/*
+ * Writes are confined (SCRIPTING.md section 7): screenshots and
+ * screendumps land under ~/Library/Application Support/RISCOSQEMU only.
+ * A caller-supplied name is a leaf, never a path: letters, digits,
+ * dot, underscore and hyphen, and it may not start with a dot.  NULL
+ * or empty picks the next numbered name.  Returns a script error code
+ * with *errmsg set, or SCRIPT_OK with the full path in buf.
+ */
+static int script_out_path(const char *name, const char *prefix,
+                           char *buf, size_t buflen, const char **errmsg)
+{
+    const char *home = g_get_home_dir();
+    char dir[PATH_MAX];
+
+    if (!home) {
+        *errmsg = "no home directory for the app support directory";
+        return SCRIPT_E_NOT_CAPABLE;
+    }
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/RISCOSQEMU",
+             home);
+    if (g_mkdir_with_parents(dir, 0700) != 0 && errno != EEXIST) {
+        *errmsg = "cannot create the app support directory";
+        return SCRIPT_E_NOT_CAPABLE;
+    }
+
+    if (name && *name) {
+        const char *c;
+
+        for (c = name; *c; c++) {
+            if (!g_ascii_isalnum(*c) && *c != '.' && *c != '_'
+                && *c != '-') {
+                *errmsg = "the name must be a plain file name, not a path";
+                return SCRIPT_E_DENIED;
+            }
+        }
+        if (name[0] == '.') {
+            *errmsg = "the name may not start with a dot";
+            return SCRIPT_E_DENIED;
+        }
+        snprintf(buf, buflen, "%s/%s.png", dir, name);
+        return SCRIPT_OK;
+    }
+
+    for (unsigned n = 1; n < 100000; n++) {
+        snprintf(buf, buflen, "%s/%s-%05u.png", dir, prefix, n);
+        if (access(buf, F_OK) != 0) {
+            return SCRIPT_OK;
+        }
+    }
+    *errmsg = "no free screenshot number";
+    return SCRIPT_E_NOT_CAPABLE;
+}
+
+/* A minimal RGB8 PNG writer: filter byte 0 per scanline, one IDAT.
+ * The front end's Python counterparts proved this layout; zlib is
+ * already a QEMU dependency. */
+static bool png_chunk(FILE *f, const char type[4], const void *data,
+                      size_t len)
+{
+    uint32_t be = cpu_to_be32(len);
+    uint32_t crc = crc32(crc32(0, Z_NULL, 0), (const Bytef *)type, 4);
+    bool ok;
+
+    if (data && len) {
+        crc = crc32(crc, data, len);
+    }
+    ok = fwrite(&be, 4, 1, f) == 1;
+    ok &= fwrite(type, 4, 1, f) == 1;
+    if (data && len) {
+        ok &= fwrite(data, len, 1, f) == 1;
+    }
+    be = cpu_to_be32(crc);
+    ok &= fwrite(&be, 4, 1, f) == 1;
+    return ok;
+}
+
+static bool script_png_write(const char *path, uint32_t w, uint32_t h,
+                             const uint8_t *rgb)
+{
+    size_t rowlen = (size_t)w * 3;
+    size_t rawlen = (size_t)h * (rowlen + 1);
+    uint8_t *raw = g_malloc(rawlen);
+    uLongf clen = compressBound(rawlen);
+    uint8_t *comp = g_malloc(clen);
+    uint8_t ihdr[13];
+    FILE *f;
+    bool ok;
+
+    for (uint32_t y = 0; y < h; y++) {
+        raw[y * (rowlen + 1)] = 0;         /* filter: none */
+        memcpy(&raw[y * (rowlen + 1) + 1], &rgb[(size_t)y * rowlen], rowlen);
+    }
+    if (compress2(comp, &clen, raw, rawlen, 6) != Z_OK) {
+        g_free(comp);
+        g_free(raw);
+        return false;
+    }
+    stl_be_p(&ihdr[0], w);
+    stl_be_p(&ihdr[4], h);
+    ihdr[8] = 8;                            /* bit depth */
+    ihdr[9] = 2;                            /* colour type: truecolor RGB */
+    ihdr[10] = ihdr[11] = ihdr[12] = 0;
+
+    f = fopen(path, "wb");
+    if (!f) {
+        g_free(comp);
+        g_free(raw);
+        return false;
+    }
+    ok = fwrite("\x89PNG\r\n\x1a\n", 8, 1, f) == 1
+         && png_chunk(f, "IHDR", ihdr, sizeof(ihdr))
+         && png_chunk(f, "IDAT", comp, clen)
+         && png_chunk(f, "IEND", NULL, 0);
+    ok &= fclose(f) == 0;
+    g_free(comp);
+    g_free(raw);
+    return ok;
+}
+
+/*
+ * The screendump: the guest framebuffer, read from the device the same
+ * way the decode shader reads it (offsets only when the viewport
+ * exceeds the physical screen; palette words 0x00BBGGRR at the VideoCore
+ * base for the palettised modes).  Runs inside the bottom half, BQL
+ * held; the reply is the path and the config generation it captured.
+ */
+static BCM2835FBState *script_fb;
+
+static int script_screendump(const char *name, char **data, char **errmsg)
+{
+    BCM2835FBConfig cfg;
+    uint32_t gen, pitch, bypp, rowlen, xo, yo;
+    uint8_t *raw = NULL, *pal = NULL, *rgb;
+    char path[PATH_MAX];
+    g_autofree char *epath = NULL;
+    int rc;
+
+    if (!script_fb) {
+        Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+
+        if (!obj) {
+            *errmsg = g_strdup("no framebuffer device");
+            return SCRIPT_E_NOT_CAPABLE;
+        }
+        script_fb = BCM2835_FB(obj);
+    }
+    gen = bcm2835_fb_get_config(script_fb, &cfg);
+    if (!cfg.xres || !cfg.yres) {
+        *errmsg = g_strdup("no framebuffer mode yet");
+        return SCRIPT_E_NOT_CAPABLE;
+    }
+    bypp = (cfg.bpp + 7) / 8;
+    pitch = bcm2835_fb_get_pitch(&cfg);
+    if (cfg.xres_virtual > cfg.xres || cfg.yres_virtual > cfg.yres) {
+        xo = cfg.xoffset;
+        yo = cfg.yoffset;
+    } else {
+        xo = yo = 0;
+    }
+
+    raw = g_malloc_n(cfg.yres, rowlen = cfg.xres * bypp);
+    for (uint32_t y = 0; y < cfg.yres; y++) {
+        address_space_read(&script_fb->dma_as,
+                           cfg.base + ((uint64_t)(yo + y) * pitch
+                                       + (uint64_t)xo * bypp),
+                           MEMTXATTRS_UNSPECIFIED,
+                           raw + (uint64_t)y * rowlen, rowlen);
+    }
+    if (cfg.bpp <= 8) {
+        pal = g_malloc(256 * 4);
+        address_space_read(&script_fb->dma_as, script_fb->vcram_base,
+                           MEMTXATTRS_UNSPECIFIED, pal, 256 * 4);
+    }
+
+    rgb = g_malloc_n((size_t)cfg.xres * cfg.yres, 3);
+    for (uint32_t y = 0; y < cfg.yres; y++) {
+        const uint8_t *row = raw + (uint64_t)y * rowlen;
+
+        for (uint32_t x = 0; x < cfg.xres; x++) {
+            uint8_t *o = &rgb[((uint64_t)y * cfg.xres + x) * 3];
+            uint32_t r = 0, g = 0, b = 0;
+
+            if (cfg.bpp == 32) {
+                r = row[x * 4 + 0];
+                g = row[x * 4 + 1];
+                b = row[x * 4 + 2];
+                if (cfg.pixo == 0) {
+                    uint32_t t = r; r = b; b = t;    /* BGR order */
+                }
+            } else if (cfg.bpp == 24) {
+                r = row[x * 3 + 0];
+                g = row[x * 3 + 1];
+                b = row[x * 3 + 2];
+            } else if (cfg.bpp == 16) {
+                uint32_t w16 = row[x * 2] | ((uint32_t)row[x * 2 + 1] << 8);
+
+                r = ((w16 >> 11) & 31) * 255 / 31;
+                g = ((w16 >> 5) & 63) * 255 / 63;
+                b = (w16 & 31) * 255 / 31;
+            } else {
+                uint32_t byte = row[x * cfg.bpp / 8];
+                uint32_t idx = (byte >> ((x * cfg.bpp) & 7))
+                               & ((1u << cfg.bpp) - 1);
+
+                r = pal[idx * 4 + 0];
+                g = pal[idx * 4 + 1];
+                b = pal[idx * 4 + 2];
+            }
+            o[0] = r;
+            o[1] = g;
+            o[2] = b;
+        }
+    }
+    g_free(raw);
+    g_free(pal);
+
+    rc = script_out_path(name, "screendump", path, sizeof(path),
+                         (const char **)errmsg);
+    if (rc != SCRIPT_OK) {
+        g_free(rgb);
+        return rc;               /* *errmsg is a literal here */
+    }
+    if (!script_png_write(path, cfg.xres, cfg.yres, rgb)) {
+        g_free(rgb);
+        *errmsg = g_strdup("the PNG could not be written");
+        return SCRIPT_E_NOT_CAPABLE;
+    }
+    g_free(rgb);
+    epath = json_escape(path);
+    *data = g_strdup_printf("{\"path\":\"%s\",\"frame_gen\":%u}",
+                            epath, gen);
+    return SCRIPT_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Typing: ASCII to linux key codes, the same entry point the osx      */
+/* keymap feeds.  US layout spelling for the shifted punctuation,      */
+/* documented in the command's help.                                   */
+
+static void script_send_linux(unsigned lnx, bool down)
+{
+    cnt.keys++;                 /* typed text counts as key events too */
+    bql_lock();
+    qemu_input_event_send_key_linux(NULL, lnx, down);
+    bql_unlock();
+}
+
+static int script_key_for_char(char c, unsigned *code, bool *shift)
+{
+    *shift = false;
+    if (c >= 'a' && c <= 'z') {
+        *code = KEY_A + (c - 'a');
+        return 0;
+    }
+    if (c >= 'A' && c <= 'Z') {
+        *code = KEY_A + (c - 'A');
+        *shift = true;
+        return 0;
+    }
+    if (c >= '1' && c <= '9') {
+        *code = KEY_1 + (c - '1');
+        return 0;
+    }
+    switch (c) {
+    case '0': *code = KEY_0; return 0;
+    case ' ': *code = KEY_SPACE; return 0;
+    case '\n': case '\r': *code = KEY_ENTER; return 0;
+    case '\t': *code = KEY_TAB; return 0;
+    case '!': *code = KEY_1; *shift = true; return 0;
+    case '@': *code = KEY_2; *shift = true; return 0;
+    case '#': *code = KEY_3; *shift = true; return 0;
+    case '$': *code = KEY_4; *shift = true; return 0;
+    case '%': *code = KEY_5; *shift = true; return 0;
+    case '^': *code = KEY_6; *shift = true; return 0;
+    case '&': *code = KEY_7; *shift = true; return 0;
+    case '*': *code = KEY_8; *shift = true; return 0;
+    case '(': *code = KEY_9; *shift = true; return 0;
+    case ')': *code = KEY_0; *shift = true; return 0;
+    case '-': *code = KEY_MINUS; return 0;
+    case '_': *code = KEY_MINUS; *shift = true; return 0;
+    case '=': *code = KEY_EQUAL; return 0;
+    case '+': *code = KEY_EQUAL; *shift = true; return 0;
+    case '[': *code = KEY_LEFTBRACE; return 0;
+    case '{': *code = KEY_LEFTBRACE; *shift = true; return 0;
+    case ']': *code = KEY_RIGHTBRACE; return 0;
+    case '}': *code = KEY_RIGHTBRACE; *shift = true; return 0;
+    case '\\': *code = KEY_BACKSLASH; return 0;
+    case '|': *code = KEY_BACKSLASH; *shift = true; return 0;
+    case ';': *code = KEY_SEMICOLON; return 0;
+    case ':': *code = KEY_SEMICOLON; *shift = true; return 0;
+    case '\'': *code = KEY_APOSTROPHE; return 0;
+    case '"': *code = KEY_APOSTROPHE; *shift = true; return 0;
+    case '`': *code = KEY_GRAVE; return 0;
+    case '~': *code = KEY_GRAVE; *shift = true; return 0;
+    case ',': *code = KEY_COMMA; return 0;
+    case '<': *code = KEY_COMMA; *shift = true; return 0;
+    case '.': *code = KEY_DOT; return 0;
+    case '>': *code = KEY_DOT; *shift = true; return 0;
+    case '/': *code = KEY_SLASH; return 0;
+    case '?': *code = KEY_SLASH; *shift = true; return 0;
+    default:
+        return -1;
+    }
+}
+
+static char *cmd_type(const QDict *q, int *err, const char **errmsg)
+{
+    const char *text = arg_str(q, "text");
+    unsigned typed = 0;
+
+    if (!text || !*text) {
+        *err = SCRIPT_E_INVALID;
+        *errmsg = "text is required";
+        return NULL;
+    }
+    if (strlen(text) > 256) {
+        *err = SCRIPT_E_INVALID;
+        *errmsg = "text is capped at 256 characters";
+        return NULL;
+    }
+    for (const char *c = text; *c; c++) {
+        unsigned code;
+        bool shift;
+
+        if (script_key_for_char(*c, &code, &shift)) {
+            *err = SCRIPT_E_INVALID;
+            *errmsg = "only ASCII printable text is supported in v1";
+            return NULL;
+        }
+        if (shift) {
+            script_send_linux(KEY_LEFTSHIFT, true);
+        }
+        script_send_linux(code, true);
+        script_send_linux(code, false);
+        if (shift) {
+            script_send_linux(KEY_LEFTSHIFT, false);
+        }
+        typed++;
+    }
+    return g_strdup_printf("{\"typed\":%u}", typed);
+}
+
+/* ------------------------------------------------------------------ */
+/* The fast commands' replies                                          */
+
+static char *cmd_state(void)
+{
+    MetalFbView v;
+    const char *state;
+    uint64_t uptime;
+    char mode[32];
+    int have_fb;
+
+    bql_lock();
+    state = RunState_str(runstate_get());
+    uptime = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bql_unlock();
+    have_fb = metal_glue_fb_view(&v);
+    if (have_fb) {
+        snprintf(mode, sizeof(mode), "\"%ux%ux%u\"", v.xres, v.yres, v.bpp);
+    } else {
+        strcpy(mode, "null");
+    }
+    return g_strdup_printf(
+        "{\"state\":\"%s\",\"uptime_ns\":%" PRIu64 ",\"frame_gen\":%u,"
+        "\"frames\":%u,\"mode\":%s,\"keys\":%u,\"mouse_moves\":%u,"
+        "\"mouse_buttons\":%u,\"ae_events\":%u}",
+        state, uptime, have_fb ? v.generation : 0, metal_ui_frame_count(),
+        mode, cnt.keys, cnt.mouse_moves, cnt.mouse_buttons,
+        script_ae_events);
+}
+
+static char *cmd_video(const QDict *q, int *err, const char **errmsg)
+{
+    int scaling, cur_scaling, vsync;
+    bool scanlines, cur_scan;
+
+    metal_ui_video_opts(&cur_scaling, &cur_scan);
+    scaling = q ? qdict_get_try_int(q, "scaling", cur_scaling) : cur_scaling;
+    scanlines = q ? qdict_get_try_bool(q, "scanlines", cur_scan) : cur_scan;
+    if (scaling < 0 || scaling > 2) {
+        *err = SCRIPT_E_INVALID;
+        *errmsg = "scaling is 0 linear, 1 sharp or 2 nearest";
+        return NULL;
+    }
+    metal_glue_video_opts(scaling, scanlines ? 1 : 0);
+
+    vsync = q ? qdict_get_try_int(q, "vsync", -1) : -1;
+    if (vsync != -1) {
+        bool ok;
+
+        if (vsync < 0 || vsync > 1000) {
+            *err = SCRIPT_E_INVALID;
+            *errmsg = "vsync is 0 to 1000 Hz";
+            return NULL;
+        }
+        bql_lock();
+        ok = metal_glue_set_vsync_hz(vsync);
+        bql_unlock();
+        if (!ok) {
+            *err = SCRIPT_E_NOT_CAPABLE;
+            *errmsg = "this machine has no vertical-sync generator";
+            return NULL;
+        }
+        return g_strdup_printf("{\"scaling\":%d,\"scanlines\":%s,"
+                               "\"vsync_hz\":%d}", scaling,
+                               scanlines ? "true" : "false", vsync);
+    }
+    return g_strdup_printf("{\"scaling\":%d,\"scanlines\":%s,"
+                           "\"vsync_hz\":null}", scaling,
+                           scanlines ? "true" : "false");
+}
+
+/* ------------------------------------------------------------------ */
+/* The bottom-half class: schedule on the main loop, wait on the       */
+/* semaphore (SCRIPTING.md section 4's threading rules).  The waiting  */
+/* UI thread holds no lock; the bottom half never calls into it.       */
+
+static struct {
+    QEMUBH *bh;
+    QemuSemaphore sem;
+    bool armed;                 /* scheduled or running */
+    /* set by the UI thread before scheduling */
+    const ScriptCmd *cmd;
+    QDict *args;                /* ref held until the next reset */
+    /* filled by the bottom half */
+    char *data;                 /* heap; owned here until collected */
+    char *errmsg;               /* heap; owned here until collected */
+    int err;
+} sbh;
+
+static void script_bh_fn(void *opaque)
+{
+    const char *name = sbh.cmd->name;
+    const QDict *args = sbh.args;
+    char *data = NULL, *msg = NULL;
+    Error *verr = NULL;
+    int err = SCRIPT_OK;
+
+    /* Main loop, BQL held: the hmp/qmp sequences, verbatim. */
+    if (!strcmp(name, "pause")) {
+        vm_stop(RUN_STATE_PAUSED);
+        data = g_strdup("{\"state\":\"paused\"}");
+    } else if (!strcmp(name, "resume")) {
+        if (runstate_check(RUN_STATE_SHUTDOWN)) {
+            err = SCRIPT_E_WRONG_STATE;
+            msg = g_strdup("the machine is powering off");
+        } else {
+            vm_start();
+            data = g_strdup_printf("{\"state\":\"%s\"}",
+                                   RunState_str(runstate_get()));
+        }
+    } else if (!strcmp(name, "reset")) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
+        data = g_strdup("{\"state\":\"resetting\"}");
+    } else if (!strcmp(name, "poweroff")) {
+        metal_backend_request_shutdown();
+        data = g_strdup("{\"powering_off\":true}");
+    } else if (!strcmp(name, "savevm")) {
+        const char *sn = arg_str(args, "name");
+
+        if (!sn || !*sn) {
+            err = SCRIPT_E_INVALID;
+            msg = g_strdup("a snapshot name is required");
+        } else if (!save_snapshot(sn, arg_bool(args, "overwrite", false),
+                                  NULL, false, NULL, &verr)) {
+            err = SCRIPT_E_INVALID;
+            msg = g_strdup(error_get_pretty(verr));
+            error_free(verr);
+        } else {
+            data = g_strdup_printf("{\"saved\":true,\"name\":\"%s\"}", sn);
+        }
+    } else if (!strcmp(name, "loadvm")) {
+        const char *sn = arg_str(args, "name");
+
+        if (!sn || !*sn) {
+            err = SCRIPT_E_INVALID;
+            msg = g_strdup("a snapshot name is required");
+        } else {
+            RunState saved = runstate_get();
+
+            vm_stop(RUN_STATE_RESTORE_VM);
+            if (load_snapshot(sn, NULL, false, NULL, &verr)) {
+                load_snapshot_resume(saved);
+                data = g_strdup_printf("{\"loaded\":true,\"name\":\"%s\"}",
+                                       sn);
+            } else {
+                const char *pretty = error_get_pretty(verr);
+
+                err = strstr(pretty, "snapshot") || strstr(pretty, "exist")
+                          ? SCRIPT_E_NOT_FOUND : SCRIPT_E_INVALID;
+                msg = g_strdup(pretty);
+                error_free(verr);
+            }
+        }
+    } else if (!strcmp(name, "listvm")) {
+        BlockDriverState *bs = bdrv_all_find_vmstate_bs(NULL, false, NULL,
+                                                        &verr);
+
+        if (!bs) {
+            if (verr) {
+                error_free(verr);
+            }
+            err = SCRIPT_E_NOT_CAPABLE;
+            msg = g_strdup("no block device carries machine state");
+        } else {
+            QEMUSnapshotInfo *tab = NULL;
+            int n = bdrv_snapshot_list(bs, &tab);
+
+            if (n < 0) {
+                err = SCRIPT_E_INVALID;
+                msg = g_strdup("cannot list the snapshots on the disc");
+            } else {
+                GString *s = g_string_new("[");
+
+                for (int i = 0; i < n; i++) {
+                    g_string_append_printf(s,
+                        "%s{\"name\":\"%s\",\"id\":\"%s\",\"date_sec\":%u,"
+                        "\"vm_state_size\":%" PRIu64 "}",
+                        i ? "," : "", tab[i].name, tab[i].id_str,
+                        tab[i].date_sec, tab[i].vm_state_size);
+                }
+                g_string_append(s, "]");
+                data = g_string_free(s, FALSE);
+                g_free(tab);
+            }
+        }
+    } else if (!strcmp(name, "screendump")) {
+        err = script_screendump(arg_str(args, "name"), &data, &msg);
+    } else {
+        g_assert_not_reached();
+    }
+
+    sbh.data = data;
+    sbh.errmsg = msg;
+    sbh.err = err;
+    sbh.armed = false;
+    qemu_sem_post(&sbh.sem);
+}
+
+/* Returns the reply data, or NULL with the error outputs set.
+ * A timeout leaves the bottom half running and the next command busy. */
+static char *script_run_bh(const ScriptCmd *c, QDict *qdict, int *err,
+                           char **errmsg_dyn, const char **errmsg,
+                           int64_t waiting_s)
+{
+    char *data;
+
+    if (sbh.armed) {
+        *err = SCRIPT_E_BUSY;
+        *errmsg = "another command is still in flight";
+        return NULL;
+    }
+    if (!sbh.bh) {
+        qemu_sem_init(&sbh.sem, 0);
+        sbh.bh = qemu_bh_new(script_bh_fn, NULL);
+    }
+    /* drain a completion that arrived after an earlier timeout; only
+     * now is the semaphore certain to be initialised (the first ever
+     * call used to reach this drain first and abort on the zeroed
+     * mutex inside, which one crashed pause taught us) */
+    while (qemu_sem_timedwait(&sbh.sem, 0) == 0) {
+    }
+    if (sbh.args) {
+        qobject_unref(sbh.args);
+        sbh.args = NULL;
+    }
+    g_free(sbh.data);
+    sbh.data = NULL;
+    g_free(sbh.errmsg);
+    sbh.errmsg = NULL;
+    sbh.err = SCRIPT_OK;
+
+    sbh.cmd = c;
+    sbh.args = qdict;
+    if (qdict) {
+        qobject_ref(qdict);
+    }
+    sbh.armed = true;
+    qemu_bh_schedule(sbh.bh);
+
+    if (qemu_sem_timedwait(&sbh.sem, (int)MIN(waiting_s * 1000, INT_MAX))
+        != 0) {
+        *err = SCRIPT_E_TIMEOUT;
+        *errmsg = "waiting expired; the operation continues";
+        return NULL;
+    }
+    if (sbh.err != SCRIPT_OK) {
+        *err = sbh.err;
+        *errmsg_dyn = sbh.errmsg;
+        sbh.errmsg = NULL;
+        return NULL;
+    }
+    data = sbh.data;
+    sbh.data = NULL;
+    return data;
+}
+
 bool metal_glue_script(uint32_t event_class, uint32_t event_id,
                        const char *json, char **reply)
 {
@@ -338,19 +1043,34 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
     QDict *qdict = NULL;
     const ScriptCmd *cmd = NULL;
     char *data = NULL;
+    char *errmsg_dyn = NULL;
     int err = SCRIPT_OK;
     const char *errmsg = NULL;
+    int64_t waiting;
     unsigned i;
 
     *reply = NULL;
+    script_ae_events++;
+
+    /*
+     * The standard quit event routes to the clean power off, the same
+     * path the window close takes (never -[NSApp terminate:], for the
+     * reason quitAction records).  It is not in the table: AppleScript
+     * addresses it through Apple's own terminology.
+     */
+    if (event_class == 0x61657674u && event_id == 0x71756974u) {
+        metal_backend_request_shutdown();
+        data = g_strdup("{\"quitting\":true}");
+        goto out;
+    }
 
     /*
      * Handlers arrive on the UI thread only and fast commands answer
      * inline, so execution is single-flight by construction.  The
-     * waiting parameter (seconds, clamped here, default 10, max 60)
-     * is accepted and becomes live with the bottom-half class in E2;
-     * a timeout will complete the operation and report rather than
-     * cancel it.
+     * bottom-half class waits on its semaphore for up to waiting
+     * seconds (default 10, clamped to 1 to 60); a timeout completes
+     * the operation and reports rather than cancel it, and the next
+     * command is busy until it lands.
      */
     if (json) {
         qdict = qobject_to(QDict, qobject_from_json(json, NULL));
@@ -360,6 +1080,8 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
             goto out;
         }
     }
+    waiting = arg_int(qdict, "waiting", 10);
+    waiting = MIN(MAX(waiting, 1), 60);
 
     /* The event id is authoritative: it is the command AppleScript
      * addressed through the terminology.  A "cmd" key in a JSON
@@ -398,20 +1120,121 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
         goto out;
     }
 
-    if (cmd == &script_cmds[0]) {           /* ping */
+    if (!strcmp(cmd->name, "ping")) {
         data = g_strdup_printf(
             "{\"app\":\"RISCOSQEMU\",\"qemu\":\"%s\",\"pid\":%d,"
             "\"surface\":1}",
             QEMU_VERSION, (int)getpid());
-    } else if (cmd == &script_cmds[1]) {    /* describe */
+    } else if (!strcmp(cmd->name, "describe")) {
         data = script_describe();
+    } else if (!strcmp(cmd->name, "state")) {
+        data = cmd_state();
+    } else if (!strcmp(cmd->name, "video")) {
+        data = cmd_video(qdict, &err, &errmsg);
+    } else if (!strcmp(cmd->name, "screenshot")) {
+        char path[PATH_MAX];
+        MetalFbView v;
+        int have_fb = metal_glue_fb_view(&v);
+        int rc = script_out_path(arg_str(qdict, "name"), "screenshot",
+                                 path, sizeof(path), &errmsg);
+
+        if (rc != SCRIPT_OK) {
+            err = rc;
+        } else if (!have_fb) {
+            err = SCRIPT_E_NOT_CAPABLE;
+            errmsg = "no framebuffer to capture yet";
+        } else if (!metal_ui_screenshot(path)) {
+            err = SCRIPT_E_NOT_CAPABLE;
+            errmsg = "the PNG could not be written";
+        } else {
+            g_autofree char *epath = json_escape(path);
+
+            data = g_strdup_printf("{\"path\":\"%s\",\"frame_gen\":%u}",
+                                   epath, v.generation);
+        }
+    } else if (!strcmp(cmd->name, "key")) {
+        int64_t keycode = arg_int(qdict, "keycode", -1);
+
+        if (keycode < 0 || keycode > 127) {
+            err = SCRIPT_E_INVALID;
+            errmsg = "keycode is a macOS virtual key code, 0 to 127";
+        } else {
+            metal_glue_key(arg_bool(qdict, "down", true), keycode);
+            data = g_strdup("{\"sent\":true}");
+        }
+    } else if (!strcmp(cmd->name, "type")) {
+        data = cmd_type(qdict, &err, &errmsg);
+    } else if (!strcmp(cmd->name, "mouse")) {
+        MetalFbView v;
+        int64_t x = arg_int(qdict, "x", INT64_MIN);
+        int64_t y = arg_int(qdict, "y", INT64_MIN);
+
+        if (x == INT64_MIN || y == INT64_MIN) {
+            err = SCRIPT_E_INVALID;
+            errmsg = "x and y are required, guest pixels";
+        } else if (!metal_glue_fb_view(&v)) {
+            err = SCRIPT_E_NOT_CAPABLE;
+            errmsg = "no screen to move on yet";
+        } else {
+            metal_glue_mouse_abs(x, y, v.xres, v.yres);
+            data = g_strdup_printf("{\"moved\":true,\"x\":%d,\"y\":%d}",
+                                   (int)x, (int)y);
+        }
+    } else if (!strcmp(cmd->name, "click")) {
+        int64_t button = arg_int(qdict, "button", 0);
+        bool full = qdict ? !qdict_haskey(qdict, "down") : true;
+
+        if (button < 0 || button > 2) {
+            err = SCRIPT_E_INVALID;
+            errmsg = "button is 0 left, 1 middle or 2 right";
+        } else if (full) {
+            metal_glue_mouse_btn(button, true);
+            metal_glue_mouse_btn(button, false);
+            data = g_strdup_printf("{\"clicked\":true,\"button\":%d}",
+                                   (int)button);
+        } else {
+            metal_glue_mouse_btn(button, arg_bool(qdict, "down", true));
+            data = g_strdup_printf("{\"clicked\":true,\"button\":%d}",
+                                   (int)button);
+        }
+    } else if (!strcmp(cmd->name, "wheel")) {
+        int64_t notches = arg_int(qdict, "notches", 1);
+
+        if (notches == 0) {
+            err = SCRIPT_E_INVALID;
+            errmsg = "notches is nonzero; positive is away from the user";
+        } else {
+            metal_glue_mouse_wheel(notches);
+            data = g_strdup_printf("{\"scrolled\":%d}", (int)notches);
+        }
+    } else if (!strcmp(cmd->name, "reset") || !strcmp(cmd->name, "poweroff")) {
+        if (!arg_bool(qdict, "dangerous", false)) {
+            err = SCRIPT_E_DENIED;
+            errmsg = "set dangerous true first; the gate is per command";
+        }
+    } else if (!strcmp(cmd->name, "savevm")) {
+        if (arg_bool(qdict, "overwrite", false)
+            && !arg_bool(qdict, "dangerous", false)) {
+            err = SCRIPT_E_DENIED;
+            errmsg = "overwrite needs dangerous true; the gate is per command";
+        }
     } else {
-        g_assert_not_reached();
+        /* the rest of the table is the bottom-half class */
+        data = script_run_bh(cmd, qdict, &err, &errmsg_dyn, &errmsg,
+                             waiting);
+    }
+
+    if (err == SCRIPT_OK && !data && !errmsg) {
+        /* a gated command that passed its gate falls through to here */
+        data = script_run_bh(cmd, qdict, &err, &errmsg_dyn, &errmsg,
+                             waiting);
     }
 
 out:
-    *reply = script_envelope(err == SCRIPT_OK, data, err, errmsg,
+    *reply = script_envelope(err == SCRIPT_OK, data, err,
+                             errmsg_dyn ?: errmsg,
                              g_get_monotonic_time() - t0);
+    g_free(errmsg_dyn);
     g_free(data);
     qobject_unref(qdict);
     return true;
@@ -453,6 +1276,7 @@ void metal_glue_key(bool down, uint32_t oskeycode)
     if (lnx == 0) {
         return;
     }
+    cnt.keys++;
 
     bql_lock();
     qemu_input_event_send_key_linux(NULL, lnx, down);
@@ -464,6 +1288,7 @@ void metal_glue_mouse_abs(int gx, int gy, int xres, int yres)
     if (xres < 2 || yres < 2) {
         return;
     }
+    cnt.mouse_moves++;
     bql_lock();
     /* Scaled by the input layer onto the tablet's 0..32767 axes, which
      * the guest's absolute-mouse driver maps onto the whole screen. */
@@ -482,8 +1307,9 @@ void metal_glue_mouse_btn(int button, bool down)
     if ((unsigned)button > 2) {
         return;
     }
+    cnt.mouse_buttons++;
     bql_lock();
-    qemu_input_queue_btn(NULL, map[button], down);
+    qemu_input_queue_btn(NULL, map[button], true);
     qemu_input_event_sync();
     bql_unlock();
 }
@@ -493,6 +1319,7 @@ void metal_glue_mouse_wheel(int notches)
     if (!notches) {
         return;
     }
+    cnt.mouse_buttons++;
     bql_lock();
     while (notches > 0) {
         qemu_input_queue_btn(NULL, INPUT_BUTTON_WHEEL_UP, true);

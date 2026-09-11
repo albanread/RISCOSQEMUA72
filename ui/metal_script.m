@@ -12,8 +12,8 @@
  * The commands themselves live on the C side (metal_glue_script) with
  * everything else that talks to QEMU; this file only marshals.  The
  * dictionary this surface is described by is
- * riscos-pi4/app/RISCOSQEMU.sdef, hand-written until E1 generates it
- * from the C command table.
+ * riscos-pi4/app/RISCOSQEMU.sdef, generated from the C command table
+ * by riscos-pi4/tools/mksdef.py.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -28,9 +28,11 @@
 /* The suite and command codes come from the C table -- one handler per
  * event id, because NSAppleEventManager dispatches exact (class, id)
  * pairs and a handler for one id does not serve another in the same
- * suite.  Mixed case on purpose: Apple reserves all-lowercase codes. */
-static uint32_t g_classes[16];
-static uint32_t g_ids[16];
+ * suite.  The standard quit event is registered beside them and routed
+ * by the C side to the clean power off.  Mixed case on purpose: Apple
+ * reserves all-lowercase codes. */
+static uint32_t g_classes[32];
+static uint32_t g_ids[32];
 static size_t g_ncodes;
 
 static id g_handler;
@@ -89,7 +91,7 @@ void metal_script_register(void)
         g_handler = [[MetalScriptHandler alloc] init];
     }
     if (!g_ncodes) {
-        g_ncodes = metal_glue_script_events(g_classes, g_ids, 16);
+        g_ncodes = metal_glue_script_events(g_classes, g_ids, 32);
     }
     n = g_ncodes;
     for (i = 0; i < n; i++) {
@@ -97,5 +99,13 @@ void metal_script_register(void)
                   andSelector:@selector(handleEvent:withReplyEvent:)
               forEventClass:g_classes[i] andEventID:g_ids[i]];
     }
-    metal_log("apple events: %zu handler%s registered", n, n == 1 ? "" : "s");
+    /* aevt/quit: the standard event AppleScript itself sends for
+     * quit.  Without this, the hand-run NSApplication would take the
+     * default terminate path and bypass the disc write-back; the C
+     * side routes it beside poweroff. */
+    [em setEventHandler:g_handler
+              andSelector:@selector(handleEvent:withReplyEvent:)
+            forEventClass:'aevt' andEventID:'quit'];
+    metal_log("apple events: %zu handler%s registered", n + 1,
+              n ? "s" : "");
 }

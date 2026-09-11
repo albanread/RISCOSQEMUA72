@@ -221,15 +221,17 @@ needed yet.
 
 ## 6. What is not done yet
 
-- **Apple Events: Sprints E0 and E1 are built.** `ping` and `describe`
+- **Apple Events: Sprints E0 to E2 are built.** `ping` and `describe`
   answer over the wire from the properly-launched app —
   `riscos-pi4/tools/run-app.sh` (an `open --args` launch, **no QMP**:
   the app persona's only always-on channel is Apple Events) over the
   bundle `make-bundle.sh` assembles. The command table in `ui/metal.c`
   is the one source of truth; `mksdef.py` generates the dictionary
-  from it and `describe` returns it as JSON. `SCRIPTING.md` §13–14
-  record the measurements (16.7 ms per event, QMP 0.1 ms) and the wire
-  lessons. The control and debug commands are E2–E3.
+  from it and `describe` returns it as JSON. `SCRIPTING.md` §13–15
+  record the measurements (16.7 ms per event, QMP 0.1 ms), the wire
+  lessons, and E2's control surface: pause/resume, snapshots, both
+  screenshots, input injection and counters, all verified end to end.
+  The debugging commands are E3.
 - **The app has its icon.** A silver cog on a navy rounded-square tile,
   drawn entirely from geometry by `riscos-pi4/tools/mkicon.py` (original
   artwork — the repository carries no third-party material — and a nod to

@@ -27,6 +27,7 @@
 #include "hw/core/irq.h"
 #include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_mbox_defs.h"
+#include "hw/misc/bcm2835_property.h"
 #include "hw/misc/bcm2835_vchiq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/dma.h"
@@ -686,11 +687,30 @@ static uint32_t disp_mint_handle(BCM2835VchiqState *s)
  */
 static void disp_display_size(uint32_t *w, uint32_t *h)
 {
-    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_PROPERTY, NULL);
     BCM2835FBConfig cfg;
 
-    *w = 640;
-    *h = 480;
+    /*
+     * The physical display, which is the EDID's preferred timing -- not
+     * whatever the framebuffer happens to be when the question is asked.
+     *
+     * The guest asks this once, early, and scales its pointer into the
+     * answer for the rest of the session. Answering with the current
+     * framebuffer meant answering 640x480, because that is the mode the
+     * boot passes through before it settles: at 800x600 the resulting
+     * 1.25x error was small enough to look like nothing, and at 1920x1200
+     * it made the pointer a third of its proper size and moved it in
+     * three-pixel steps. The display is what does not change.
+     */
+    *w = 800;
+    *h = 600;
+    if (obj) {
+        bcm2835_property_preferred_mode(BCM2835_PROPERTY(obj), w, h);
+        return;
+    }
+
+    /* No property device: fall back to the framebuffer, as before */
+    obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
     if (obj) {
         bcm2835_fb_get_config(BCM2835_FB(obj), &cfg);
         if (cfg.xres && cfg.yres) {
@@ -900,14 +920,25 @@ static unsigned disp_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
  * sprite rather than a mixed one. */
 bool bcm2835_vchiq_get_cursor(VchiqCursor *out)
 {
-    Object *obj = object_resolve_path_type("", TYPE_BCM2835_VCHIQ, NULL);
+    /* The device is resolved once and kept: this runs every frame from
+     * the UI thread, and a per-frame walk of the object tree is both a
+     * millisecond the compositor does not have and a read of a tree
+     * other threads own (a sampled stuck frame showed the walk).  The
+     * machine is built before the first frame, so the cache can only
+     * ever fill with the one and only instance. */
+    static BCM2835VchiqState *cached;
     BCM2835VchiqState *s;
     uint32_t gen;
 
-    if (!obj) {
-        return false;
+    if (!cached) {
+        Object *obj = object_resolve_path_type("", TYPE_BCM2835_VCHIQ, NULL);
+
+        if (!obj) {
+            return false;
+        }
+        cached = BCM2835_VCHIQ(obj);
     }
-    s = BCM2835_VCHIQ(obj);
+    s = cached;
 
     gen = qatomic_read(&s->ptr_gen);
     smp_rmb();

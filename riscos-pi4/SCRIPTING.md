@@ -419,11 +419,11 @@ promise. E0's answers gate E1's shape; nothing else starts before them.
   timeouts. Done when the sdef opens in Script Editor with real
   terminology, and `describe` returns the table an agent can drive the
   machine with.
-- **E2 — control (2 d).** Lifecycle, pause/resume, snapshots, both
-  screenshots, the input set, counters in the envelope. Done when a
-  script — written by an agent from `describe` alone, no human — cold
-  boots, waits for the desktop by polling `frame_gen`, takes a
-  screendump, saves a snapshot, loads it.
+- **E2 — control (2 d). *Done; see §15.*** Lifecycle, pause/resume,
+  snapshots, both screenshots, the input set, counters in the envelope.
+  Done when a script — written by an agent from `describe` alone, no
+  human — cold boots, waits for the desktop by polling `frame_gen`,
+  takes a screendump, saves a snapshot, loads it.
 - **E3 — debugging (3 d).** HMP passthrough, `read memory` both
   address spaces, registers, PC, disassemble, `capture`. Done when a
   scripted session pauses a running desktop and its `capture`'s
@@ -610,6 +610,72 @@ Four things the wire taught, each costing a build:
   contents where the envelope promised an object — invisible in a
   glance at the string and impossible to miss in `python3 -m
   json.tool`.
+
+## 15. E2, as built
+
+Eighteen commands answer on the wire: the E1 pair, `state`, `video`,
+the lifecycle four (`pause`/`resume` fast-path-gated none,
+`reset`/`poweroff` behind `dangerous`), snapshots three
+(`savevm`/`loadvm`/`listvm`), screens two (`screendump`/`screenshot`),
+and input five (`key`/`type`/`mouse`/`click`/`wheel`). The envelope's
+machine block grew `uptime_ns`, `frame_gen`, `frames` and `mode` — the
+wait-for-desktop poll of the acceptance test is two fields in every
+reply. The acceptance script ran end to end: boot, `frame_gen` polling,
+both screenshots, snapshot save, list and load, the load proven by the
+uptime winding back to the save point and continuing.
+
+Measured on the wire (full Apple Event round trips): fast commands
+0–1 ms, `pause` 39 ms (it takes the BQL and stops the vCPUs), `resume`
+30 ms, `screendump` 40 ms, `screenshot` 72 ms, `savevm` 749 ms,
+`loadvm` 228 ms, `listvm` 0 ms. The bottom-half class is the E1
+semaphore design: schedule, wait up to `waiting` seconds (1–60,
+default 10), `busy` for a second command while one is in flight, and a
+timeout that reports while the operation continues.
+
+Four more things the wire taught, each costing a build or an evening:
+
+- **Initialise before you drain.** The first `pause` aborted the app:
+  `script_run_bh` drained the semaphore *before* `qemu_sem_init()` had
+  ever run, and macOS's pthread mutex is not a zeroed mutex. The
+  init-once block now comes first; the drain only makes sense once
+  something can post.
+- **One instance, or the wires cross.** A relaunch while an instance
+  still ran (a quit that silently failed its QMP handshake) left two
+  apps with one bundle id: `tell application id` delivered events to
+  one process while QMP answered from the other, and the surface
+  looked hung (`-1712` timeouts on `ping`) with both machines healthy.
+  §10's duplicate-instance caveat is now a tested failure mode, not a
+  footnote: check `pgrep` before blaming the surface.
+- **Never walk the object tree per frame.** The crash sample that
+  chased the phantom hang showed `bcm2835_vchiq_get_cursor` resolving
+  the VCHIQ device through the full QOM tree on *every* frame —
+  milliseconds per frame, and a lock-free read of a tree other threads
+  own. The device pointer is cached once now, the way the framebuffer
+  view always did it.
+- **The standard `quit` event was a land mine.** AppleScript `quit`
+  previously fell through to NSApplication's default terminate — no
+  disc write-back. `aevt/quit` is registered beside the table's
+  handlers and routes to the same clean power-off as the window close;
+  the reply is an envelope, and the process exits after the disc is
+  written.
+
+As-built notes against §5: `type` goes straight to linux key codes —
+the same entry point the osx map feeds, so reversing the map would
+land on the same codes (US spelling, shifted punctuation, 256-char
+cap). `screenshot` is the decoded surface at the guest's native
+resolution, with the pointer sprite blended in — the window's scaling
+and scanlines ride the drawable, not the texture. Both screens write
+only under `~/Library/Application Support/RISCOSQEMU` (§7's configured
+directory, v1: one), a caller `name` is a leaf or `denied`, and the
+periodic `METAL_SHOT_EVERY` path moved there too — a properly-launched
+app has `cwd=/`, so the old bare filename was writing nowhere.
+`listvm` reads `bdrv_snapshot_list` on the vmstate device (the same
+data `info snapshots` prints). `video` applies scaling/scanlines by
+dropping the specialised pipeline for one frame, and `vsync` sets the
+machine's generator or reports `not-capable`. Counters (`keys`,
+`mouse_moves`, `mouse_buttons`, `ae_events`) are taken where input
+enters QEMU, so the window's events and the surface's count together
+— an agent proves causality with one `state` before and after.
 
 ## Sources
 

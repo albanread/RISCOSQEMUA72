@@ -58,6 +58,9 @@ static struct {
     dispatch_semaphore_t inflight;
     bool ready;
     bool lost;
+    /* The content size we last chose ourselves. If the window still has
+     * it, the user has not taken over and a mode change may resize it. */
+    NSSize auto_size;
     /* input forwarded, for the debug log */
     unsigned keys;
     unsigned mouse_moves;
@@ -75,14 +78,6 @@ static struct {
     int scaling;                        /* MetalScaling */
     bool scanlines;
 } video_opts = { METAL_SCALING_SHARP, false };
-
-void metal_glue_video_opts(int scaling, int scanlines)
-{
-    if (scaling >= METAL_SCALING_LINEAR && scaling <= METAL_SCALING_NEAREST) {
-        video_opts.scaling = scaling;
-    }
-    video_opts.scanlines = scanlines != 0;
-}
 
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
@@ -104,6 +99,38 @@ static struct {
 
 static bool fb_failed;
 static uint32_t fb_failed_generation;
+
+/* The scale pipeline is specialised on the options, so a runtime
+ * change drops the pipeline and the next frame rebuilds it -- one
+ * frame at worst of the old look, which is also what a mode change
+ * costs.  Invalid scaling is ignored, as at init. */
+void metal_glue_video_opts(int scaling, int scanlines)
+{
+    int s = video_opts.scaling;
+    bool sl = scanlines != 0;
+
+    if (scaling >= METAL_SCALING_LINEAR && scaling <= METAL_SCALING_NEAREST) {
+        s = scaling;
+    }
+    if (s != video_opts.scaling || sl != video_opts.scanlines) {
+        video_opts.scaling = s;
+        video_opts.scanlines = sl;
+        fb.up = false;
+    }
+}
+
+/* UI-side reads for the scripting surface (ui/metal.c's state and
+ * video commands); UI thread only, like everything in this file. */
+uint32_t metal_ui_frame_count(void)
+{
+    return frame_count;
+}
+
+void metal_ui_video_opts(int *scaling, bool *scanlines)
+{
+    *scaling = video_opts.scaling;
+    *scanlines = video_opts.scanlines;
+}
 
 /* The pointer sprite: a pipeline and an image that do not depend on
  * the guest's mode, built once beside the scale pass.  The VCHIQ peer
@@ -290,6 +317,10 @@ static void metal_mouse_send_abs(int gx, int gy)
         }
         if (gy > mouse.gyres - 1) {
             gy = mouse.gyres - 1;
+        }
+        if (metal_debug()) {
+            metal_log("mouse: sent %d,%d of %dx%d", gx, gy,
+                      mouse.gxres, mouse.gyres);
         }
         metal_glue_mouse_abs(gx, gy, mouse.gxres, mouse.gyres);
         mouse.gx = gx;
@@ -653,6 +684,54 @@ static id<MTLRenderPipelineState> metal_pipeline(NSString *fragment,
 /* ------------------------------------------------------------------ */
 /* The per-mode pipeline                                               */
 
+/*
+ * Open the window at the guest's own resolution.
+ *
+ * The shader will stretch any mode to any window, so this is only about
+ * what you get before touching anything -- and a 1920x1200 desktop
+ * shrunk into 800x600 is not it. The size is in backing pixels, so on a
+ * Retina panel the guest lands one pixel to one pixel rather than
+ * doubled, and it is clamped to what the screen can actually show.
+ *
+ * Once the window has been resized by hand it is left alone: the size we
+ * chose is remembered, and anything else means the user has an opinion.
+ */
+static void metal_fit_window_to_mode(uint32_t xres, uint32_t yres)
+{
+    NSSize now = [[m.window contentView] frame].size;
+    CGFloat scale = [m.window backingScaleFactor];
+    NSRect visible = [[m.window screen] visibleFrame];
+    NSSize want;
+
+    if (!xres || !yres || scale <= 0) {
+        return;
+    }
+    if (m.auto_size.width > 0 &&
+        (fabs(now.width - m.auto_size.width) > 1 ||
+         fabs(now.height - m.auto_size.height) > 1)) {
+        return;                         /* the user has resized it */
+    }
+
+    want.width = xres / scale;
+    want.height = yres / scale;
+
+    /* Leave room for the title bar and the Dock rather than filling the
+     * screen exactly; a window you cannot grab is worse than a small one. */
+    if (want.width > NSWidth(visible) || want.height > NSHeight(visible) - 40) {
+        CGFloat fit = MIN(NSWidth(visible) / want.width,
+                          (NSHeight(visible) - 40) / want.height);
+
+        want.width = floor(want.width * fit);
+        want.height = floor(want.height * fit);
+    }
+
+    [m.window setContentSize:want];
+    [m.window center];
+    m.auto_size = [[m.window contentView] frame].size;
+    metal_log("window fitted to %ux%u at scale %.1f -> %.0fx%.0f points",
+              xres, yres, scale, m.auto_size.width, m.auto_size.height);
+}
+
 static void fb_release_pipeline(void)
 {
     unsigned i;
@@ -744,6 +823,7 @@ static bool fb_build_pipeline(const MetalFbView *v)
     fb.pitch = v->pitch;
     fb.rows = v->rows;
     fb.up = true;
+    metal_fit_window_to_mode(v->xres, v->yres);
     metal_log("pipeline up: gen %u, %ux%u, %u bpp, pitch %u, %u rows",
               v->generation, v->xres, v->yres, v->bpp, v->pitch, v->rows);
     return true;
@@ -1025,9 +1105,27 @@ static bool metal_render_frame(void)
 /* ------------------------------------------------------------------ */
 /* Screenshot: the decoded surface to a PNG file                       */
 
-static void metal_screenshot(void)
+/* Where the periodic screenshots land.  A properly-launched app has
+ * cwd=/, so a bare file name would vanish; the app support directory
+ * is the configured home (SCRIPTING.md section 7) and the scripting
+ * surface's screenshot command writes there too. */
+static NSString *metal_shot_path(unsigned n)
 {
-    static unsigned n;
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(
+        NSApplicationSupportDirectory, NSUserDomainMask, YES);
+    NSString *base = dirs.count
+        ? [dirs[0] stringByAppendingPathComponent:@"RISCOSQEMU"]
+        : NSTemporaryDirectory();
+
+    [[NSFileManager defaultManager] createDirectoryAtPath:base
+                             withIntermediateDirectories:YES
+                                              attributes:nil error:NULL];
+    return [base stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"metal-screenshot-%u.png", n]];
+}
+
+static bool metal_screenshot_to(NSString *path)
+{
     id<MTLBuffer> staging;
     id<MTLCommandBuffer> cb;
     id<MTLBlitCommandEncoder> blit;
@@ -1035,18 +1133,18 @@ static void metal_screenshot(void)
     CGContextRef ctx;
     CGImageRef img;
     CGImageDestinationRef dst;
-    NSString *path;
     NSURL *url;
     size_t stride;
+    bool ok = false;
 
     if (!fb.up || !fb.decoded) {
-        return;
+        return false;
     }
     stride = (size_t)fb.xres * 4;
     staging = [m.device newBufferWithLength:stride * fb.yres
                                     options:MTLResourceStorageModeShared];
     if (!staging) {
-        return;
+        return false;
     }
     cb = [m.queue commandBuffer];
     blit = [cb blitCommandEncoder];
@@ -1126,7 +1224,6 @@ static void metal_screenshot(void)
                                 | kCGBitmapByteOrder32Big);
     img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
 
-    path = [NSString stringWithFormat:@"metal-screenshot-%u.png", ++n];
     url = [NSURL fileURLWithPath:path];
     dst = img ? CGImageDestinationCreateWithURL((CFURLRef)url,
                                                 CFSTR("public.png"), 1, NULL)
@@ -1137,8 +1234,9 @@ static void metal_screenshot(void)
         CFRelease(dst);
         metal_log("screenshot: %s (%ux%u)", [path UTF8String],
                   fb.xres, fb.yres);
+        ok = true;
     } else {
-        metal_log("screenshot failed");
+        metal_log("screenshot failed: %s", [path UTF8String]);
     }
     if (img) {
         CGImageRelease(img);
@@ -1148,6 +1246,21 @@ static void metal_screenshot(void)
     }
     CGColorSpaceRelease(cs);
     [staging release];
+    return ok;
+}
+
+static void metal_screenshot(void)
+{
+    static unsigned n;
+
+    metal_screenshot_to(metal_shot_path(++n));
+}
+
+/* The scripting surface's screenshot command lands here; the C side
+ * has already chosen and confined the path. */
+bool metal_ui_screenshot(const char *path)
+{
+    return path && metal_screenshot_to([NSString stringWithUTF8String:path]);
 }
 
 /* ------------------------------------------------------------------ */

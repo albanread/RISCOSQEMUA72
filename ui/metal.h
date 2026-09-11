@@ -138,9 +138,20 @@ void metal_glue_grab(bool on);
 bool metal_glue_set_vsync_hz(int hz);
 
 /* Scaler and CRT options for the window: scaling is 0 linear, 1 sharp
- * bilinear, 2 nearest; set once at display init, before any shader is
- * compiled. */
+ * bilinear, 2 nearest.  Set at display init and by the scripting
+ * surface's video command; a change rebuilds the pipelines on the
+ * next frame. */
 void metal_glue_video_opts(int scaling, int scanlines);
+
+/* UI-side reads for the scripting surface, all UI-thread only like the
+ * rest of this side of the boundary. */
+/* Presented frames since the window opened; monotonic per boot. */
+uint32_t metal_ui_frame_count(void);
+/* The video options as currently applied (0/1/2, scanlines). */
+void metal_ui_video_opts(int *scaling, bool *scanlines);
+/* Write the decoded Metal surface (the guest mode after palette/
+ * format decode, before scaling) to a PNG at path. */
+bool metal_ui_screenshot(const char *path);
 
 /* Reload the named-by-convention snapshot ("desktop") from the Machine
  * menu; the load itself runs as a bottom half on the main loop. */

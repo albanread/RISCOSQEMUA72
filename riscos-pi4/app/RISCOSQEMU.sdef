@@ -29,5 +29,133 @@
 				<type type="text" description="The JSON reply envelope."/>
 			</result>
 		</command>
+		<command name="state" code="MQemStat" description="Machine counters: run state, uptime, frame gen and count, input and event counters, display mode.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="video" code="MQemVOpt" description="Set video options; omitted keys are unchanged. Reply is as applied.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="pause" code="MQemPaus" description="Stop the virtual CPUs; the reply envelope reports the paused state.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="resume" code="MQemResu" description="Continue the virtual CPUs after a pause.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="reset" code="MQemRset" description="Reset the machine. Destructive: needs dangerous true.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="poweroff" code="MQemPowr" description="Power off the way the window close does, disc written back. Destructive: needs dangerous true.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="savevm" code="MQemSnSv" description="Save an internal snapshot on the machine disc. Overwriting an existing name needs dangerous true.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="loadvm" code="MQemSnLd" description="Load an internal snapshot and resume: the Machine menu path, generalised.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="listvm" code="MQemSnLs" description="List the internal snapshots on the machine disc.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="screendump" code="MQemDump" description="Write the guest framebuffer as PNG into the app support directory: the truth, no decode.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="screenshot" code="MQemShot" description="Write the decoded Metal surface as PNG into the app support directory.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="key" code="MQemKeyD" description="One key event: a macOS virtual keycode, down or up.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="type" code="MQemType" description="Type ASCII text through the US keymap, shifted punctuation included.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="mouse" code="MQemMous" description="Move the pointer to guest pixel coordinates on the current screen.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="click" code="MQemClkM" description="Press a mouse button (0 left, 1 middle, 2 right); without down, the full click.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+		<command name="wheel" code="MQemWhl " description="Scroll notches; positive is away from the user.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
 	</suite>
 </dictionary>

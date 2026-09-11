@@ -16,6 +16,118 @@
       "help": "The whole command table as JSON: names, help, arguments, classes.",
       "args": null,
       "class": "fast"
+    },
+    {
+      "name": "state",
+      "code": "MQemStat",
+      "help": "Machine counters: run state, uptime, frame gen and count, input and event counters, display mode.",
+      "args": null,
+      "class": "fast"
+    },
+    {
+      "name": "video",
+      "code": "MQemVOpt",
+      "help": "Set video options; omitted keys are unchanged. Reply is as applied.",
+      "args": "scaling int (0 linear, 1 sharp, 2 nearest), scanlines bool, vsync int Hz, waiting int s",
+      "class": "fast"
+    },
+    {
+      "name": "pause",
+      "code": "MQemPaus",
+      "help": "Stop the virtual CPUs; the reply envelope reports the paused state.",
+      "args": null,
+      "class": "bottom"
+    },
+    {
+      "name": "resume",
+      "code": "MQemResu",
+      "help": "Continue the virtual CPUs after a pause.",
+      "args": null,
+      "class": "bottom"
+    },
+    {
+      "name": "reset",
+      "code": "MQemRset",
+      "help": "Reset the machine. Destructive: needs dangerous true.",
+      "args": "dangerous bool",
+      "class": "bottom"
+    },
+    {
+      "name": "poweroff",
+      "code": "MQemPowr",
+      "help": "Power off the way the window close does, disc written back. Destructive: needs dangerous true.",
+      "args": "dangerous bool",
+      "class": "bottom"
+    },
+    {
+      "name": "savevm",
+      "code": "MQemSnSv",
+      "help": "Save an internal snapshot on the machine disc. Overwriting an existing name needs dangerous true.",
+      "args": "name str, overwrite bool, dangerous bool, waiting int s",
+      "class": "bottom"
+    },
+    {
+      "name": "loadvm",
+      "code": "MQemSnLd",
+      "help": "Load an internal snapshot and resume: the Machine menu path, generalised.",
+      "args": "name str, waiting int s",
+      "class": "bottom"
+    },
+    {
+      "name": "listvm",
+      "code": "MQemSnLs",
+      "help": "List the internal snapshots on the machine disc.",
+      "args": null,
+      "class": "bottom"
+    },
+    {
+      "name": "screendump",
+      "code": "MQemDump",
+      "help": "Write the guest framebuffer as PNG into the app support directory: the truth, no decode.",
+      "args": "name str, waiting int s",
+      "class": "bottom"
+    },
+    {
+      "name": "screenshot",
+      "code": "MQemShot",
+      "help": "Write the decoded Metal surface as PNG into the app support directory.",
+      "args": "name str",
+      "class": "fast"
+    },
+    {
+      "name": "key",
+      "code": "MQemKeyD",
+      "help": "One key event: a macOS virtual keycode, down or up.",
+      "args": "keycode int, down bool",
+      "class": "fast"
+    },
+    {
+      "name": "type",
+      "code": "MQemType",
+      "help": "Type ASCII text through the US keymap, shifted punctuation included.",
+      "args": "text str",
+      "class": "fast"
+    },
+    {
+      "name": "mouse",
+      "code": "MQemMous",
+      "help": "Move the pointer to guest pixel coordinates on the current screen.",
+      "args": "x int, y int",
+      "class": "fast"
+    },
+    {
+      "name": "click",
+      "code": "MQemClkM",
+      "help": "Press a mouse button (0 left, 1 middle, 2 right); without down, the full click.",
+      "args": "button int, down bool",
+      "class": "fast"
+    },
+    {
+      "name": "wheel",
+      "code": "MQemWhl ",
+      "help": "Scroll notches; positive is away from the user.",
+      "args": "notches int",
+      "class": "fast"
     }
   ]
 }
