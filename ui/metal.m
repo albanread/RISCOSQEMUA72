@@ -88,6 +88,7 @@ static struct {
 
     id<MTLBuffer> raw[METAL_RING];      /* guest bytes, pitch * rows */
     unsigned ring;
+    bool uploaded;                      /* a ring entry holds a real frame */
     id<MTLBuffer> palette;              /* 256 * RGBA8 */
     uint8_t pal_cache[256 * 4];
     bool pal_valid;
@@ -776,6 +777,7 @@ static bool fb_build_pipeline(const MetalFbView *v)
         }
     }
     fb.ring = 0;
+    fb.uploaded = false;                /* new buffers hold nothing yet */
 
     if (!fb.palette) {
         fb.palette = [m.device newBufferWithLength:256 * 4
@@ -892,10 +894,66 @@ static bool ptr_build(void)
     return true;
 }
 
+/*
+ * Frames the guest is still drawing are not worth showing, and frames
+ * it has finished drawing are worth showing once.
+ *
+ * The blitter raises a flag whenever a fill or a sprite lands.  Seeing
+ * it means the guest is mid-redraw, so the previous, whole frame is
+ * left on screen; seeing it stop means the screen has settled, and
+ * that is the moment to take a copy.  Waiting for the settle is the
+ * point -- what gets copied is a finished picture rather than one
+ * caught halfway through a window being painted.
+ *
+ * METAL_SETTLE_MAX bounds the wait, for two reasons.  Continuous
+ * drawing -- dragging, scrolling -- never settles and still has to
+ * animate.  And text and lines are plotted straight to memory without
+ * passing through the blitter, so nothing raises the flag for them;
+ * without a forced copy, typing would never appear.
+ */
+#define METAL_SETTLE_MAX 4          /* frames to wait for a settle */
+
+static bool fb_damage_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("METAL_DAMAGE");
+        on = e && *e && *e != '0';
+    }
+    return on != 0;
+}
+
 static void fb_upload(const MetalFbView *v)
 {
+    static uint64_t frames, copied;
+    static unsigned held;
+    static bool pending;
+    bool drawing = riscos_blitter_take_damage() != 0;
+    bool settled;
+
+    frames++;
+    if (drawing) {
+        pending = true;             /* new content, not shown yet */
+    }
+
+    settled = pending && !drawing;
+    if (fb.uploaded && !settled && ++held < METAL_SETTLE_MAX) {
+        if (fb_damage_on() && frames % 300 == 0) {
+            metal_log("upload: %llu of %llu frames copied (%.1f%%)",
+                      (unsigned long long)copied,
+                      (unsigned long long)frames,
+                      100.0 * copied / frames);
+        }
+        return;
+    }
+    held = 0;
+    pending = false;
+
     fb.ring = (fb.ring + 1) % METAL_RING;
     memcpy([fb.raw[fb.ring] contents], v->fb, (size_t)v->pitch * v->rows);
+    fb.uploaded = true;
+    copied++;
 
     if (!fb.pal_valid
         || memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {

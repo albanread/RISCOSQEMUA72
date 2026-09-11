@@ -132,6 +132,15 @@
 #define BLIT_MAX_HEIGHT   (1u << 14)
 #define BLIT_MAX_BYTES    (64u << 20)
 
+/*
+ * Set on the vCPU thread whenever a blit lands, taken and cleared by
+ * whoever is drawing the screen.  An atomic word and nothing more: the
+ * front end runs on its own thread and must not touch memory regions
+ * or take the big lock to ask a question this simple.
+ */
+void riscos_blitter_note_damage(void);
+unsigned riscos_blitter_take_damage(void);
+
 #define TYPE_RISCOS_BLITTER "riscos-blitter"
 OBJECT_DECLARE_SIMPLE_TYPE(RISCOSBlitterState, RISCOS_BLITTER)
 

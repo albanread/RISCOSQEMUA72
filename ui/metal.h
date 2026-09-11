@@ -83,6 +83,14 @@ typedef struct MetalFbView {
  */
 int metal_glue_fb_view(MetalFbView *out);
 
+/*
+ * Has anything been drawn since this was last asked?  Raised on the
+ * vCPU thread by the blitter, taken and cleared here.  Declared in this
+ * header rather than the device's so the Objective-C side can ask
+ * without dragging QOM into a .m file.
+ */
+unsigned riscos_blitter_take_damage(void);
+
 /* Drop any cached mapping (called once from the UI loop at exit). */
 void metal_glue_fb_done(void);
 

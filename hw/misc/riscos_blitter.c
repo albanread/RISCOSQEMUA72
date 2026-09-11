@@ -635,6 +635,24 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
     return rc;
 }
 
+/*
+ * Whether anything has been drawn since the last time someone asked.
+ * Written on the vCPU thread inside an MMIO write, read on the UI
+ * thread; a plain atomic word, so neither has to synchronise with the
+ * other to find out.
+ */
+static unsigned blit_damage;
+
+void riscos_blitter_note_damage(void)
+{
+    qatomic_set(&blit_damage, 1);
+}
+
+unsigned riscos_blitter_take_damage(void)
+{
+    return qatomic_xchg(&blit_damage, 0);
+}
+
 static void blit_go(RISCOSBlitterState *s)
 {
     int64_t t0 = g_get_monotonic_time();
@@ -666,6 +684,9 @@ static void blit_go(RISCOSBlitterState *s)
         }
     }
 
+    if (rc == BLIT_RC_OK && s->width && s->height) {
+        riscos_blitter_note_damage();
+    }
     trace_riscos_blitter_go(s->op, s->width, s->height,
                             s->dstride, s->sstride, rc,
                             (uint32_t)(g_get_monotonic_time() - t0));
