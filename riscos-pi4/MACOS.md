@@ -221,6 +221,11 @@ needed yet.
 
 ## 6. What is not done yet
 
+- **Apple Events and AppleScript are designed, not built.**
+  `riscos-pi4/SCRIPTING.md` is the design: an agents-first scripting
+  surface over the machine-control and debugging functions, and the app
+  bundle, signing and notarization it needs before an unattended agent
+  can rely on it. None of it is in the tree yet.
 - **Grab, full screen and the snapshot menu are written but unexercised.**
   ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
 
