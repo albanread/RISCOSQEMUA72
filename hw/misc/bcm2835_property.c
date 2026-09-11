@@ -18,41 +18,184 @@
 #include "qemu/module.h"
 #include "trace.h"
 #include "hw/arm/raspi_platform.h"
+#include "hw/core/qdev-properties.h"
+#include "qemu/error-report.h"
 
 #define VCHI_BUSADDR_SIZE       sizeof(uint32_t)
 
 /* https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface */
 
 /*
- * The monitor the firmware would have read over DDC: an EDID 1.3 block
- * describing a digital 800x600 display, preferred timing VESA DMT 800x600
- * at 60 Hz (40 MHz, 1056x628 total), with 640x480 and 800x600 among the
- * established timings and a range-limits descriptor that admits them. The
- * checksum byte is filled in when the block is handed over.
+ * The monitor the firmware would have read over DDC.
+ *
+ * RISC OS builds its whole mode list out of this: ScreenModes reads the
+ * EDID, filters it by what BCMVideo can drive, and the Display Manager
+ * offers what survives. So the sizes a user can choose are decided here,
+ * and nowhere else -- which is why it is a table rather than the 127
+ * hand-written bytes it used to be.
+ *
+ * Nothing behind it is real, so the timings only have to be well formed
+ * and self-consistent: the active area is what the framebuffer becomes,
+ * and the rest exists to be believed. They are the standard DMT and
+ * CVT-RB figures anyway, because a plausible block is easier to debug
+ * than an invented one.
  */
-static const uint8_t bcm2835_edid_800x600[127] = {
-    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,     /* header */
-    0x45, 0xb5, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,     /* "QMU", product 1 */
-    0x00, 0x24, 0x01, 0x03,                             /* 2026, EDID 1.3 */
-    0x80, 0x20, 0x18, 0x78, 0x02,                       /* digital, 32x24 cm, gamma 2.2, preferred timing */
-    0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54,
-    0x21, 0x00, 0x00,                                   /* established: 640x480@60, 800x600@60 */
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,     /* no standard timings */
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    /* detailed timing: 800x600@60 */
-    0xa0, 0x0f, 0x20, 0x00, 0x31, 0x58, 0x1c, 0x20, 0x28, 0x80, 0x14, 0x00,
-    0x40, 0xf0, 0x10, 0x00, 0x00, 0x1e,
-    /* monitor name */
-    0x00, 0x00, 0x00, 0xfc, 0x00, 'Q', 'E', 'M', 'U', ' ', 'P', 'i', ' ', '4',
-    0x0a, 0x20, 0x20, 0x20,
-    /* range limits: 50-75 Hz, 30-50 kHz, 50 MHz */
-    0x00, 0x00, 0x00, 0xfd, 0x00, 0x32, 0x4b, 0x1e, 0x32, 0x05, 0x00,
-    0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    /* unused descriptor */
-    0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00,                                               /* no extension blocks */
+typedef struct {
+    uint16_t w, h;
+    uint32_t clock_khz;             /* pixel clock */
+    uint16_t hblank, hfp, hsync;    /* horizontal blanking, in pixels */
+    uint16_t vblank, vfp, vsync;    /* vertical blanking, in lines */
+} BCM2835EdidMode;
+
+static const BCM2835EdidMode bcm2835_edid_modes[] = {
+    {  640,  480,  25175, 160,  16,  96, 45, 10, 2 },   /* DMT */
+    {  800,  600,  40000, 256,  40, 128, 28,  1, 4 },   /* DMT */
+    { 1024,  768,  65000, 320,  24, 136, 38,  3, 6 },   /* DMT */
+    { 1280,  720,  74250, 370, 110,  40, 30,  5, 5 },   /* CEA-861 */
+    { 1280,  800,  71000, 160,  48,  32, 23,  3, 6 },   /* CVT-RB */
+    { 1280, 1024, 108000, 408,  48, 112, 42,  1, 3 },   /* DMT */
+    { 1440,  900,  88750, 160,  48,  32, 26,  3, 6 },   /* CVT-RB */
+    { 1600, 1200, 162000, 560,  64, 192, 50,  1, 3 },   /* DMT */
+    { 1920, 1080, 148500, 280,  88,  44, 45,  4, 5 },   /* CEA-861 */
+    { 1920, 1200, 154000, 160,  48,  32, 35,  3, 6 },   /* CVT-RB */
 };
+
+/*
+ * The eight standard-timing slots, which is where most of the list
+ * lives. The encoding is (pixels / 8) - 31 in one byte, so it cannot
+ * express a width over 2288 or one that is not a multiple of eight --
+ * 1366 famously is not -- and the aspect is one of four. Anything that
+ * does not fit would need a detailed timing or a CTA-861 extension
+ * block; nothing here needs one yet.
+ */
+static const uint16_t bcm2835_edid_standard[8][2] = {
+    { 1024,  768 }, { 1280,  720 }, { 1280,  800 }, { 1280, 1024 },
+    { 1440,  900 }, { 1600, 1200 }, { 1920, 1080 }, { 1920, 1200 },
+};
+
+static const BCM2835EdidMode *bcm2835_edid_find(uint32_t w, uint32_t h)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(bcm2835_edid_modes); i++) {
+        if (bcm2835_edid_modes[i].w == w && bcm2835_edid_modes[i].h == h) {
+            return &bcm2835_edid_modes[i];
+        }
+    }
+    return NULL;
+}
+
+/* An 18-byte detailed timing descriptor */
+static void bcm2835_edid_detailed(uint8_t *d, const BCM2835EdidMode *m)
+{
+    /* ~100 dpi, so the aspect the guest reads matches the mode's */
+    uint32_t mm_w = m->w / 4, mm_h = m->h / 4;
+
+    d[0] = (m->clock_khz / 10) & 0xff;          /* 10 kHz units */
+    d[1] = (m->clock_khz / 10) >> 8;
+    d[2] = m->w & 0xff;
+    d[3] = m->hblank & 0xff;
+    d[4] = ((m->w >> 8) << 4) | (m->hblank >> 8);
+    d[5] = m->h & 0xff;
+    d[6] = m->vblank & 0xff;
+    d[7] = ((m->h >> 8) << 4) | (m->vblank >> 8);
+    d[8] = m->hfp & 0xff;
+    d[9] = m->hsync & 0xff;
+    d[10] = ((m->vfp & 0xf) << 4) | (m->vsync & 0xf);
+    d[11] = ((m->hfp >> 8) << 6) | ((m->hsync >> 8) << 4)
+          | ((m->vfp >> 4) << 2) | (m->vsync >> 4);
+    d[12] = mm_w & 0xff;
+    d[13] = mm_h & 0xff;
+    d[14] = ((mm_w >> 8) << 4) | (mm_h >> 8);
+    d[15] = 0;                                  /* borders */
+    d[16] = 0;
+    d[17] = 0x1e;                               /* digital separate, +h +v */
+}
+
+/*
+ * Build the block. `pref` is the preferred timing, which is the mode
+ * RISC OS brings the desktop up in.
+ */
+static void bcm2835_edid_build(uint8_t *edid, const BCM2835EdidMode *pref)
+{
+    unsigned sum = 0;
+    uint8_t *d;
+
+    memset(edid, 0, 128);
+    memset(edid + 1, 0xff, 6);                  /* header */
+    edid[8] = 0x45; edid[9] = 0xb5;             /* "QMU" */
+    edid[10] = 0x01;                            /* product 1 */
+    edid[16] = 0x00; edid[17] = 0x24;           /* week -, year 2026 */
+    edid[18] = 0x01; edid[19] = 0x03;           /* EDID 1.3 */
+    edid[20] = 0x80;                            /* digital */
+    edid[21] = pref->w / 40;                    /* cm, from the mode */
+    edid[22] = pref->h / 40;
+    edid[23] = 0x78;                            /* gamma 2.2 */
+    edid[24] = 0x02;                            /* preferred timing in DTD 1 */
+    memcpy(edid + 25, "\xee\x91\xa3\x54\x4c\x99\x26\x0f\x50\x54", 10);
+
+    /* Established: 640x480@60 and 800x600@60, the two legacy sizes */
+    edid[35] = 0x21;
+
+    for (size_t i = 0; i < 8; i++) {
+        uint32_t w = bcm2835_edid_standard[i][0];
+        uint32_t h = bcm2835_edid_standard[i][1];
+        uint32_t aspect;
+
+        /* 0 = 16:10, 1 = 4:3, 2 = 5:4, 3 = 16:9 */
+        if (w * 10 == h * 16) {
+            aspect = 0;
+        } else if (w * 3 == h * 4) {
+            aspect = 1;
+        } else if (w * 4 == h * 5) {
+            aspect = 2;
+        } else {
+            aspect = 3;
+        }
+        edid[38 + i * 2] = (w / 8) - 31;
+        edid[39 + i * 2] = (aspect << 6) | (60 - 60);
+    }
+
+    /* Descriptor 1: the preferred timing */
+    bcm2835_edid_detailed(edid + 54, pref);
+
+    /* Descriptor 2: monitor name */
+    d = edid + 72;
+    d[3] = 0xfc;
+    memcpy(d + 5, "QEMU Pi 4\n         ", 13);
+
+    /*
+     * Descriptor 3: range limits, and the reason the big modes are
+     * reachable at all. RISC OS checks every timing against these before
+     * it will offer it, so a ceiling of 50 MHz -- which is what this
+     * block used to carry -- silently discards anything above about
+     * 800x600 however many timings are advertised. 1920x1200 wants
+     * 154 MHz and 75 kHz.
+     */
+    d = edid + 90;
+    d[3] = 0xfd;
+    d[5] = 50;                                  /* 50-75 Hz vertical */
+    d[6] = 75;
+    d[7] = 15;                                  /* 15-200 kHz horizontal */
+    d[8] = 200;
+    d[9] = 60;                                  /* 600 MHz pixel clock */
+    d[10] = 0x00;
+    memset(d + 11, 0x20, 7);
+
+    /* Descriptor 4: unused */
+    edid[108 + 3] = 0x10;
+
+    edid[126] = 0;                              /* no extension blocks */
+    for (int i = 0; i < 127; i++) {
+        sum += edid[i];
+    }
+    edid[127] = -sum;
+}
+
+void bcm2835_property_preferred_mode(BCM2835PropertyState *s,
+                                     uint32_t *w, uint32_t *h)
+{
+    *w = s->pref_w;
+    *h = s->pref_h;
+}
 
 static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
 {
@@ -296,15 +439,14 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
         {
             uint32_t block = ldl_le_phys(&s->dma_as, value + 12);
             uint8_t edid[128];
-            unsigned sum = 0;
 
             stl_le_phys(&s->dma_as, value + 16, block == 0 ? 0 : 1);
             if (block == 0) {
-                memcpy(edid, bcm2835_edid_800x600, sizeof(edid) - 1);
-                for (int i = 0; i < sizeof(edid) - 1; i++) {
-                    sum += edid[i];
-                }
-                edid[sizeof(edid) - 1] = -sum;
+                const BCM2835EdidMode *pref =
+                    bcm2835_edid_find(s->pref_w, s->pref_h);
+
+                bcm2835_edid_build(edid, pref);
+                trace_bcm2835_property_edid(pref->w, pref->h);
                 dma_memory_write(&s->dma_as, value + 20, edid, sizeof(edid),
                                  MEMTXATTRS_UNSPECIFIED);
             }
@@ -632,6 +774,21 @@ static void bcm2835_property_reset(DeviceState *dev)
 static void bcm2835_property_realize(DeviceState *dev, Error **errp)
 {
     BCM2835PropertyState *s = BCM2835_PROPERTY(dev);
+    {
+        unsigned w, h;
+
+        s->pref_w = 800;
+        s->pref_h = 600;
+        if (s->mode && sscanf(s->mode, "%ux%u", &w, &h) == 2) {
+            if (bcm2835_edid_find(w, h)) {
+                s->pref_w = w;
+                s->pref_h = h;
+            } else {
+                warn_report("bcm2835-property: no timing for mode %s; the "
+                            "desktop will come up at 800x600", s->mode);
+            }
+        }
+    }
     Object *obj;
 
     obj = object_property_get_link(OBJECT(dev), "fb", &error_abort);
@@ -651,6 +808,7 @@ static void bcm2835_property_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property bcm2835_property_props[] = {
+    DEFINE_PROP_STRING("mode", BCM2835PropertyState, mode),
     DEFINE_PROP_UINT32("board-rev", BCM2835PropertyState, board_rev, 0),
     DEFINE_PROP_STRING("command-line", BCM2835PropertyState, command_line),
 };

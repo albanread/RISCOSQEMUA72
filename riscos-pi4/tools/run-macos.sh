@@ -20,6 +20,7 @@ IMAGES="${RISCOS_IMAGES:-$ROOT/riscos-images}"
 Q="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 DISPLAY_OPT="${DISPLAY_OPT:-metal,vsync=30}"
 AUDIODEV="${AUDIODEV:-coreaudio}"
+MODE="${MODE:-}"
 
 for f in "$Q" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
     [[ -e "$f" ]] || { print -u2 "missing: $f"; exit 1; }
@@ -41,6 +42,10 @@ args=(
 )
 # Without a card it boots to the desktop from ROM alone, with nothing
 # behind the SD icon.  snapshot=on keeps the image pristine across runs.
+# MODE=1920x1200 etc: the EDID preferred timing, so RISC OS brings the
+# desktop up at that size. Empty keeps the 800x600 default.
+[[ -n "$MODE" ]] && args+=(-global "bcm2835-property.mode=$MODE")
+
 [[ -e "$IMAGES/card.img" ]] && \
     args+=(-drive file="$IMAGES/card.img",if=sd,format=raw,snapshot=on)
 

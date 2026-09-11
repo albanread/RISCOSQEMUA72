@@ -743,7 +743,33 @@ static void disp_commit(BCM2835VchiqState *s)
         s->ptr_img_w = s->disp_res_w;
         s->ptr_img_h = s->disp_res_h;
         s->disp_tx_pending = false;
-        trace_bcm2835_vchiq_disp_pointer(s->ptr_visible, s->ptr_x, s->ptr_y,
+            {
+        /* Where the visible pixels actually sit inside the sprite: the
+         * hot spot is baked into this, and it decides whether drawing
+         * the bitmap at the rect origin puts the tip in the right
+         * place. Logged once per image change. */
+        static uint32_t last_logged;
+        const uint32_t *px = s->ptr_image;
+
+        if (s->ptr_img_w && s->ptr_img_h && s->ptr_gen != last_logged) {
+            uint32_t minx = s->ptr_img_w, miny = s->ptr_img_h, maxx = 0, maxy = 0;
+
+            last_logged = s->ptr_gen;
+            for (uint32_t yy = 0; yy < s->ptr_img_h; yy++) {
+                for (uint32_t xx = 0; xx < s->ptr_img_w; xx++) {
+                    if (px[yy * s->ptr_img_w + xx] >> 24) {
+                        if (xx < minx) minx = xx;
+                        if (yy < miny) miny = yy;
+                        if (xx > maxx) maxx = xx;
+                        if (yy > maxy) maxy = yy;
+                    }
+                }
+            }
+            trace_bcm2835_vchiq_disp_sprite(s->ptr_img_w, s->ptr_img_h,
+                                            minx, maxx, miny, maxy);
+        }
+    }
+    trace_bcm2835_vchiq_disp_pointer(s->ptr_visible, s->ptr_x, s->ptr_y,
                                          s->ptr_w, s->ptr_h);
     }
     s->ptr_gen++;

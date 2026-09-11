@@ -36,6 +36,23 @@ struct BCM2835PropertyState {
     uint32_t touchbuf;
     uint32_t gpiovirtbuf;
     bool pending;
+    /*
+     * -global bcm2835-property.mode=WxH: the EDID's preferred timing,
+     * which is the size RISC OS brings the desktop up in. Empty keeps
+     * the 800x600 the fork has always answered with.
+     */
+    char *mode;
+    /* Resolved from `mode` at realize: the EDID's preferred timing, and
+     * therefore the size the desktop comes up in. */
+    uint32_t pref_w, pref_h;
 };
+
+/*
+ * The display the firmware is pretending to drive. Dispmanx's display
+ * space is the physical monitor, not whatever the guest has currently
+ * programmed the framebuffer to, so this is what answers GetInfo.
+ */
+void bcm2835_property_preferred_mode(BCM2835PropertyState *s,
+                                     uint32_t *w, uint32_t *h);
 
 #endif
