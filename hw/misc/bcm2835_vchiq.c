@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_mbox_defs.h"
 #include "hw/misc/bcm2835_vchiq.h"
 #include "hw/core/qdev-properties.h"
@@ -639,6 +640,293 @@ static unsigned auds_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*
+ * The dispmanx display service -- the pointer, said yes to.
+ *
+ * The ROM's hardware pointer is a dispmanx element over this service
+ * (BCMVideo s/HWPointer): it converts the kernel's 2 bpp shape into a
+ * 32x32 ARGB resource, bulk-writes the image, and adds/moves/removes an
+ * element in start-change-submit transactions.  Answering the subset
+ * the pointer uses gives the guest a real hardware pointer with no
+ * guest-side code of ours: the ROM does the conversion (including its
+ * anti-fringe fill of transparent pixels) and the host composites --
+ * riscos-pi4/GPUDESIGN.md section 2.
+ *
+ * Every command outside the subset is refused with -1, so the overlay
+ * machinery in BCMVideo s/GVOverlay stays inert while the service is
+ * open -- the refusal discipline of DESIGN.md section 11, scoped to
+ * the call instead of the service.
+ */
+
+static void disp_reply(BCM2835VchiqState *s, const uint32_t *msg,
+                       uint32_t words)
+{
+    vchiq_queue_msg_data(s,
+                         VCHIQ_MAKE_MSG(VCHIQ_MSG_DATA,
+                                        VCHIQ_DISP_VC_PORT, s->disp_port),
+                         msg, words * 4);
+}
+
+static uint32_t disp_mint_handle(BCM2835VchiqState *s)
+{
+    if (++s->disp_next_handle == 0) {
+        s->disp_next_handle = 1;
+    }
+    return s->disp_next_handle;
+}
+
+/*
+ * DisplayGetInfo answers the physical display's size, from which the
+ * ROM derives the desktop-to-display scale and offset
+ * (Dispmanx_CalcDisplayScaleOffset).  Answering the mode's own size
+ * makes that arithmetic the identity: the sprite's destination
+ * rectangle is then guest pixels outright, which is what the compositor
+ * assumes.
+ */
+static void disp_display_size(uint32_t *w, uint32_t *h)
+{
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    BCM2835FBConfig cfg;
+
+    *w = 640;
+    *h = 480;
+    if (obj) {
+        bcm2835_fb_get_config(BCM2835_FB(obj), &cfg);
+        if (cfg.xres && cfg.yres) {
+            *w = cfg.xres;
+            *h = cfg.yres;
+        }
+    }
+}
+
+/*
+ * UpdateSubmit.  Dispmanx applies an update at vsync, so the
+ * transaction becomes visible here, all of it or none: the image is
+ * never read half-written and the compositor never sees half a move.
+ */
+static void disp_commit(BCM2835VchiqState *s)
+{
+    if (s->disp_stage_len) {
+        memcpy(s->ptr_image, s->disp_stage, s->disp_stage_len);
+        s->disp_stage_len = 0;
+    }
+    if (s->disp_tx_pending) {
+        s->ptr_visible = s->disp_tx_visible;
+        s->ptr_x = s->disp_tx_x;
+        s->ptr_y = s->disp_tx_y;
+        s->ptr_w = s->disp_tx_w;
+        s->ptr_h = s->disp_tx_h;
+        /* the sprite's own resolution: the resource's, never the dest
+         * rect's -- the plane is mode-independent and the rect may be
+         * scaled by the ROM's display arithmetic */
+        s->ptr_img_w = s->disp_res_w;
+        s->ptr_img_h = s->disp_res_h;
+        s->disp_tx_pending = false;
+        trace_bcm2835_vchiq_disp_pointer(s->ptr_visible, s->ptr_x, s->ptr_y,
+                                         s->ptr_w, s->ptr_h);
+    }
+    s->ptr_gen++;
+}
+
+static void disp_reset(BCM2835VchiqState *s)
+{
+    s->disp_resource = 0;
+    s->disp_res_w = 0;
+    s->disp_res_h = 0;
+    s->disp_element = 0;
+    s->disp_bulk_len = 0;
+    s->disp_stage_len = 0;
+    s->disp_tx_pending = false;
+    s->ptr_visible = false;
+    s->ptr_w = 0;
+    s->ptr_h = 0;
+    s->ptr_img_w = 0;
+    s->ptr_img_h = 0;
+    s->ptr_gen++;               /* the compositor drops what it had */
+}
+
+/*
+ * One dispmanx message out of a DATA carrying it.  The reply protocol
+ * is Dispmanx_Send's (BCMVideo/s/Dispmanx:237-309): a reply is wanted
+ * for any command without the NoReply bit -- four bytes, twenty for
+ * DisplayGetInfo -- and the client dequeues FIFO, so replies go back
+ * strictly in ask order.
+ *
+ * Message layouts are read out of the ROM's senders: ElementAdd is
+ * HWP_RTRoutine's 108-byte block with the destination rectangle at
+ * +16 and the resource at +32; ElementChangeAttributes is its 64-byte
+ * block with the rectangle at +32.
+ */
+static unsigned disp_handle_msg(BCM2835VchiqState *s, uint32_t hdr,
+                                uint32_t size)
+{
+    uint32_t body = hdr + VCHIQ_MSG_HDR_SIZE;
+    uint32_t word[5] = { 0 };
+    uint32_t cmd, op;
+
+    if (size < 4) {
+        return 0;
+    }
+    cmd = vchiq_ld(s, body);
+    op = cmd & ~EDISPMAN_NO_REPLY;
+    trace_bcm2835_vchiq_disp_msg(op, cmd & EDISPMAN_NO_REPLY);
+
+    switch (op) {
+    case EDISPMAN_DISPLAY_OPEN:
+        word[0] = disp_mint_handle(s);
+        disp_reply(s, word, 1);
+        return 1;
+
+    case EDISPMAN_DISPLAY_GET_INFO: {
+        uint32_t w, h;
+
+        disp_display_size(&w, &h);
+        s->disp_info_w = w;
+        s->disp_info_h = h;
+        trace_bcm2835_vchiq_disp_getinfo(w, h);
+        word[0] = 0;               /* result */
+        word[1] = w;
+        word[2] = h;
+        word[3] = 0;               /* transform */
+        word[4] = 1;               /* format: RGB565 */
+        disp_reply(s, word, 5);
+        return 1;
+    }
+
+    case EDISPMAN_RESOURCE_CREATE:
+        /* {type, width, height}: the pointer's 32x32 ARGB */
+        if (size >= 16) {
+            uint32_t w = vchiq_ld(s, body + 8);
+            uint32_t h = vchiq_ld(s, body + 12);
+
+            if (w && h && w <= VCHIQ_DISP_SPRITE_MAX
+                && h <= VCHIQ_DISP_SPRITE_MAX) {
+                s->disp_resource = disp_mint_handle(s);
+                s->disp_res_w = w;
+                s->disp_res_h = h;
+                word[0] = s->disp_resource;
+                disp_reply(s, word, 1);
+                return 1;
+            }
+        }
+        word[0] = (uint32_t)-1;
+        disp_reply(s, word, 1);
+        return 1;
+
+    case EDISPMAN_BULK_WRITE:
+        /* {resource, offset, length}; the bytes follow as a bulk */
+        s->disp_bulk_len = 0;
+        if (size >= 16 && vchiq_ld(s, body + 4) == s->disp_resource) {
+            uint32_t len = vchiq_ld(s, body + 12);
+
+            if (len && len <= VCHIQ_DISP_IMAGE_BYTES) {
+                s->disp_bulk_len = len;
+            }
+        }
+        return 0;                   /* NoReply */
+
+    case EDISPMAN_UPDATE_START:
+        s->disp_tx_pending = false; /* a fresh transaction */
+        word[0] = disp_mint_handle(s);
+        disp_reply(s, word, 1);
+        return 1;
+
+    case EDISPMAN_ELEMENT_ADD: {
+        uint32_t layer = size >= 16 ? vchiq_ld(s, body + 12) : 0;
+
+        if (size >= 36 && layer == EDISPMAN_LAYER_POINTER
+            && vchiq_ld(s, body + 32) == s->disp_resource) {
+            s->disp_tx_pending = true;
+            s->disp_tx_visible = true;
+            s->disp_tx_x = (int32_t)vchiq_ld(s, body + 16);
+            s->disp_tx_y = (int32_t)vchiq_ld(s, body + 20);
+            s->disp_tx_w = (int32_t)vchiq_ld(s, body + 24);
+            s->disp_tx_h = (int32_t)vchiq_ld(s, body + 28);
+            s->disp_element = disp_mint_handle(s);
+            word[0] = s->disp_element;
+        } else {
+            word[0] = (uint32_t)-1; /* not a pointer element: refused */
+        }
+        disp_reply(s, word, 1);
+        return 1;
+    }
+
+    case EDISPMAN_ELEMENT_CHANGE_ATTRIBUTES:
+        if (size >= 48 && vchiq_ld(s, body + 8) == s->disp_element) {
+            s->disp_tx_pending = true;
+            s->disp_tx_x = (int32_t)vchiq_ld(s, body + 32);
+            s->disp_tx_y = (int32_t)vchiq_ld(s, body + 36);
+            s->disp_tx_w = (int32_t)vchiq_ld(s, body + 40);
+            s->disp_tx_h = (int32_t)vchiq_ld(s, body + 44);
+        }
+        return 0;                   /* NoReply */
+
+    case EDISPMAN_ELEMENT_REMOVE:
+        if (size >= 12 && vchiq_ld(s, body + 8) == s->disp_element) {
+            s->disp_tx_pending = true;
+            s->disp_tx_visible = false;
+        }
+        return 0;                   /* NoReply */
+
+    case EDISPMAN_UPDATE_SUBMIT:
+        disp_commit(s);
+        word[0] = 0;
+        disp_reply(s, word, 1);
+        return 1;
+
+    case EDISPMAN_RESOURCE_DELETE:
+        if (size >= 8 && vchiq_ld(s, body + 4) == s->disp_resource) {
+            s->disp_resource = 0;
+        }
+        word[0] = 0;
+        disp_reply(s, word, 1);
+        return 1;
+
+    default:
+        /* DisplayClose and every command the pointer does not use */
+        if (!(cmd & EDISPMAN_NO_REPLY)) {
+            word[0] = (uint32_t)-1;
+            disp_reply(s, word, 1);
+            return 1;
+        }
+        return 0;
+    }
+}
+
+/* The committed pointer sprite, for the compositor (ui/metal).  UI
+ * thread, no BQL: the generation is a seqlock, so a read that raced a
+ * commit is reported stale and the caller keeps the previous frame's
+ * sprite rather than a mixed one. */
+bool bcm2835_vchiq_get_cursor(VchiqCursor *out)
+{
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_VCHIQ, NULL);
+    BCM2835VchiqState *s;
+    uint32_t gen;
+
+    if (!obj) {
+        return false;
+    }
+    s = BCM2835_VCHIQ(obj);
+
+    gen = qatomic_read(&s->ptr_gen);
+    smp_rmb();
+    out->generation = gen;
+    out->visible = s->ptr_visible;
+    out->x = s->ptr_x;
+    out->y = s->ptr_y;
+    out->w = s->ptr_w;
+    out->h = s->ptr_h;
+    out->img_w = s->ptr_img_w;
+    out->img_h = s->ptr_img_h;
+    out->disp_w = s->disp_info_w;
+    out->disp_h = s->disp_info_h;
+    out->argb = s->ptr_image;
+    smp_rmb();
+    out->stale = qatomic_read(&s->ptr_gen) != gen;
+    return true;
+}
+
 /*
  * The guest has handed us slot zero. Set up our half of it, answer its
  * CONNECT, and wake it.
@@ -832,6 +1120,28 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
                     VCHIQ_MAKE_MSG(VCHIQ_MSG_OPENACK,
                                    VCHIQ_AUDS_VC_PORT, srcport),
                     &ack, 4);
+            } else if (fourcc == VCHIQ_FOURCC_DISP && !s->disp_open) {
+                uint32_t ack = VCHIQ_DISP_VERSION;
+
+                s->disp_open = true;
+                s->disp_port = srcport;
+                trace_bcm2835_vchiq_disp_open(srcport);
+                replies += vchiq_queue_msg_data(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_OPENACK,
+                                   VCHIQ_DISP_VC_PORT, srcport),
+                    &ack, 4);
+            } else if (fourcc == VCHIQ_FOURCC_UPDH && !s->updh_open) {
+                /* The notification service: opened for completeness,
+                 * its ROM-side callback is an empty stub, so nothing is
+                 * ever sent on it. */
+                uint32_t ack = VCHIQ_DISP_VERSION;
+
+                s->updh_open = true;
+                s->updh_port = srcport;
+                replies += vchiq_queue_msg_data(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_OPENACK,
+                                   VCHIQ_UPDH_VC_PORT, srcport),
+                    &ack, 4);
             } else {
                 trace_bcm2835_vchiq_open(fourcc, srcport);
                 replies += vchiq_queue_msg(s,
@@ -844,6 +1154,9 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
             if (s->auds_open &&
                 VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_AUDS_VC_PORT) {
                 replies += auds_handle_msg(s, hdr, size);
+            } else if (s->disp_open &&
+                       VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_DISP_VC_PORT) {
+                replies += disp_handle_msg(s, hdr, size);
             }
             break;
         case VCHIQ_MSG_BULK_TX:
@@ -876,6 +1189,24 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
                     &bulk_size, 4);
                 /* Only what we actually read can be played on */
                 auds_queue_playback(s, MIN(got, bulk_size));
+            } else if (s->disp_open &&
+                       VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_DISP_VC_PORT) {
+                /* The sprite image the ROM converted.  It lands in the
+                 * staging buffer and is committed whole at the next
+                 * UpdateSubmit, so the compositor can never read a
+                 * half-written shape. */
+                uint32_t got = vchiq_bulk_gather(s, bulk_page);
+
+                if (got && s->disp_bulk_len) {
+                    uint32_t n = MIN(got, s->disp_bulk_len);
+
+                    memcpy(s->disp_stage, s->bulk_buf, n);
+                    s->disp_stage_len = n;
+                }
+                replies += vchiq_queue_msg_data(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_BULK_TX_DONE,
+                                   VCHIQ_DISP_VC_PORT, s->disp_port),
+                    &bulk_size, 4);
             }
             break;
         }
@@ -889,6 +1220,19 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
                     VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE,
                                    VCHIQ_AUDS_VC_PORT, s->auds_port), 0);
                 auds_close(s);
+            } else if (s->disp_open &&
+                       VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_DISP_VC_PORT) {
+                replies += vchiq_queue_msg(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE,
+                                   VCHIQ_DISP_VC_PORT, s->disp_port), 0);
+                s->disp_open = false;
+                disp_reset(s);
+            } else if (s->updh_open &&
+                       VCHIQ_MSG_DSTPORT(msgid) == VCHIQ_UPDH_VC_PORT) {
+                replies += vchiq_queue_msg(s,
+                    VCHIQ_MAKE_MSG(VCHIQ_MSG_CLOSE,
+                                   VCHIQ_UPDH_VC_PORT, s->updh_port), 0);
+                s->updh_open = false;
             }
             break;
         case VCHIQ_MSG_CONNECT:
@@ -1019,8 +1363,8 @@ static const MemoryRegionOps bcm2835_vchiq_bell_ops = {
 
 static const VMStateDescription vmstate_bcm2835_vchiq = {
     .name = TYPE_BCM2835_VCHIQ,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(bell0, BCM2835VchiqState),
         VMSTATE_UINT32(slot0, BCM2835VchiqState),
@@ -1041,6 +1385,29 @@ static const VMStateDescription vmstate_bcm2835_vchiq = {
         VMSTATE_UINT32(auds_cookie1, BCM2835VchiqState),
         VMSTATE_UINT32(auds_cookie2, BCM2835VchiqState),
         VMSTATE_BOOL(auds_running, BCM2835VchiqState),
+        VMSTATE_BOOL(disp_open, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_port, BCM2835VchiqState),
+        VMSTATE_BOOL(updh_open, BCM2835VchiqState),
+        VMSTATE_UINT32(updh_port, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_next_handle, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_resource, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_res_w, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_res_h, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_element, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_info_w, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_info_h, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_res_w, BCM2835VchiqState),
+        VMSTATE_UINT32(disp_res_h, BCM2835VchiqState),
+        VMSTATE_BOOL(ptr_visible, BCM2835VchiqState),
+        VMSTATE_INT32(ptr_x, BCM2835VchiqState),
+        VMSTATE_INT32(ptr_y, BCM2835VchiqState),
+        VMSTATE_INT32(ptr_w, BCM2835VchiqState),
+        VMSTATE_INT32(ptr_h, BCM2835VchiqState),
+        VMSTATE_UINT32(ptr_img_w, BCM2835VchiqState),
+        VMSTATE_UINT32(ptr_img_h, BCM2835VchiqState),
+        VMSTATE_UINT32(ptr_gen, BCM2835VchiqState),
+        VMSTATE_UINT32_ARRAY(ptr_image, BCM2835VchiqState,
+                             VCHIQ_DISP_SPRITE_MAX * VCHIQ_DISP_SPRITE_MAX),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1089,6 +1456,12 @@ static void bcm2835_vchiq_reset(DeviceState *dev)
     s->auds_bps = 0;
     s->auds_cookie1 = 0;
     s->auds_cookie2 = 0;
+    /* The services close with the machine, and the sprite goes too */
+    s->auds_open = false;
+    s->disp_open = false;
+    s->updh_open = false;
+    s->updh_port = 0;
+    disp_reset(s);
 }
 
 static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)

@@ -113,6 +113,18 @@ what the host's sound card takes is what the guest is told has played, so
 its clock is the real output device and delivery measures 0.998x real
 time. `riscos-pi4/SOUND.md` is the research and the three sprints.
 
+**The pointer is a hardware sprite again.** On a real Pi the pointer is a
+dispmanx overlay the GPU composites; this fork refused that service, so
+the kernel painted a software pointer into the framebuffer — a save-under
+and restore bracketing every plot while the pointer was on screen. The
+VCHIQ peer now answers `'DISP'` with the subset the pointer uses: the ROM
+converts its own 2 bpp shape (the anti-fringe fill included) and
+bulk-writes a 32×32 ARGB image, moves arrive as element transactions
+committed at `UpdateSubmit`, and the window composites the sprite over
+the frame — sharp at any scale, never in guest RAM, the save-under tax
+gone from every redraw. `riscos-pi4/GPUDESIGN.md` is the design and the
+build record.
+
 Not working yet: `SET_CLOCK_RATE` is still NYI. There is no way to get files
 into a running guest except through the card image. The boot spends about
 five seconds reading the card at a millisecond per stall for reasons that
@@ -150,7 +162,8 @@ infrastructure:
 - `hw/misc`: BCM2835 mailbox **channel 0** (power management) — defined since
   the mailbox was first modelled, never given a peer
 - `hw/misc`: a **VCHIQ peer** for mailbox channel 3, plus the VC→ARM and
-  ARM→VC doorbells
+  ARM→VC doorbells — answering the `'AUDS'` audio and `'DISP'` pointer
+  services, refusing the rest
 - `hw/misc/bcm2835_property`: the touch and GPIO virtual buffer tags, and the
   GPIO state tags; and **`GET_EDID_BLOCK`**, answered with an EDID block for
   an 800×600 monitor, which is what turns the 640×256 fallback into a desktop
@@ -353,6 +366,14 @@ which hypotheses were wrong, and why each fix is shaped the way it is.
 for the sound that is not there yet — researched against the ROM's own
 sources, and turning out to need no audio hardware at all, because RISC OS
 reaches the speaker through the VCHIQ service this fork already owns.
+`riscos-pi4/SCRIPTING.md` designs the macOS app's Apple Events surface —
+an AppleScript/JXA control and debugging API whose first user is an AI
+agent, and the bundle and signing that go with it.
+`riscos-pi4/GPUDESIGN.md` expands Sprint 13 for the Mac, its scope
+settled by reading the ROOL ROM sources tree-wide: the pointer as a
+sprite the host answers for over `'DISP'`, the sprite plots accelerated
+through a `SpriteV` module — and the rectangle fill deferred until the
+project builds its own ROM and a real blitter device with it.
 
 ## Licence
 

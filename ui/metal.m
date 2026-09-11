@@ -105,6 +105,24 @@ static struct {
 static bool fb_failed;
 static uint32_t fb_failed_generation;
 
+/* The pointer sprite: a pipeline and an image that do not depend on
+ * the guest's mode, built once beside the scale pass.  The VCHIQ peer
+ * answers the dispmanx requests the ROM sends for its hardware
+ * pointer, so the sprite is composited here on top of the scaled
+ * frame -- never written to guest RAM, sharp at any window scale, and
+ * without the scanline mask: on a real Acorn machine the sprite lay
+ * over the CRT, it was not part of its raster. */
+#define METAL_CURSOR_TEXELS 64     /* words per side, as the peer defines */
+static struct {
+    id<MTLRenderPipelineState> pipe;
+    id<MTLBuffer> image;            /* METAL_CURSOR_TEXELS^2 ARGB words */
+    bool visible;
+    uint32_t generation;
+    int32_t x, y, w, h;             /* dest rect, display pixels */
+    int32_t img_w, img_h;           /* the sprite's own resolution */
+    int32_t disp_w, disp_h;         /* the display the rect is measured in */
+} ptr;
+
 /* The shader constants, mirroring the Params struct in the MSL below. */
 typedef struct {
     uint32_t dim[4];    /* xres, yres, pitch(bytes), bpp */
@@ -546,6 +564,38 @@ static NSString * const SHADER_SRC = @""
 "        }\n"
 "    }\n"
 "    return float4(c.rgb, 1.0);\n"
+"}\n"
+"\n"
+"vertex VSOut vs_quad(uint id [[vertex_id]], constant float4 &R [[buffer(0)]])\n"
+"{\n"
+"    /* one triangle covering the NDC rectangle R = {x0, y0, x1, y1}:\n"
+"     * the vertices overshoot to 2x the rectangle's span, the same\n"
+"     * trick as vs_main, so the unit square of t lies strictly inside\n"
+"     * and no pixel of the rectangle lands on the hypotenuse (a\n"
+"     * corner-exact triangle loses its lower right half to the\n"
+"     * top-left fill rule).  uv runs 0..1 across the rectangle; the\n"
+"     * overhang samples past 1 and the fragment clamps it. */\n"
+"    VSOut o;\n"
+"    float2 t = float2((id << 1) & 2, id & 2);\n"
+"    o.pos = float4(R.xy + t * (R.zw - R.xy), 0, 1);\n"
+"    o.uv = t;\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 ps_pointer(VSOut v [[stage_in]],\n"
+"                           constant uint2 &dim [[buffer(0)]],\n"
+"                           device const uchar4 *img [[buffer(1)]])\n"
+"{\n"
+"    /* The triangle overshoots the rectangle on purpose; its overhang\n"
+"     * is not clipped by anything, so drop it here.  The image words\n"
+"     * are little-endian 0xAARRGGBB, so the bytes are B, G, R, A --\n"
+"     * what HWP_Update's REV-plus-alpha leaves in guest memory. */\n"
+"    if (v.uv.x > 1.0f || v.uv.y > 1.0f) {\n"
+"        discard_fragment();\n"
+"    }\n"
+"    uint2 t = min(uint2(v.uv * float2(dim)), dim - 1);\n"
+"    uchar4 c = img[t.y * dim.x + t.x];\n"
+"    return float4(float(c.z), float(c.y), float(c.x), float(c.w)) / 255.0f;\n"
 "}\n";
 
 static bool metal_compile_library(void)
@@ -714,6 +764,53 @@ static bool fb_build_scale(void)
     return fb.scale != nil;
 }
 
+/* The pointer pipeline: straight alpha, so the ROM's anti-fringe fill
+ * (transparent pixels carrying the neighbouring colour at alpha 0)
+ * behaves exactly as it does against the firmware's compositor. */
+static bool ptr_build(void)
+{
+    MTLRenderPipelineDescriptor *pd;
+    id<MTLFunction> vs, fs;
+    NSError *err = nil;
+
+    vs = [m.library newFunctionWithName:@"vs_quad"];
+    fs = [m.library newFunctionWithName:@"ps_pointer"];
+    if (!vs || !fs) {
+        metal_log("pointer shader functions missing");
+        [vs release];
+        [fs release];
+        return false;
+    }
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
+    pd.colorAttachments[0].pixelFormat = m.layer.pixelFormat;
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    ptr.pipe = [m.device newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [vs release];
+    [fs release];
+    if (!ptr.pipe) {
+        metal_log("pointer pipeline failed: %s",
+                  err ? [[err localizedDescription] UTF8String] : "?");
+        return false;
+    }
+    ptr.image = [m.device
+        newBufferWithLength:METAL_CURSOR_TEXELS * METAL_CURSOR_TEXELS * 4
+                    options:MTLResourceStorageModeShared];
+    if (!ptr.image) {
+        metal_log("pointer image buffer failed");
+        return false;
+    }
+    return true;
+}
+
 static void fb_upload(const MetalFbView *v)
 {
     fb.ring = (fb.ring + 1) % METAL_RING;
@@ -866,6 +963,54 @@ static bool metal_render_frame(void)
         [enc drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0 vertexCount:3];
     }
+
+    /* The pointer sprite, on top of the scaled frame.  The peer
+     * commits whole transactions at UpdateSubmit, so a generation move
+     * is always a complete new sprite and position; a read that raced
+     * one is reported stale and the previous frame's is kept. */
+    {
+        MetalCursorView cv;
+
+        if (ptr.pipe && metal_glue_cursor_view(&cv) && !cv.stale
+            && cv.generation != ptr.generation) {
+            memcpy([ptr.image contents], cv.argb,
+                   METAL_CURSOR_TEXELS * METAL_CURSOR_TEXELS * 4);
+            ptr.generation = cv.generation;
+            ptr.visible = cv.visible;
+            ptr.x = cv.x;
+            ptr.y = cv.y;
+            ptr.w = cv.w;
+            ptr.h = cv.h;
+            ptr.img_w = cv.img_w;
+            ptr.img_h = cv.img_h;
+            ptr.disp_w = cv.disp_w;
+            ptr.disp_h = cv.disp_h;
+        }
+        if (have_fb && ptr.pipe && ptr.visible && ptr.w > 0 && ptr.h > 0
+            && ptr.img_w > 0 && ptr.img_h > 0) {
+            float rect[4];
+            uint32_t dim[2];
+            double dw = ptr.disp_w > 0 ? ptr.disp_w : (int32_t)v.xres;
+            double dh = ptr.disp_h > 0 ? ptr.disp_h : (int32_t)v.yres;
+
+            /* The dest rect is in display pixels -- the space the ROM's
+             * own scale arithmetic produced it in -- and the view is
+             * that display; the image keeps its own resolution and is
+             * stretched to the rect, whatever mode is underneath. */
+            rect[0] = (float)(2.0 * (double)ptr.x / dw - 1.0);
+            rect[1] = (float)(1.0 - 2.0 * (double)ptr.y / dh);
+            rect[2] = (float)(rect[0] + 2.0 * (double)ptr.w / dw);
+            rect[3] = (float)(rect[1] - 2.0 * (double)ptr.h / dh);
+            dim[0] = (uint32_t)ptr.img_w;
+            dim[1] = (uint32_t)ptr.img_h;
+            [enc setRenderPipelineState:ptr.pipe];
+            [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+            [enc setFragmentBytes:dim length:sizeof(dim) atIndex:0];
+            [enc setFragmentBuffer:ptr.image offset:0 atIndex:1];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                    vertexStart:0 vertexCount:3];
+        }
+    }
     [enc endEncoding];
 
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -916,6 +1061,63 @@ static void metal_screenshot(void)
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+
+    /* The pointer is composited over the frame, not in it, and a
+     * screenshot shows what a human sees: blend the sprite in with the
+     * same straight alpha the pipeline uses.  The dest rect is in
+     * display pixels, so it is mapped into the decoded surface's own
+     * guest pixels first; the image is indexed by its own resolution. */
+    {
+        MetalCursorView cv;
+
+        if (metal_glue_cursor_view(&cv) && !cv.stale && cv.visible
+            && cv.w > 0 && cv.h > 0 && cv.img_w > 0 && cv.img_h > 0
+            && cv.disp_w > 0 && cv.disp_h > 0) {
+            uint8_t *px = [staging contents];
+            const uint8_t *sp = cv.argb;
+            double kx = (double)fb.xres / (double)cv.disp_w;
+            double ky = (double)fb.yres / (double)cv.disp_h;
+            /* sprite texels per guest pixel, for the stretch */
+            double tx = (double)cv.img_w / ((double)cv.w * kx);
+            double ty = (double)cv.img_h / ((double)cv.h * ky);
+            int32_t gx0 = (int32_t)(cv.x * kx);
+            int32_t gy0 = (int32_t)(cv.y * ky);
+            int32_t gx1 = (int32_t)((cv.x + cv.w) * kx);
+            int32_t gy1 = (int32_t)((cv.y + cv.h) * ky);
+            int32_t x0 = gx0 < 0 ? 0 : gx0;
+            int32_t y0 = gy0 < 0 ? 0 : gy0;
+            int32_t sx, sy;
+
+            if (gx1 > (int32_t)fb.xres) {
+                gx1 = (int32_t)fb.xres;
+            }
+            if (gy1 > (int32_t)fb.yres) {
+                gy1 = (int32_t)fb.yres;
+            }
+            for (sy = y0; sy < gy1; sy++) {
+                for (sx = x0; sx < gx1; sx++) {
+                    /* nearest sprite texel for this guest pixel; the
+                     * sprite bytes are B,G,R,A, the surface R,G,B,A */
+                    int32_t ix = (int32_t)((sx - gx0) * tx);
+                    int32_t iy = (int32_t)((sy - gy0) * ty);
+
+                    if (ix >= cv.img_w) {
+                        ix = cv.img_w - 1;
+                    }
+                    if (iy >= cv.img_h) {
+                        iy = cv.img_h - 1;
+                    }
+                    const uint8_t *s = sp + (size_t)(iy * cv.img_w + ix) * 4;
+                    uint8_t *d = px + (size_t)(sy * fb.xres + sx) * 4;
+                    int a = s[3];
+
+                    d[0] = (uint8_t)(d[0] + (s[2] - d[0]) * a / 255);
+                    d[1] = (uint8_t)(d[1] + (s[1] - d[1]) * a / 255);
+                    d[2] = (uint8_t)(d[2] + (s[0] - d[2]) * a / 255);
+                }
+            }
+        }
+    }
 
     cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     ctx = CGBitmapContextCreate([staging contents], fb.xres, fb.yres, 8,
@@ -1370,7 +1572,7 @@ int metal_backend_init(void)
         metal_log("no window");
         return -1;
     }
-    if (!metal_compile_library() || !fb_build_scale()) {
+    if (!metal_compile_library() || !fb_build_scale() || !ptr_build()) {
         return -1;
     }
 

@@ -118,6 +118,66 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835VchiqState, BCM2835_VCHIQ)
 #define VCHIQ_AUDS_RING_BYTES       (128 * 1024)
 
 /*
+ * The dispmanx display service -- the pointer, said yes to. RISC OS's
+ * hardware pointer is a dispmanx element over this service (BCMVideo
+ * s/HWPointer), so answering it makes the pointer a sprite the host
+ * composites and takes out of the framebuffer entirely -- see
+ * riscos-pi4/GPUDESIGN.md section 2. Message numbers, layouts and the
+ * reply protocol are BCMVideo/s/{Dispmanx,HWPointer}, which are the de
+ * facto specification the same way Linux's headers were for 'AUDS'.
+ */
+#define VCHIQ_FOURCC_DISP           0x44495350  /* 'DISP' */
+#define VCHIQ_FOURCC_UPDH           0x55504448  /* 'UPDH', update notify */
+#define VCHIQ_DISP_VERSION          2
+/* Our ports for the two services. The guest records each as its
+ * service's remoteport and matches on it thereafter, so they must stay
+ * distinct and constant for the session. */
+#define VCHIQ_DISP_VC_PORT          2
+#define VCHIQ_UPDH_VC_PORT          3
+
+/* EDispman* command numbers, BCMVideo/s/Dispmanx:19-50 */
+#define EDISPMAN_RESOURCE_CREATE            3
+#define EDISPMAN_RESOURCE_DELETE            5
+#define EDISPMAN_DISPLAY_OPEN               8
+#define EDISPMAN_DISPLAY_GET_INFO           14
+#define EDISPMAN_DISPLAY_CLOSE              15
+#define EDISPMAN_UPDATE_START               16
+#define EDISPMAN_UPDATE_SUBMIT              17
+#define EDISPMAN_ELEMENT_ADD                19
+#define EDISPMAN_ELEMENT_REMOVE             21
+#define EDISPMAN_ELEMENT_CHANGE_ATTRIBUTES  24
+#define EDISPMAN_BULK_WRITE                 27
+#define EDISPMAN_NO_REPLY                   (1u << 31)
+
+/* The one layer we serve: the pointer's (Depth_Pointer, BCMVideo:272).
+ * ElementAdd with any other layer is refused, which is what keeps
+ * GVOverlay inert while the service is open. */
+#define EDISPMAN_LAYER_POINTER              2000
+
+/* The ROM's pointer resource is 32x32 ARGB; 64 is a sanity bound. */
+#define VCHIQ_DISP_SPRITE_MAX               64
+#define VCHIQ_DISP_IMAGE_BYTES \
+    (VCHIQ_DISP_SPRITE_MAX * VCHIQ_DISP_SPRITE_MAX * 4)
+
+/* The committed pointer sprite, as the compositor reads it.  Single
+ * writer (the main loop under the BQL); the UI thread reads it without
+ * a lock, using the generation as a seqlock exactly as the framebuffer
+ * config does.  The image words are little-endian 0xAARRGGBB, which is
+ * what HWP_Update's REV-plus-alpha leaves in guest memory. */
+typedef struct VchiqCursor {
+    uint32_t generation;
+    bool stale;                 /* read raced a commit: keep the last one */
+    bool visible;
+    int32_t x, y;               /* dest rect, display pixels, top-left */
+    int32_t w, h;               /* dest rect size, display pixels */
+    uint32_t img_w, img_h;      /* the sprite's own resolution, texels */
+    uint32_t disp_w, disp_h;    /* the display the dest rect is measured in */
+    const uint32_t *argb;       /* img_w * img_h words */
+} VchiqCursor;
+
+bool bcm2835_vchiq_get_cursor(VchiqCursor *out);
+
+/*
  * The bulk transfers do not carry the samples: they carry the bus address
  * of a pagelist describing where the samples are. Linux's
  * vchiq_pagelist.h is the layout, and RISC OS ships a copy of it.
@@ -214,6 +274,35 @@ struct BCM2835VchiqState {
     HRTimer *auds_timer;
     uint64_t auds_outstanding;  /* bytes taken but not yet reported played */
     int64_t auds_played_ns;     /* when the audio queued so far runs out */
+
+    /*
+     * The dispmanx display service, while the guest has it open. The
+     * staging half holds what the current transaction has gathered;
+     * UpdateSubmit commits it into the ptr_* half atomically, which is
+     * dispmanx's own vsync semantics and what makes a torn sprite
+     * impossible rather than merely unlikely.
+     */
+    bool disp_open;
+    uint32_t disp_port;         /* the guest's port for 'DISP' */
+    bool updh_open;
+    uint32_t updh_port;
+    uint32_t disp_next_handle;  /* minted nonzero: display/resource/update/element */
+    uint32_t disp_resource;     /* the pointer's resource, 0 when none */
+    uint32_t disp_res_w, disp_res_h;
+    uint32_t disp_element;      /* the pointer's element, 0 when none */
+    uint32_t disp_bulk_len;     /* length the last BulkWrite announced */
+    uint32_t disp_stage[VCHIQ_DISP_SPRITE_MAX * VCHIQ_DISP_SPRITE_MAX];
+    uint32_t disp_stage_len;    /* bytes the last bulk gathered */
+    bool disp_tx_pending;       /* the transaction touched the pointer */
+    bool disp_tx_visible;
+    int32_t disp_tx_x, disp_tx_y, disp_tx_w, disp_tx_h;
+    uint32_t disp_info_w, disp_info_h;    /* what GetInfo answered */
+
+    uint32_t ptr_image[VCHIQ_DISP_SPRITE_MAX * VCHIQ_DISP_SPRITE_MAX];
+    uint32_t ptr_gen;
+    bool ptr_visible;
+    int32_t ptr_x, ptr_y, ptr_w, ptr_h;
+    uint32_t ptr_img_w, ptr_img_h;       /* the sprite's own resolution */
 
     /* The samples, gathered out of the pagelist each bulk describes */
     uint8_t *bulk_buf;
