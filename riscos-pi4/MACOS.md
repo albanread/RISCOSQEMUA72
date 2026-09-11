@@ -230,6 +230,11 @@ needed yet.
   from it and `describe` returns it as JSON. `SCRIPTING.md` §13–14
   record the measurements (16.7 ms per event, QMP 0.1 ms) and the wire
   lessons. The control and debug commands are E2–E3.
+- **The app has its icon.** A silver cog on a navy rounded-square tile,
+  drawn entirely from geometry by `riscos-pi4/tools/mkicon.py` (original
+  artwork — the repository carries no third-party material — and a nod to
+  RISC OS's cog branding), packed into `riscos-pi4/app/AppIcon.icns` and
+  wired through `CFBundleIconFile` and `make-bundle.sh`.
 - **Grab, full screen and the snapshot menu are written but unexercised.**
   ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
 

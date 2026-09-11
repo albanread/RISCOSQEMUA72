@@ -25,6 +25,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/"
 cp "$ROOT/riscos-pi4/app/Info.plist" "$APP/Contents/"
 cp "$ROOT/riscos-pi4/app/RISCOSQEMU.sdef" "$APP/Contents/Resources/"
+# The icon is drawn from scratch by mkicon.py (original geometry, no
+# third-party artwork) and lands in Resources for CFBundleIconFile.
+cp "$ROOT/riscos-pi4/app/AppIcon.icns" "$APP/Contents/Resources/"
 # Force a fresh ad-hoc signature every time: the executable is a copy of
 # an already-signed binary and the bundle contents change per build, so
 # a stale seal gets the app SIGKILLed at launch for an invalid signature
