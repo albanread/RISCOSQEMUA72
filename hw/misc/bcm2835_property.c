@@ -322,8 +322,10 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
         case RPI_FWREQ_SET_MAX_CLOCK_RATE:
         case RPI_FWREQ_SET_MIN_CLOCK_RATE:
             qemu_log_mask(LOG_UNIMP,
-                          "bcm2835_property: 0x%08x set clock rate NYI\n",
-                          tag);
+                          "bcm2835_property: 0x%08x set clock rate NYI "
+                          "(clock id %u, rate %u Hz)\n", tag,
+                          ldl_le_phys(&s->dma_as, value + 12),
+                          ldl_le_phys(&s->dma_as, value + 16));
             resplen = 8;
             break;
 
