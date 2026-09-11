@@ -1,75 +1,102 @@
-# GVFill — rectangle fills done by the host
+# GVFill — rectangle fills and sprite plots done by the host
 
 RISC OS asks its video driver to fill rectangles through
-`GraphicsV_Render` reason 2, `FillRectangle`.  BCMVideo declines it —
-the dispatcher in `BCMVideo/s/GraphicsV` tests only for
-`CopyRectangle` and `NOP` — so every window background, every `CLS` and
-every menu erase is plotted by the CPU a word at a time.  Under
-emulation that CPU is the slow part, which is why a large window
-redraws in visible pieces.
+`GraphicsV_Render` reason 2, and plots sprites through `SpriteV`.
+BCMVideo declines the fill — its dispatcher tests only for
+`CopyRectangle` and `NOP` — and sprites are plotted by SpriteExtend,
+which *generates* a bespoke ARM routine per format and caches only
+eight of them.  Under emulation that CPU work is the slow part.
 
-`GVFill` claims GraphicsV, answers `FillRectangle` by handing the
-rectangle to the `riscos-blitter` device, and returns
-`GraphicsV_Complete` so the kernel skips its own plot.  Everything else
-passes through with R4 untouched.
+`GVFill` claims both vectors, answers the cases it understands by
+handing the rectangle to the `riscos-blitter` device, and passes
+everything else through untouched.
 
-## What it accelerates
+## What it takes on
 
-Only a plain colour.  The colour block is sixteen words of interleaved
-`(ora, eor)`, and a fill is `(dest ORR ora) EOR eor` per word; when
-every `ora` is all ones that reduces to a constant and the destination
-need not be read.  Any other GCOL action, and any depth below 8bpp
-where a pixel is not a whole number of bytes, is left to the kernel.
+**Fills** — any plain colour.  The colour block is sixteen words of
+interleaved `(ora, eor)` and a fill is `(dest ORR ora) EOR eor` per
+word; when every `ora` is all ones that reduces to a constant.  Other
+GCOL actions need the destination read back and are left alone.
 
-The block's shape was settled by measurement, not by reading: `hdr/
-KernelWS` describes `GColAdr` as the address of an eight-word Ecf,
-while `vduwrch` builds a sixteen-word ora/eor block, and since no
-driver has ever implemented this operation nothing in the sources
-settles which arrives.  Observing both call sites on a live desktop
-showed sixteen words of `(ora, eor)` from each — `vduwrch`'s on the
-stack, `vdugrafa`'s in kernel workspace with `FFFFFFFF`/`FF888888`
-pairs, the desktop grey.  The KernelWS comment is stale.
+**Sprites** — `PutSpriteScaled` where the sprite is pointed at rather
+than named, 32bpp into a 32bpp screen, whole words edge to edge, and
+not actually scaling.  Nothing in a desktop session scales: every scale
+block sampled has equal multiplier and divisor, so this is a copy.
+
+Masked sprites are taken too.  At two bits per pixel and above the mask
+is one bit per pixel, least significant first, rows padded to whole
+words, a set bit meaning the pixel is plotted.  **The mask is used only
+when bit 3 of the plot action asks for it** — below 8 RISC OS plots
+solid even on a masked sprite.
+
+Packed sources (1/2/4/8bpp through a wide colour table) are implemented
+host-side but not currently reached; see below.
+
+## What it measures
+
+`*SprStats` — sprite plots seen, taken on, and passed, by count and by
+area, plus which gate declined the rest.
+
+`*SprBench` — a thousand plots of a 512x512 32bpp sprite the module
+owns, with the host doing it and then SpriteExtend, timed by the
+guest's clock.  It owns the sprite deliberately: an earlier version
+replotted whichever sprite the desktop last handed it and died when
+NetSurf moved its buffer.
+
+`*BlitFill` — paints 200x100 pixels at the top left, proving the device
+without involving GraphicsV.
+
+## Where it stands
+
+On a 1920x1200 desktop with NetSurf and a filer window:
+
+- **98.2% of sprite pixels** on the host — 753,664 against 13,571
+  passed.
+- **6.1x** on the plot itself: 490us a plot for SpriteExtend against
+  80us, of which 61.8us is the host blit and about 18us is guest-side.
+- **0 differing pixels of 2,304,000** against the same scene with the
+  module absent, re-checked after every change.
+
+What is left is one thing, not many.  Counting every gate separately —
+named 0, wastage 0, scaling 0, mask 0, depth 3, no table 0 — leaves the
+plot action with 56 of 59 declined calls.  Their raw values are 16 and
+24: **bit 4 is set on all of them and its meaning is not established**.
+`putscaled_compiler()` reads `gcol & 7` and `gcol & 8` and never looks
+higher, so ignoring it looked safe, but accepting those calls changed
+3468 pixels across a cluster of filer icons.  Finding out what bit 4
+does means reading the assembly veneer between `OS_SpriteOp` and that
+compiler, which is not in the C sources.  Until then they are declined.
 
 ## Building
 
-Pure assembly with no relocations, so it needs only clang and
-llvm-objcopy — not the `roscc` module linker the HostFS build uses,
-which is Windows-only and only necessary when there is C to link.
+Pure assembly with no relocations, so clang and llvm-objcopy suffice —
+not the `roscc` module linker, which is Windows-only and only needed
+for C.
 
 ```bash
-clang --target=arm-none-eabi -mcpu=cortex-a72 -mfloat-abi=soft \
-      -c blitmod.s -o blitmod.o
-llvm-objcopy -O binary --only-section=.text blitmod.o 'GVFill,ffa'
+./build.sh          # refuses to emit a module with relocations left
 ```
 
-`llvm-readobj -r blitmod.o` should report no relocations.  If it ever
-reports any, the module is not position independent and will not load.
+That check is the build, not a nicety: a module is loaded wherever the
+RMA has room and nothing relocates it, so a stray relocation is a
+branch into nowhere — and it does not fail at load, it takes the
+desktop black minutes later.
+
+**`ADR` reaches about a kilobyte and this handler has outgrown it
+twice**, the second time breaking code that used to assemble.  The
+handler carries its workspace in `r12`, which the vector dispatch
+provides for exactly that purpose.  Anything added should use
+`[r12, #off]` rather than a new `ADR`.
 
 ## Running
 
-Put `GVFill,ffa` in the HostFS root and load it.  The `,ffa` suffix
-matters: `*RMLoad` checks the filetype is &FFA, and the doorbell maps a
-`,xxx` suffix to the type while leaving it in the name.
+Put `GVFill,ffa` in the HostFS root and load it.  The `,ffa` matters:
+`*RMLoad` checks the filetype is &FFA, and the doorbell maps a `,xxx`
+suffix to the type while leaving it in the name.
 
 ```
 *RMLoad hostfs:$.GVFill,ffa
-*BlitFill
 ```
 
-`*BlitFill` paints 200x100 pixels at the top left, which proves the
-device without involving the GraphicsV path.
-
-The module maps its own device page with `OS_Memory 13` rather than
-assuming an address: RISC OS builds its logical map from what the HAL
-asks for, and a peripheral page nothing claimed simply aborts — which
-is what happens if you try to reach 0xFD404000 directly.
-
-## Status
-
-Verified on a 1280x1024 desktop: fifteen fills accelerated on a single
-redraw, two of them full-screen clears of 5120x1024 bytes, with the
-desktop drawing correctly.
-
-Not yet measured: a before-and-after timing.  A `*BlitBench` command
-that ran the same fills with the hook off and on hung in the software
-pass and was removed; the timing is still worth having.
+`*RMKill GVFill` takes it back out of the path instantly, which is the
+first thing to try if anything on screen looks wrong.
