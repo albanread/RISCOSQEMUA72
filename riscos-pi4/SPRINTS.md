@@ -339,6 +339,27 @@ Two routes, in order of cheapness:
 
    *Done when:* a `*Cat` typed in the guest appears in the host log.
 
+   **6D — HostFS on the icon bar (nice to have, low priority; not
+   required for Sprint 6).**  A small `HostFSFiler` module so a HostFS
+   root — a shared host folder, or a Samba share mounted on the host —
+   shows on the icon bar as a disc and opens like any drive.  The
+   desktop Filer already draws the windows and handles double-click and
+   drag for any registered filing system through the `FSEntry_Func`
+   calls the module answers, so this adds only the icon-bar lifecycle
+   (`Service_StartFiler` / `StartedFiler` / `FilerDying` / `ShutDown`),
+   the icon, `Filer_OpenDir "HostFS:$"` on a click, and a menu.
+   RAMFSFiler is the template to copy and trim.  One module
+   prerequisite: `FSEntry_Func 30` (ReadFreeSpace), fed by a new device
+   command sourcing the host figure (`statvfs` / `GetDiskFreeSpaceEx`),
+   or the disc's free display is blank.
+
+   Deferred behind reliable host file transfer, which is the live 6B
+   work and the immediate need: this is desktop polish on top of a
+   working filing system, not a way to make one work.
+
+   *Done when:* a HostFS root appears as a disc icon on the icon bar, a
+   click opens a filer window on it, and Free reports the host's figure.
+
 *Done when (sprint 6 as a whole):* a file written on the host is
 readable from the RISC OS desktop within a second and without a
 reboot, and a `*Cat` typed in the guest appears on the host.
@@ -401,6 +422,15 @@ framebuffer; dragging a window across the Pinboard backdrop, and scrolling
 a NetSurf page, show a measured speed-up with sprites and render ops
 offloaded; and a pixel-compare test shows every fall-through case producing
 exactly SpriteExtend's output.
+
+**Windows parity, from the Mac's G0.** The Metal front end has built the
+pointer half of this (`GPUDESIGN.md` section 8a). The device answers
+`'DISP'` in `hw/misc/bcm2835_vchiq.c`, which is shared C and already ours,
+and `ui/metal` composites the sprite through `metal_glue_cursor_view`. The
+D3D11 side is the untouched twin: a `dx11_glue_cursor_view` beside
+`dx11_glue_fb_view`, and a pointer-composite step in the output pass. Copy
+the Metal reference for the pointer. The render-op and sprite halves are
+still unbuilt on both front ends, so only the pointer has a twin to follow.
 
 ## 7 — the developer loop: roscc on the target (3–4 days)
 
@@ -586,6 +616,17 @@ choice, not a limit of ours.
 
 Done when the Display Manager lists the table and every entry displays.
 
+**Windows parity, from the Mac's wide modes.** The Metal decode reads the
+framebuffer as a plain `device const uchar *` buffer indexed by pitch,
+which removed the texture-width ceiling on the wide entries above. The
+D3D11 decode reads a `Texture2D<uint>` of `R8_UINT`, so a 3840-wide 32bpp
+mode is a 15360-byte pitch, just inside D3D11's 16384 texture limit, and
+anything wider overflows it. Move the decode source to a `ByteAddressBuffer`
+indexed by pitch, the twin of the Metal read, before the table reaches past
+3840 wide. The EDID table is device-side, so mode work done for the Mac
+lands here too; presenting the wide modes is the front-end task that stays
+ours.
+
 ## 17 — settings: one window, and a page that explains itself (4–5 days)
 
 The main window stays minimal: no toolbars, no panes. A key chord
@@ -612,6 +653,29 @@ of help beside it, and a mark on anything that needs a restart.
 Done when a new user can pick a mode, a card image and a HostFS folder
 without the command line, and the page reads as help rather than as a
 form.
+
+## 18 — sound: the audio path, on Windows (1–2 days)
+
+Sound is designed and built device-side in [`SOUND.md`](SOUND.md):
+`hw/misc/bcm2835_vchiq.c` answers the `AUDS` service, bulk-receives the
+sample stream, and plays it through QEMU's own audio backend, clocked by
+what the backend drains (the `COMPLETE`-is-the-clock trick). None of it is
+front-end code. It uses `DEFINE_AUDIO_PROPERTIES` and `audio_be_*`, so the
+backend is chosen with `-audiodev`: `coreaudio` on the Mac, and `dsound`
+on Windows, already in our build. For us this is wiring and verification,
+not new code.
+
+- Reach the vchiq peer's `DEFINE_AUDIO_PROPERTIES` from a Windows backend:
+  `-audiodev dsound,id=a0` in `riscos-pi4/tools/run.py`, with a backend
+  choice added to the settings model (Sprint 17).
+- Verify a RISC OS sound reaches the Windows speakers: a `Maestro` tune or
+  a sampled sound, and confirm the priming burst (`SampleRate/(BuffSize*5)`,
+  forced even, minimum two) does not stall at the start of every sound.
+- `AUDIODEV=none` stays silent rather than an error, the fallback
+  `SOUND.md` section 12 already built.
+
+Done when a RISC OS sound plays on Windows through `dsound`, and a machine
+started with no audio backend still boots and runs silently.
 
 ## Tier two, noted for later
 
