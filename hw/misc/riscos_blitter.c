@@ -297,12 +297,16 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
  */
 typedef struct {
     CPUState *cpu;
-    uint64_t page;          /* guest virtual page currently mapped */
-    uint8_t *host;          /* ... and where it lives, or NULL */
+    uint64_t va_base;       /* virtual base of the run currently mapped */
+    hwaddr pa_base;         /* and its physical base */
+    uint8_t *host;
     void *mapped;
-    hwaddr maplen;
+    hwaddr maplen;          /* bytes the map call gave us from pa_base */
+    uint64_t run_len;       /* bytes proven virtually and physically flat */
     bool valid;
 } BlitSrcWin;
+
+#define BLIT_SRC_MAP_MAX (1u << 20)
 
 static void blit_src_drop(BlitSrcWin *w)
 {
@@ -312,35 +316,77 @@ static void blit_src_drop(BlitSrcWin *w)
         w->mapped = NULL;
     }
     w->valid = false;
+    w->run_len = 0;
 }
 
+static bool blit_src_xlate(BlitSrcWin *w, uint64_t page, hwaddr *pa,
+                           MemTxAttrs *attrs)
+{
+    TranslateForDebugResult tres;
+
+    if (!cpu_translate_for_debug(w->cpu, page, &tres)) {
+        return false;
+    }
+    *pa = tres.physaddr;
+    *attrs = tres.attrs;
+    return true;
+}
+
+/*
+ * Reading the source a page at a time was still one address_space_map
+ * per page, and a megabyte of sprite is 256 of them -- most of the host
+ * cost of a large plot.  Map as much as the address space will give in
+ * one go, then walk forward page by page, extending the run for as long
+ * as the guest's pages stay physically flat inside what was mapped.
+ * Translation is the cheap half; mapping is the half worth avoiding.
+ */
 static bool blit_src_read(BlitSrcWin *w, uint64_t va, uint8_t *dst,
                           uint32_t len)
 {
     while (len) {
-        uint64_t page = va & ~(uint64_t)0xfff;
-        uint32_t off = va & 0xfff;
-        uint32_t n = MIN(len, 0x1000 - off);
+        uint64_t off;
+        uint32_t n;
 
-        if (!w->valid || w->page != page) {
-            TranslateForDebugResult tres;
-            hwaddr plen = 0x1000;
+        if (w->valid && va >= w->va_base + w->run_len) {
+            /* Just past the run: try to grow it rather than remap. */
+            uint64_t next = w->va_base + w->run_len;
+            hwaddr pa;
+            MemTxAttrs attrs;
+
+            while (w->run_len + 0x1000 <= w->maplen &&
+                   va >= w->va_base + w->run_len &&
+                   blit_src_xlate(w, next, &pa, &attrs) &&
+                   pa == w->pa_base + w->run_len) {
+                w->run_len += 0x1000;
+                next += 0x1000;
+            }
+        }
+        if (!w->valid || va < w->va_base || va >= w->va_base + w->run_len) {
+            uint64_t page = va & ~(uint64_t)0xfff;
+            hwaddr plen = BLIT_SRC_MAP_MAX;
+            hwaddr pa;
+            MemTxAttrs attrs;
 
             blit_src_drop(w);
-            if (!cpu_translate_for_debug(w->cpu, page, &tres)) {
+            if (!blit_src_xlate(w, page, &pa, &attrs)) {
                 return false;
             }
-            w->mapped = address_space_map(&address_space_memory, tres.physaddr,
-                                          &plen, false, tres.attrs);
+            w->mapped = address_space_map(&address_space_memory, pa, &plen,
+                                          false, attrs);
             if (!w->mapped || plen < 0x1000) {
                 blit_src_drop(w);
                 return false;
             }
             w->maplen = plen;
             w->host = w->mapped;
-            w->page = page;
+            w->va_base = page;
+            w->pa_base = pa;
+            w->run_len = 0x1000;
             w->valid = true;
         }
+
+        off = va - w->va_base;
+        n = MIN((uint64_t)len, w->run_len - off);
         memcpy(dst, w->host + off, n);
         dst += n;
         va += n;

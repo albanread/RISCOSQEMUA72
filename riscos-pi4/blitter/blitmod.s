@@ -72,6 +72,7 @@
     .equ    XOS_WriteC,            0x20000
     .equ    XOS_Module,            0x2001E
     .equ    ModClaim,              6
+    .equ    Service_ModeChange,    0x46
 
     .equ    BENCH_W,      512             @ pixels, one word each
     .equ    BENCH_H,      512
@@ -84,7 +85,7 @@ base:
     .word   0                       @ start
     .word   init    - base
     .word   final   - base
-    .word   0                       @ service call handler
+    .word   sv_service - base       @ service call handler
     .word   title   - base
     .word   help    - base
     .word   cmdtab  - base
@@ -478,8 +479,23 @@ sv_handler:
     TEQEQ   r9, r11
     BNE     sv_pass
 sv_scaled_ok:
-    ADR     r0, sv_vduvars
+    @ Five of these are mode constants and six are not: the graphics
+    @ window and origin are set per redraw rectangle, so the Wimp
+    @ changes them between one plot and the next.  Read the constants
+    @ only when the mode has changed under us.
+    ADR     r8, sv_modestale
+    LDR     r9, [r8]
+    TEQ     r9, #0
+    BEQ     sv_haveconst
+    MOV     r9, #0
+    STR     r9, [r8]
+    ADR     r0, sv_constvars
     ADR     r1, sv_vduvals
+    SWI     XOS_ReadVduVariables
+    BVS     sv_pass
+sv_haveconst:
+    ADR     r0, sv_winvars
+    ADR     r1, sv_vduvals + 20
     SWI     XOS_ReadVduVariables
     BVS     sv_pass
     ADR     r1, sv_vduvals
@@ -624,12 +640,27 @@ sv_hit:
 sv_out:
     LDMFD   sp!, {r0-r11, pc}
 
-sv_vduvars:
+@ Service handler: the only thing worth hearing is that the mode
+@ changed, which makes the cached constants stale.  Registers are left
+@ exactly as they came in and the call is never claimed.
+sv_service:
+    TEQ     r1, #Service_ModeChange
+    MOVNE   pc, lr
+    STMFD   sp!, {r0, r2}
+    ADR     r0, sv_modestale
+    MOV     r2, #1
+    STR     r2, [r0]
+    LDMFD   sp!, {r0, r2}
+    MOV     pc, lr
+
+sv_constvars:
     .word   4                       @ XEigFactor
     .word   5                       @ YEigFactor
     .word   6                       @ LineLength
     .word   9                       @ Log2BPP
     .word   12                      @ YWindLimit
+    .word   -1
+sv_winvars:
     .word   0x80                    @ GWLCol
     .word   0x81                    @ GWBRow
     .word   0x82                    @ GWRCol
@@ -639,6 +670,8 @@ sv_vduvars:
     .word   -1
 sv_vduvals:
     .space  4 * 11
+sv_modestale:
+    .word   1                       @ nothing cached yet
 sv_reasons:
     .word   28, 34, 48, 49, 50, 52
 sv_maxarea:
