@@ -81,8 +81,18 @@ static struct {
     uint32_t bpp;
     uint32_t xres, yres, pitch, rows;
 
-    ID3D11Buffer *raw;              /* guest bytes, pitch * rows, flat */
-    ID3D11ShaderResourceView *raw_srv;
+    /*
+     * Two copies of the guest bytes, not one.  A copy the guest wrote
+     * into while we were reading it splices two guest states together,
+     * and during a window move that puts part of the window where it
+     * used to be.  So the fresh copy goes into the buffer we are not
+     * showing, and only becomes the shown one if it came out whole;
+     * otherwise the previous good frame stays up and we try again.
+     */
+    ID3D11Buffer *raw[2];           /* guest bytes, pitch * rows, flat */
+    ID3D11ShaderResourceView *raw_srv[2];
+    unsigned raw_cur;               /* the one being displayed */
+    bool have_good;                 /* a whole frame has been captured */
     ID3D11Texture2D *palette;       /* 256 x 1 RGBA8 */
     ID3D11ShaderResourceView *pal_srv;
     uint8_t pal_cache[256 * 4];
@@ -995,16 +1005,20 @@ static void ptr_release(void)
 
 static void fb_release_pipeline(void)
 {
-    if (fb.raw_srv) fb.raw_srv->Release();
-    if (fb.raw) fb.raw->Release();
+    for (unsigned i = 0; i < 2; i++) {
+        if (fb.raw_srv[i]) fb.raw_srv[i]->Release();
+        if (fb.raw[i]) fb.raw[i]->Release();
+        fb.raw_srv[i] = nullptr;
+        fb.raw[i] = nullptr;
+    }
     if (fb.pal_srv) fb.pal_srv->Release();
     if (fb.palette) fb.palette->Release();
     if (fb.dec_srv) fb.dec_srv->Release();
     if (fb.dec_rtv) fb.dec_rtv->Release();
     if (fb.decoded) fb.decoded->Release();
     if (fb.ps) fb.ps->Release();
-    fb.raw_srv = nullptr;
-    fb.raw = nullptr;
+    fb.raw_cur = 0;
+    fb.have_good = false;
     fb.pal_srv = nullptr;
     fb.palette = nullptr;
     fb.dec_srv = nullptr;
@@ -1083,23 +1097,28 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        hr = dx11.device->CreateBuffer(&bd, nullptr, &fb.raw);
-        if (FAILED(hr)) {
-            dx11_log("raw buffer %ux%u failed: %#x", v->pitch, v->rows,
-                     (unsigned)hr);
-            return false;
-        }
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
         sd.Format = DXGI_FORMAT_R32_TYPELESS;
         sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
         sd.BufferEx.FirstElement = 0;
         sd.BufferEx.NumElements = bd.ByteWidth / 4;
         sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-        hr = dx11.device->CreateShaderResourceView(fb.raw, &sd, &fb.raw_srv);
-        if (FAILED(hr)) {
-            dx11_log("raw SRV failed: %#x", (unsigned)hr);
-            return false;
+        for (unsigned i = 0; i < 2; i++) {
+            hr = dx11.device->CreateBuffer(&bd, nullptr, &fb.raw[i]);
+            if (FAILED(hr)) {
+                dx11_log("raw buffer %u %ux%u failed: %#x", i, v->pitch,
+                         v->rows, (unsigned)hr);
+                return false;
+            }
+            hr = dx11.device->CreateShaderResourceView(fb.raw[i], &sd,
+                                                       &fb.raw_srv[i]);
+            if (FAILED(hr)) {
+                dx11_log("raw SRV %u failed: %#x", i, (unsigned)hr);
+                return false;
+            }
         }
+        fb.raw_cur = 0;
+        fb.have_good = false;
     }
 
     /* the palette at the VideoCore RAM base: 0x00BBGGRR words, which as
@@ -1243,30 +1262,50 @@ static bool fb_failed;
  * show yet (clear instead). */
 static uint32_t frame_count;
 
-static uint32_t fb_uploads;          /* guest frames actually sampled */
-static uint32_t fb_torn;             /* copies the guest wrote into */
+static uint32_t fb_uploads;          /* whole frames shown */
+static uint32_t fb_held;             /* frames held back, guest mid-draw */
+static uint32_t fb_forced;           /* held so long we showed one anyway */
+static unsigned fb_hold_run;         /* consecutive holds */
+
+/* How long the display may be held while the guest is still painting.
+ * Emulated RISC OS repaints far slower than the real machine, so a
+ * window redraw can span many of our frames; this has to outlast one or
+ * the hold is pointless.  Beyond it we show what we have rather than
+ * freeze. */
+#define FB_HOLD_MAX 12               /* ~200 ms at 60 Hz */
 
 /*
- * A cheap fingerprint of a few rows spread down the frame.  Taken either
- * side of the copy it answers the question the eye cannot: did the guest
- * write to the screen while we were reading it?  If it did, the frame we
- * captured is a mix of two guest states, which is a tear.
+ * A fingerprint of the guest's screen, taken either side of the copy.
+ * If it changes across the copy then the guest painted while we were
+ * reading, and the bytes we took are a splice of two different guest
+ * states -- which during a window move is the window drawn in two
+ * places at once.
+ *
+ * Every row is sampled, at a fixed pair of columns plus one that walks
+ * across the width, so a change anywhere is likely to be seen while the
+ * whole probe stays a few tens of KB against a multi-MB frame.
  */
 static uint32_t fb_probe(const Dx11FbView *v)
 {
     const uint8_t *p = (const uint8_t *)v->fb;
     uint32_t h = 2166136261u;
+    uint32_t span;
 
-    if (!p || v->rows == 0 || v->pitch < 4) {
+    if (!p || v->rows == 0 || v->pitch < 32) {
         return 0;
     }
-    for (uint32_t i = 0; i < 16; i++) {
-        uint32_t row = (uint32_t)((uint64_t)v->rows * i / 16);
-        const uint8_t *r = p + (size_t)row * v->pitch;
-        for (uint32_t b = 0; b + 4 <= 256 && b + 4 <= v->pitch; b += 4) {
-            uint32_t w;
-            memcpy(&w, r + b, 4);
-            h = (h ^ w) * 16777619u;
+    span = v->pitch - 16;
+    for (uint32_t y = 0; y < v->rows; y++) {
+        const uint8_t *r = p + (size_t)y * v->pitch;
+        uint32_t cols[3] = { 0, span / 2, (y * 149u) % span };
+
+        for (int c = 0; c < 3; c++) {
+            uint32_t off = cols[c] & ~3u;
+            for (uint32_t b = 0; b < 16; b += 4) {
+                uint32_t w;
+                memcpy(&w, r + off + b, 4);
+                h = (h ^ w) * 16777619u;
+            }
         }
     }
     return h;
@@ -1276,19 +1315,34 @@ static void fb_upload(const Dx11FbView *v)
 {
     D3D11_MAPPED_SUBRESOURCE map;
     HRESULT hr;
+    unsigned next = fb.raw_cur ^ 1u;
     uint32_t before = fb_probe(v);
+    bool whole;
 
-    fb_uploads++;
-
-    hr = dx11.context->Map(fb.raw, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
-    if (SUCCEEDED(hr)) {
-        memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
-        dx11.context->Unmap(fb.raw, 0);
-        if (fb_probe(v) != before) {
-            fb_torn++;              /* the guest wrote while we read */
+    /* Read into the buffer we are not showing, so a copy that turns out
+     * to be a splice costs nothing: the good one is still on screen. */
+    hr = dx11.context->Map(fb.raw[next], 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
+    if (FAILED(hr)) {
+        if (frame_count % 300 == 0) {
+            dx11_log("raw Map failed: %#x", (unsigned)hr);
         }
-    } else if (frame_count % 300 == 0) {
-        dx11_log("raw Map failed: %#x", (unsigned)hr);
+        return;
+    }
+    memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
+    dx11.context->Unmap(fb.raw[next], 0);
+
+    whole = (fb_probe(v) == before);
+    if (whole || !fb.have_good || fb_hold_run >= FB_HOLD_MAX) {
+        if (!whole && fb.have_good) {
+            fb_forced++;        /* the guest never stopped; show it anyway */
+        }
+        fb.raw_cur = next;
+        fb.have_good = true;
+        fb_hold_run = 0;
+        fb_uploads++;
+    } else {
+        fb_held++;              /* keep the previous whole frame up */
+        fb_hold_run++;
     }
 
     if (memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {
@@ -1502,10 +1556,11 @@ static bool dx11_render_frame(void)
 
     if (++frame_count % 300 == 0) {
         dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u, "
-                 "uploads %u, torn %u, mouse moves %u, button events %u",
+                 "shown %u, held %u, forced %u, mouse moves %u, buttons %u",
                  frame_count, fb.up ? "up" : "down",
                  fb.generation, fb.xres, fb.yres, fb.bpp,
-                 fb_uploads, fb_torn, dx11.mouse_moves, dx11.mouse_buttons);
+                 fb_uploads, fb_held, fb_forced,
+                 dx11.mouse_moves, dx11.mouse_buttons);
     }
     /* The status line: window title carries the guest's mode and the
      * presented frame rate, once a second.  (The sprint's instruction
@@ -1601,7 +1656,8 @@ static bool dx11_render_frame(void)
     fb_upload(&v);
 
     /* decode pass: raw bytes -> linear RGB */
-    ID3D11ShaderResourceView *srvs[2] = { fb.raw_srv, fb.pal_srv };
+    ID3D11ShaderResourceView *srvs[2] = { fb.raw_srv[fb.raw_cur],
+                                          fb.pal_srv };
     dx11.context->PSSetShaderResources(0, 2, srvs);
     dx11.context->PSSetShader(fb.ps, nullptr, 0);
     dx11.context->VSSetShader(fb.vs, nullptr, 0);
