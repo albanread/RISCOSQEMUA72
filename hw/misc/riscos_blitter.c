@@ -428,6 +428,30 @@ static void blit_merge(uint8_t *dst, const uint8_t *src, const uint8_t *mbits,
     }
 }
 
+/*
+ * Expand a packed row through the colour table.  The pixel at index i
+ * sits at bit i*srcbpp counting from the low end of the first byte,
+ * which is how RISC OS packs sub-byte depths.
+ */
+static void blit_expand(uint8_t *dst, const uint8_t *src, const uint32_t *tab,
+                        uint32_t first, uint32_t w, uint32_t srcbpp)
+{
+    uint32_t mask = (srcbpp >= 32) ? 0xffffffffu : ((1u << srcbpp) - 1);
+
+    for (uint32_t x = 0; x < w; x++) {
+        uint32_t bit = (first + x) * srcbpp;
+        uint32_t idx = (src[bit >> 3] >> (bit & 7)) & mask;
+
+        if (srcbpp > 8 - (bit & 7) && srcbpp <= 8) {
+            /* straddles a byte: only possible when srcbpp is not a
+             * divisor of 8, which RISC OS does not do -- but be exact */
+            idx = ((src[bit >> 3] | (src[(bit >> 3) + 1] << 8)) >> (bit & 7))
+                  & mask;
+        }
+        stl_le_p(dst + (size_t)x * 4, tab[idx]);
+    }
+}
+
 static uint32_t blit_sprite(RISCOSBlitterState *s)
 {
     BCM2835FBConfig cfg;
@@ -437,6 +461,7 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
     hwaddr fbmapped = 0;
     uint32_t pitch, fbsize, bpp = s->bpp;
     uint32_t rc = BLIT_RC_OK;
+    uint32_t tab[256];
     int32_t x0, y0, x1, y1;
 
     if (!obj) {
@@ -481,10 +506,30 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
             return BLIT_RC_RANGE;
         }
         {
-            /* source row, a destination row when the framebuffer is not
-             * mapped, and the mask row, in one allocation */
+            /* expanded row, a destination row when the framebuffer is
+             * not mapped, the mask row, and the packed source row */
             uint32_t need = w * bpp * 2 + ((w + 63) / 8) + 8;
+
+            if (s->flags & BLIT_F_TABLE) {
+                need += MIN(s->sstride, BLIT_MAX_WIDTH) + 8;
+            }
             row = blit_scratch(s, need);
+        }
+
+        if (s->flags & BLIT_F_TABLE) {
+            uint32_t entries;
+
+            if (s->srcbpp == 0 || s->srcbpp > 8) {
+                return BLIT_RC_BADGEOM;
+            }
+            entries = 1u << s->srcbpp;
+            if (!blit_src_read(&win, s->table, (uint8_t *)tab, entries * 4)) {
+                blit_src_drop(&win);
+                return BLIT_RC_FAULT;
+            }
+            for (uint32_t i = 0; i < entries; i++) {
+                tab[i] = ldl_le_p((uint8_t *)&tab[i]);
+            }
         }
         /*
          * Mapping the whole span pays for the gaps between rows: a
@@ -506,7 +551,18 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
             }
             src = s->src + (uint64_t)sy * s->sstride + (uint64_t)skip_x * bpp;
 
-            if (s->flags & BLIT_F_SRC_VIRT) {
+            if (s->flags & BLIT_F_TABLE) {
+                /* whole packed row, then expanded into the row buffer */
+                uint8_t *packed = row + w * bpp * 2 + ((w + 63) / 8) + 8;
+                uint32_t pbytes = MIN(s->sstride, BLIT_MAX_WIDTH);
+                uint64_t prow = s->src + (uint64_t)sy * s->sstride;
+
+                if (!blit_src_read(&win, prow, packed, pbytes)) {
+                    rc = BLIT_RC_FAULT;
+                    break;
+                }
+                blit_expand(row, packed, tab, skip_x, w, s->srcbpp);
+            } else if (s->flags & BLIT_F_SRC_VIRT) {
                 if (!blit_src_read(&win, src, row, w * bpp)) {
                     rc = BLIT_RC_FAULT;
                     break;
@@ -609,7 +665,7 @@ static uint64_t blit_read(void *opaque, hwaddr offset, unsigned size)
         return BLIT_VERSION_VALUE;
     case BLIT_FEATURES:
         return BLIT_FEATURE_FILL | BLIT_FEATURE_COPY | BLIT_FEATURE_SPRITE
-               | BLIT_FEATURE_MASK;
+               | BLIT_FEATURE_MASK | BLIT_FEATURE_TABLE;
     case BLIT_GO:
         return s->status;
     default:
@@ -643,6 +699,8 @@ static void blit_write(void *opaque, hwaddr offset, uint64_t value,
     case BLIT_BPP:     s->bpp = v;      break;
     case BLIT_MASK:    s->mask = v;     break;
     case BLIT_MSTRIDE: s->mstride = v;  break;
+    case BLIT_SRCBPP:  s->srcbpp = v;   break;
+    case BLIT_TABLE:   s->table = v;    break;
     default:
         if (offset >= BLIT_PATTERN && offset < BLIT_PATTERN + 16) {
             s->pattern[(offset - BLIT_PATTERN) / 4] = v;
@@ -673,7 +731,7 @@ static void blit_reset(DeviceState *dev)
     RISCOSBlitterState *s = RISCOS_BLITTER(dev);
 
     s->op = s->flags = s->dest = s->src = 0;
-    s->mask = s->mstride = 0;
+    s->mask = s->mstride = s->srcbpp = s->table = 0;
     s->width = s->height = s->patlen = 0;
     s->dstride = s->sstride = 0;
     memset(s->pattern, 0, sizeof(s->pattern));
@@ -704,6 +762,8 @@ static const VMStateDescription blit_vmstate = {
         VMSTATE_UINT32(bpp, RISCOSBlitterState),
         VMSTATE_UINT32(mask, RISCOSBlitterState),
         VMSTATE_UINT32(mstride, RISCOSBlitterState),
+        VMSTATE_UINT32(srcbpp, RISCOSBlitterState),
+        VMSTATE_UINT32(table, RISCOSBlitterState),
         VMSTATE_INT32(dstride, RISCOSBlitterState),
         VMSTATE_INT32(sstride, RISCOSBlitterState),
         VMSTATE_UINT32_ARRAY(pattern, RISCOSBlitterState, 4),

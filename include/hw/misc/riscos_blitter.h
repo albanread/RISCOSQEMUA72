@@ -66,6 +66,8 @@
 #define BLIT_BPP        0x5c    /* bytes per pixel, source and dest */
 #define BLIT_MASK       0x60    /* 1bpp transparency mask, guest virtual */
 #define BLIT_MSTRIDE    0x64    /* bytes per mask row */
+#define BLIT_SRCBPP     0x68    /* bits per source pixel: 1, 2, 4, 8 */
+#define BLIT_TABLE      0x6c    /* wide colour table, guest virtual */
 #define BLIT_REGION_SIZE 0x1000
 
 #define BLIT_MAGIC_VALUE   0x54494c42  /* 'B','L','I','T' little-endian */
@@ -75,6 +77,7 @@
 #define BLIT_FEATURE_COPY  0x2
 #define BLIT_FEATURE_SPRITE 0x4
 #define BLIT_FEATURE_MASK   0x8
+#define BLIT_FEATURE_TABLE  0x10
 
 #define BLIT_F_FB          0x1  /* DEST is a framebuffer byte offset */
 /*
@@ -99,6 +102,14 @@
  * two bits per pixel or more.
  */
 #define BLIT_F_MASK        0x8
+/*
+ * The source is packed at BLIT_SRCBPP bits a pixel and each value
+ * indexes BLIT_TABLE, one word per entry, giving the screen pixel.
+ * That is what RISC OS calls a wide translation table, the form it
+ * builds for anything up to 8bpp going to a deeper screen -- which is
+ * every old-format sprite the desktop still uses.
+ */
+#define BLIT_F_TABLE       0x10
 
 #define BLIT_OP_NOP        0
 #define BLIT_OP_FILL       1
@@ -134,7 +145,7 @@ struct RISCOSBlitterState {
     uint32_t op, flags, dest, src, width, height, patlen;
     int32_t dstride, sstride;
     int32_t dstx, dsty, clipx0, clipy0, clipx1, clipy1;
-    uint32_t bpp, mask, mstride;
+    uint32_t bpp, mask, mstride, srcbpp, table;
     uint32_t pattern[4];
 
     /*

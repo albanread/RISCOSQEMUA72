@@ -70,6 +70,10 @@
     .equ    F_MASK,       8
     .equ    BLIT_MASK,    0x60
     .equ    BLIT_MSTRIDE, 0x64
+    .equ    BLIT_SRCBPP,  0x68
+    .equ    BLIT_TABLE,   0x6C
+    .equ    F_TABLE,      0x10
+    .equ    XOS_ReadModeVariable,  0x20035
     .equ    XOS_SpriteOp,          0x2002E
     .equ    XOS_ReadMonotonicTime, 0x20042
     .equ    XOS_WriteC,            0x20000
@@ -440,8 +444,25 @@ hexbuf:
 @ It lives at the end with its data beside it: ADR reaches about a
 @ kilobyte, and a module with no relocations has nothing else to address
 @ with.
+@ Scratch the handler reaches through r12 rather than ADR.  The vector
+@ dispatch loads r12 from the claim block for the handler's own use, and
+@ ADR only reaches about a kilobyte -- which this handler has outgrown
+@ twice now.
+    .equ    W_TBL,     0
+    .equ    W_SRCBPP,  4
+    .equ    W_PACKED,  8
+    .equ    W_MODE,    12
+    .equ    W_LOG2BPP, 16
+sv_work:
+    .word   0                       @ colour table
+    .word   32                      @ bits per source pixel
+    .word   0                       @ non-zero when the source is packed
+    .word   -1                      @ cached mode number
+    .word   0                       @ ... and its Log2BPP
+
 sv_handler:
     STMFD   sp!, {r0-r11, lr}
+    ADR     r12, sv_work
     AND     r10, r0, #0xFF
     TEQ     r10, #52                @ PutSpriteScaled: the only one that pays
     BNE     sv_count
@@ -459,35 +480,77 @@ sv_handler:
     @ nothing to say.
     CMP     r0, #512
     BLO     sv_pass
-    LDR     r8, [r2, #spMode]
-    MOV     r8, r8, ASR #27
-    TEQ     r8, #6                  @ sprite type 6 = 32bpp
-    BNE     sv_pass
     TEQ     r5, #0                  @ GCOL action: store only
     BNE     sv_pass
     LDR     r8, [r2, #spLBit]
     TEQ     r8, #0
     BNE     sv_pass                 @ left-hand wastage
-    LDR     r8, [r2, #spRBit]
-    TEQ     r8, #31
-    BNE     sv_pass                 @ right-hand wastage
     TEQ     r6, #0
-    BEQ     sv_scaled_ok
+    BEQ     .Lsv_scaleok
     LDMIA   r6, {r8, r9, r10, r11}
     TEQ     r8, r10
     TEQEQ   r9, r11
     BNE     sv_pass
-sv_scaled_ok:
-    @ Five of these are mode constants and six are not: the graphics
-    @ window and origin are set per redraw rectangle, so the Wimp
-    @ changes them between one plot and the next.  Read the constants
-    @ only when the mode has changed under us.
-    ADR     r8, sv_modestale
-    LDR     r9, [r8]
+.Lsv_scaleok:
+
+    @ Two shapes are taken.  A type 6 sprite is 32bpp, already the
+    @ screen's format, and copies straight across.  A type 0 sprite is
+    @ old format -- its mode word is a mode number, not a type -- and
+    @ its pixels are packed, so they come through the caller's colour
+    @ table.  Its mask, if it has one, is the pre-RISC OS 5 kind at the
+    @ sprite's own depth rather than one bit per pixel, so masked
+    @ old-format sprites are left alone.
+    STR     r7, [r12, #W_TBL]
+    LDR     r8, [r2, #spMode]
+    MOVS    r9, r8, ASR #27
+    BMI     sv_pass
+    TEQ     r9, #6
+    BEQ     .Lsv_deep
     TEQ     r9, #0
-    BEQ     sv_haveconst
-    MOV     r9, #0
-    STR     r9, [r8]
+    BNE     sv_pass
+    CMP     r8, #256                @ a mode number, not a packed word
+    BHS     sv_pass
+    TEQ     r7, #0
+    BEQ     sv_pass                 @ no table: would need the palette
+    LDR     r9, [r2, #spImage]
+    LDR     r10, [r2, #spTrans]
+    TEQ     r9, r10
+    BNE     sv_pass                 @ old-style mask, not one bit a pixel
+
+    @ Depth comes from the mode number, which costs a SWI, so remember
+    @ the last one: a desktop uses very few sprite modes.
+    LDR     r10, [r12, #W_MODE]
+    TEQ     r10, r8
+    LDREQ   r11, [r12, #W_LOG2BPP]
+    BEQ     .Lsv_gotdepth
+    MOV     r0, r8
+    MOV     r1, #9                  @ Log2BPP
+    SWI     XOS_ReadModeVariable
+    BVS     sv_pass
+    MOV     r11, r2
+    STR     r8, [r12, #W_MODE]
+    STR     r11, [r12, #W_LOG2BPP]
+    LDR     r2, [sp, #8]            @ the SWI had r2; sprite pointer back
+.Lsv_gotdepth:
+    CMP     r11, #3                 @ 8bpp or less
+    BHI     sv_pass
+    MOV     r10, #1
+    MOV     r10, r10, LSL r11       @ bits per source pixel
+    STR     r10, [r12, #W_SRCBPP]
+    MOV     r10, #1
+    STR     r10, [r12, #W_PACKED]
+    B       .Lsv_haveformat
+
+.Lsv_deep:
+    LDR     r8, [r2, #spRBit]
+    TEQ     r8, #31
+    BNE     sv_pass                 @ right-hand wastage
+    MOV     r10, #32
+    STR     r10, [r12, #W_SRCBPP]
+    MOV     r10, #0
+    STR     r10, [r12, #W_PACKED]
+
+.Lsv_haveformat:
     ADR     r0, sv_constvars
     ADR     r1, sv_vduvals
     SWI     XOS_ReadVduVariables
@@ -513,8 +576,18 @@ sv_haveconst:
     ADD     r4, r4, r9
     MOV     r4, r4, ASR r8          @ bottom edge, bottom origin
 
+    @ Pixels across the row: whole words at the source depth, plus
+    @ however many of the last word spRBit says are used.
+    LDR     r8, [r12, #W_SRCBPP]
     LDR     r5, [r2, #spWidth]
-    ADD     r5, r5, #1              @ pixels: one word each at 32bpp
+    LDR     r9, [r2, #spRBit]
+    ADD     r9, r9, #1
+    CLZ     r10, r8
+    RSB     r10, r10, #31           @ log2 of the source depth
+    MOV     r9, r9, LSR r10         @ pixels in the last word
+    RSB     r11, r10, #5
+    MOV     r5, r5, LSL r11
+    ADD     r5, r5, r9              @ total pixels
     LDR     r6, [r2, #spHeight]
     ADD     r6, r6, #1
     LDR     r7, [r1, #16]
@@ -566,12 +639,23 @@ sv_haveconst:
     STR     r8, [r10, #BLIT_MSTRIDE]
     MOV     r11, #F_SRC_VIRT + F_MASK
 .Lsv_unmasked:
+    LDR     r8, [r12, #W_PACKED]
+    TEQ     r8, #0
+    ORRNE   r11, r11, #F_TABLE
     STR     r11, [r10, #BLIT_FLAGS]
     LDR     r11, [r2, #spImage]
     ADD     r11, r11, r2            @ logical: the host walks the page tables
     STR     r11, [r10, #BLIT_SRC]
-    MOV     r11, r5, LSL #2
+    LDR     r11, [r2, #spWidth]
+    ADD     r11, r11, #1
+    MOV     r11, r11, LSL #2        @ bytes per source row
     STR     r11, [r10, #BLIT_SSTRIDE]
+    LDR     r8, [r12, #W_SRCBPP]
+    STR     r8, [r10, #BLIT_SRCBPP]
+    LDR     r8, [r12, #W_PACKED]
+    TEQ     r8, #0
+    LDRNE   r8, [r12, #W_TBL]
+    STRNE   r8, [r10, #BLIT_TABLE]
     STR     r5, [r10, #BLIT_WIDTH]
     STR     r6, [r10, #BLIT_HEIGHT]
     STR     r3, [r10, #BLIT_DSTX]
@@ -632,6 +716,22 @@ sv_pass:
     ADR     r8, sv_passarea
     LDR     r10, [r8]
     ADD     r10, r10, r9
+    STR     r10, [r8]
+    @ And by sprite type, so the depth still being turned away is a fact
+    @ rather than a guess.  Type 6 is 32bpp; below that is packed.
+    LDR     r9, [r2, #spMode]
+    MOV     r9, r9, LSR #27
+    CMP     r9, #16
+    BHS     sv_count
+    ADR     r8, sv_bytype
+    LDR     r10, [r8, r9, LSL #2]
+    ADD     r10, r10, #1
+    STR     r10, [r8, r9, LSL #2]
+    TEQ     r7, #0
+    BEQ     sv_count
+    ADR     r8, sv_withtable
+    LDR     r10, [r8]
+    ADD     r10, r10, #1
     STR     r10, [r8]
 
 sv_count:
@@ -702,6 +802,10 @@ sv_passed:
 sv_accarea:
     .word   0
 sv_passarea:
+    .word   0
+sv_bytype:
+    .space  4 * 16
+sv_withtable:
     .word   0
 sv_accoff:
     .word   0
@@ -855,7 +959,7 @@ sb_guest:
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
     ADR     r6, sv_maxarea
-    MOV     r7, #12                 @ ..., accelerated, passed, and both areas
+    MOV     r7, #29                 @ ..., areas, 16 type buckets, table count
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4
