@@ -101,7 +101,14 @@ can very likely produce a working double buffer.
 **What only the Wimp can do.**  The full-screen copy is needed *only*
 because the Wimp does not know it is double buffered.  A Wimp that did
 would keep the damage from the previous frame as well as this one, and
-redraw their union into the back buffer -- no copy at all.  That is the
+redraw their union into the back buffer -- no copy at all.
+
+Put another way: with two banks a damaged rectangle is not correct
+until *both* have been repainted, so damage stops being a per-frame
+list and becomes per-bank -- each rectangle has to survive until every
+bank has seen it.  That bookkeeping belongs where the damage lives.
+The Wimp has to cycle its own banks; it cannot have them swapped
+underneath it.  That is the
 textbook approach and it is strictly better: it turns a fixed
 full-screen cost per frame into a cost proportional to what actually
 changed, which on an idle desktop is nothing.  The damage lists live
