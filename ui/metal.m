@@ -1567,7 +1567,7 @@ int metal_backend_init(void)
     delegate = [[MetalDelegate alloc] init];
     [NSApp setDelegate:delegate];
     metal_build_menu();
-    metal_script_init();
+    metal_script_register();
 
     if (!metal_create_window()) {
         metal_log("no window");
@@ -1604,6 +1604,7 @@ int metal_backend_main(void)
      * and the events interleave the way the Windows front end's do.
      * finishLaunching is what -run would have called first. */
     [NSApp finishLaunching];
+    metal_script_register();      /* again: after AppKit's scripting init */
     [m.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     metal_log("window: visible %d, miniaturized %d, key %d, occlusion %#lx, "
