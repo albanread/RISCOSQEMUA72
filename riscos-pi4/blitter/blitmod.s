@@ -528,6 +528,11 @@ sv_scaled_ok:
     LDR     r9, [r8]
     ADD     r9, r9, #1
     STR     r9, [r8]
+    MUL     r9, r6, r5              @ pixels actually taken on
+    ADR     r8, sv_accarea
+    LDR     r10, [r8]
+    ADD     r10, r10, r9
+    STR     r10, [r8]
 
     @ Claim.  CallVector pushed the caller's return address before
     @ walking the chain, so passing on is MOV pc, lr and intercepting is
@@ -541,6 +546,21 @@ sv_pass:
     LDR     r9, [r8]
     ADD     r9, r9, #1
     STR     r9, [r8]
+    @ Area of what we turned away, so the split that matters -- pixels,
+    @ not calls -- says whether the next case is worth writing.  Only
+    @ range C, where r2 points at the sprite rather than naming it.
+    LDR     r9, [sp]                @ r0 as it came in
+    CMP     r9, #512
+    BLO     sv_count
+    LDR     r9, [r2, #spWidth]
+    ADD     r9, r9, #1
+    LDR     r10, [r2, #spHeight]
+    ADD     r10, r10, #1
+    MUL     r9, r10, r9
+    ADR     r8, sv_passarea
+    LDR     r10, [r8]
+    ADD     r10, r10, r9
+    STR     r10, [r8]
 
 sv_count:
     LDR     r10, [sp]               @ r0 as it came in
@@ -590,6 +610,10 @@ sv_easyn:
     .word   0
 sv_passed:
     .word   0
+sv_accarea:
+    .word   0
+sv_passarea:
+    .word   0
 sv_hexbuf:
     .space  16
     .balign 4
@@ -597,7 +621,7 @@ sv_hexbuf:
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
     ADR     r6, sv_maxarea
-    MOV     r7, #10                 @ maxarea, 6 reasons, 52s, accelerated, passed
+    MOV     r7, #12                 @ ..., accelerated, passed, and both areas
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4
