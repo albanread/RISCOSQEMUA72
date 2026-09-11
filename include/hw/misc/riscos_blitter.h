@@ -50,6 +50,20 @@
 #define BLIT_SSTRIDE    0x2c
 #define BLIT_PATTERN    0x30    /* four words */
 #define BLIT_PATLEN     0x40    /* 1..16, the pattern's repeat length */
+/*
+ * Sprite plots.  Everything here is in framebuffer pixels with the
+ * origin at the top left, so the guest converts out of OS units and
+ * its bottom-left origin once and the host does the clipping -- a
+ * rectangle intersection is easy to get right in C and fiddly in
+ * relocation-free ARM.
+ */
+#define BLIT_DSTX       0x44    /* left edge of the sprite */
+#define BLIT_DSTY       0x48    /* top edge of the sprite */
+#define BLIT_CLIPX0     0x4c    /* clip rectangle, inclusive */
+#define BLIT_CLIPY0     0x50
+#define BLIT_CLIPX1     0x54
+#define BLIT_CLIPY1     0x58
+#define BLIT_BPP        0x5c    /* bytes per pixel, source and dest */
 #define BLIT_REGION_SIZE 0x1000
 
 #define BLIT_MAGIC_VALUE   0x54494c42  /* 'B','L','I','T' little-endian */
@@ -57,18 +71,36 @@
 
 #define BLIT_FEATURE_FILL  0x1
 #define BLIT_FEATURE_COPY  0x2
+#define BLIT_FEATURE_SPRITE 0x4
 
-#define BLIT_F_FB          0x1  /* DEST/SRC are framebuffer byte offsets */
+#define BLIT_F_FB          0x1  /* DEST is a framebuffer byte offset */
+/*
+ * SRC is a guest *virtual* address.  A sprite lives in a sprite area
+ * somewhere in the guest's map, and RISC OS dynamic areas are virtually
+ * contiguous but physically scattered, so there is no one physical
+ * address to hand over -- the documented alternative is OS_Memory 19
+ * with scatter callbacks, per plot.  Letting the host walk the guest's
+ * page tables costs the guest nothing and handles the scatter for free.
+ */
+#define BLIT_F_SRC_VIRT    0x2
+/*
+ * RISC OS stores a sprite's rows bottom first.  Flagged rather than
+ * assumed: if it is ever the other way round this is a one-line change
+ * on the guest side instead of a rewrite here.
+ */
+#define BLIT_F_BOTTOM_UP   0x4
 
 #define BLIT_OP_NOP        0
 #define BLIT_OP_FILL       1
 #define BLIT_OP_COPY       2
+#define BLIT_OP_SPRITE     3   /* RAM -> framebuffer, source may be virtual */
 
 #define BLIT_RC_OK         0
 #define BLIT_RC_BADOP      1
 #define BLIT_RC_BADGEOM    2
 #define BLIT_RC_NOFB       3   /* BLIT_F_FB, but no framebuffer configured */
 #define BLIT_RC_RANGE      4   /* a row fell outside the framebuffer */
+#define BLIT_RC_FAULT      5   /* a source row would not translate */
 
 /*
  * Sanity limits.  A blit runs synchronously with the vCPU stopped, so a
@@ -91,6 +123,8 @@ struct RISCOSBlitterState {
 
     uint32_t op, flags, dest, src, width, height, patlen;
     int32_t dstride, sstride;
+    int32_t dstx, dsty, clipx0, clipy0, clipx1, clipy1;
+    uint32_t bpp;
     uint32_t pattern[4];
 
     /*

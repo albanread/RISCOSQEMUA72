@@ -53,7 +53,20 @@
     .equ    spHeight,              20      @ height in rows - 1
     .equ    spImage,               32
     .equ    spTrans,               36      @ == spImage when unmasked
+    .equ    spLBit,                24      @ first bit used
+    .equ    spRBit,                28      @ last bit used
     .equ    spMode,                40
+
+    .equ    BLIT_DSTX,    0x44
+    .equ    BLIT_DSTY,    0x48
+    .equ    BLIT_CLIPX0,  0x4C
+    .equ    BLIT_CLIPY0,  0x50
+    .equ    BLIT_CLIPX1,  0x54
+    .equ    BLIT_CLIPY1,  0x58
+    .equ    BLIT_BPP,     0x5C
+    .equ    OP_SPRITE,    3
+    .equ    F_SRC_VIRT,   2
+    .equ    F_BOTTOM_UP,  4
 
 _start:
 base:
@@ -405,115 +418,129 @@ hexbuf:
 sv_handler:
     STMFD   sp!, {r0-r11, lr}
     AND     r10, r0, #0xFF
-
-    @ Is this the one case worth specialising -- PutSpriteScaled, the
-    @ sprite pointed at rather than named, unmasked, already the
-    @ screen's depth, no colour translation, plain store, and not
-    @ actually scaling?  Everything that fails is counted by the reason
-    @ it failed, so the rejects say what a second case would have to be.
-    TEQ     r10, #52
+    TEQ     r10, #52                @ PutSpriteScaled: the only one that pays
     BNE     sv_count
+
     ADR     r11, sv_n52
     LDR     r8, [r11]
     ADD     r8, r8, #1
     STR     r8, [r11]
 
-    MOV     r11, #0                 @ reject slot
-    CMP     r0, #512                @ r2 a pointer, not a name
-    BLO     sv_rej
-    MOV     r11, #1
+    @ The case worth taking: the sprite pointed at rather than named,
+    @ unmasked, already the screen's depth, whole words edge to edge,
+    @ plain store, and not really scaling.  A pixel translation table is
+    @ allowed through: at 32bpp it is a ColourMap format descriptor, not
+    @ a palette, and for a sprite already in the screen's format it has
+    @ nothing to say.
+    CMP     r0, #512
+    BLO     sv_pass
     LDR     r8, [r2, #spImage]
     LDR     r9, [r2, #spTrans]
-    TEQ     r8, r9                  @ mask present?
-    BNE     sv_rej
-    MOV     r11, #2
+    TEQ     r8, r9
+    BNE     sv_pass                 @ masked
     LDR     r8, [r2, #spMode]
-    MOV     r8, r8, ASR #27         @ sprite type
-    TEQ     r8, #6                  @ 6 = 32bpp
-    BNE     sv_rej
-    MOV     r11, #3
-    TEQ     r7, #0                  @ pixel translation table
-    BNE     sv_rej
-    MOV     r11, #4
+    MOV     r8, r8, ASR #27
+    TEQ     r8, #6                  @ sprite type 6 = 32bpp
+    BNE     sv_pass
     TEQ     r5, #0                  @ GCOL action: store only
-    BNE     sv_rej
-    MOV     r11, #5
-    TEQ     r6, #0                  @ no scale block means 1:1
-    BEQ     sv_easy
-    LDMIA   r6, {r8, r9, r10, r11}  @ xmul, ymul, xdiv, ydiv
+    BNE     sv_pass
+    LDR     r8, [r2, #spLBit]
+    TEQ     r8, #0
+    BNE     sv_pass                 @ left-hand wastage
+    LDR     r8, [r2, #spRBit]
+    TEQ     r8, #31
+    BNE     sv_pass                 @ right-hand wastage
+    TEQ     r6, #0
+    BEQ     sv_scaled_ok
+    LDMIA   r6, {r8, r9, r10, r11}
     TEQ     r8, r10
     TEQEQ   r9, r11
-    MOV     r11, #5
-    BNE     sv_rej
-sv_easy:
+    BNE     sv_pass
+sv_scaled_ok:
+    ADR     r0, sv_vduvars
+    ADR     r1, sv_vduvals
+    SWI     XOS_ReadVduVariables
+    BVS     sv_pass
+    ADR     r1, sv_vduvals
+    LDR     r8, [r1, #12]
+    TEQ     r8, #5                  @ screen 32bpp too
+    BNE     sv_pass
+
+    @ OS units to pixels, and the bottom-left origin to the top-left one
+    @ the device works in.
+    LDR     r8, [r1, #0]            @ XEigFactor
+    LDR     r9, [r1, #36]           @ OrgX
+    ADD     r3, r3, r9
+    MOV     r3, r3, ASR r8          @ left edge in pixels
+    LDR     r8, [r1, #4]            @ YEigFactor
+    LDR     r9, [r1, #40]           @ OrgY
+    ADD     r4, r4, r9
+    MOV     r4, r4, ASR r8          @ bottom edge, bottom origin
+
+    LDR     r5, [r2, #spWidth]
+    ADD     r5, r5, #1              @ pixels: one word each at 32bpp
+    LDR     r6, [r2, #spHeight]
+    ADD     r6, r6, #1
+    LDR     r7, [r1, #16]
+    ADD     r7, r7, #1              @ yres
+    SUB     r9, r7, r4
+    SUB     r9, r9, r6              @ top edge, top origin
+
+    ADR     r10, blit_log
+    LDR     r10, [r10]
+    TEQ     r10, #0
+    BEQ     sv_pass
+
+    MOV     r11, #OP_SPRITE
+    STR     r11, [r10, #BLIT_OP]
+    MOV     r11, #F_SRC_VIRT        @ rows run top down, as the screen does
+    STR     r11, [r10, #BLIT_FLAGS]
+    LDR     r11, [r2, #spImage]
+    ADD     r11, r11, r2            @ logical: the host walks the page tables
+    STR     r11, [r10, #BLIT_SRC]
+    MOV     r11, r5, LSL #2
+    STR     r11, [r10, #BLIT_SSTRIDE]
+    STR     r5, [r10, #BLIT_WIDTH]
+    STR     r6, [r10, #BLIT_HEIGHT]
+    STR     r3, [r10, #BLIT_DSTX]
+    STR     r9, [r10, #BLIT_DSTY]
+    MOV     r11, #4
+    STR     r11, [r10, #BLIT_BPP]
+
+    LDR     r11, [r1, #20]          @ GWLCol
+    STR     r11, [r10, #BLIT_CLIPX0]
+    LDR     r11, [r1, #28]          @ GWRCol
+    STR     r11, [r10, #BLIT_CLIPX1]
+    SUB     r8, r7, #1              @ yres - 1
+    LDR     r11, [r1, #32]          @ GWTRow
+    SUB     r11, r8, r11
+    STR     r11, [r10, #BLIT_CLIPY0]
+    LDR     r11, [r1, #24]          @ GWBRow
+    SUB     r11, r8, r11
+    STR     r11, [r10, #BLIT_CLIPY1]
+
+    STR     r11, [r10, #BLIT_GO]
+    LDR     r11, [r10, #BLIT_GO]
+    TEQ     r11, #0
+    BNE     sv_pass                 @ refused: leave it to SpriteExtend
+
     ADR     r8, sv_easyn
     LDR     r9, [r8]
     ADD     r9, r9, #1
     STR     r9, [r8]
-    ADR     r8, sv_easyarea
-    LDR     r9, [r2, #spWidth]
-    ADD     r9, r9, #1              @ width in words
-    LDR     r10, [r2, #spHeight]
-    ADD     r10, r10, #1
-    MUL     r9, r10, r9
-    LDR     r10, [r8]
-    ADD     r10, r10, r9
-    STR     r10, [r8]
-    B       sv_sampled
-sv_rej:
-    ADR     r8, sv_rejects
-    LDR     r9, [r8, r11, LSL #2]
-    ADD     r9, r9, #1
-    STR     r9, [r8, r11, LSL #2]
-    ADR     r8, sv_rejarea
-    LDR     r9, [r2, #spWidth]
-    ADD     r9, r9, #1              @ width in words
-    LDR     r10, [r2, #spHeight]
-    ADD     r10, r10, #1
-    MUL     r9, r10, r9
-    LDR     r10, [r8]
-    ADD     r10, r10, r9
-    STR     r10, [r8]
 
-sv_sampled:
-    @ Sample the biggest sprite seen rather than the first: the average
-    @ reject is ninety thousand words, so one very large sprite is being
-    @ replotted over and over and it is the one worth identifying.
-    CMP     r0, #512
-    BLO     sv_count
-    LDR     r9, [r2, #spWidth]
+    @ Claim.  CallVector pushed the caller's return address before
+    @ walking the chain, so passing on is MOV pc, lr and intercepting is
+    @ taking that address off the stack once our own frame is gone.
+    LDMFD   sp!, {r0-r11, lr}
+    MSR     CPSR_f, #0              @ V clear: no error
+    LDMFD   sp!, {pc}
+
+sv_pass:
+    ADR     r8, sv_passed
+    LDR     r9, [r8]
     ADD     r9, r9, #1
-    LDR     r10, [r2, #spHeight]
-    ADD     r10, r10, #1
-    MUL     r9, r10, r9             @ area in words
-    ADR     r8, sv_maxarea
-    LDR     r10, [r8]
-    CMP     r9, r10
-    BLS     sv_count
     STR     r9, [r8]
-    ADR     r8, sv_sample
-    STR     r0, [r8, #0]
-    STR     r5, [r8, #4]            @ plot action
-    STR     r6, [r8, #8]            @ scale block
-    STR     r7, [r8, #12]           @ translation table
-    LDR     r9, [r2, #spWidth]
-    STR     r9, [r8, #16]
-    LDR     r9, [r2, #spHeight]
-    STR     r9, [r8, #20]
-    LDR     r9, [r2, #spMode]
-    STR     r9, [r8, #24]
-    LDR     r9, [r2, #spImage]
-    LDR     r10, [r2, #spTrans]
-    SUB     r9, r10, r9             @ 0 when unmasked
-    STR     r9, [r8, #28]
-    @ The name says what is being replotted; everything else has been
-    @ inference.  Twelve bytes at +4, space padded.
-    LDR     r9, [r2, #4]
-    STR     r9, [r8, #32]
-    LDR     r9, [r2, #8]
-    STR     r9, [r8, #36]
-    LDR     r9, [r2, #12]
-    STR     r9, [r8, #40]
 
 sv_count:
     LDR     r10, [sp]               @ r0 as it came in
@@ -536,12 +563,21 @@ sv_hit:
 sv_out:
     LDMFD   sp!, {r0-r11, pc}
 
-@ Counts say how often, area says how much: a backdrop tile is worth a
-@ hundred icons, so the split that matters is pixels, not calls.  The
-@ accumulation is inlined at both sites rather than called: a BL to a
-@ named symbol leaves an R_ARM_CALL relocation that objcopy cannot
-@ resolve, and the module then branches into nowhere.
-
+sv_vduvars:
+    .word   4                       @ XEigFactor
+    .word   5                       @ YEigFactor
+    .word   6                       @ LineLength
+    .word   9                       @ Log2BPP
+    .word   12                      @ YWindLimit
+    .word   0x80                    @ GWLCol
+    .word   0x81                    @ GWBRow
+    .word   0x82                    @ GWRCol
+    .word   0x83                    @ GWTRow
+    .word   0x88                    @ OrgX
+    .word   0x89                    @ OrgY
+    .word   -1
+sv_vduvals:
+    .space  4 * 11
 sv_reasons:
     .word   28, 34, 48, 49, 50, 52
 sv_maxarea:
@@ -552,14 +588,8 @@ sv_n52:
     .word   0
 sv_easyn:
     .word   0
-sv_rejects:
-    .space  4 * 6           @ name, mask, depth, translation, action, scale
-sv_easyarea:
+sv_passed:
     .word   0
-sv_rejarea:
-    .word   0
-sv_sample:
-    .space  4 * 12
 sv_hexbuf:
     .space  16
     .balign 4
@@ -567,7 +597,7 @@ sv_hexbuf:
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
     ADR     r6, sv_maxarea
-    MOV     r7, #29                 @ ..., 6 rejects, two areas, sample
+    MOV     r7, #10                 @ maxarea, 6 reasons, 52s, accelerated, passed
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4

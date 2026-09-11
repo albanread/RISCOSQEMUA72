@@ -16,6 +16,7 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "hw/core/cpu.h"
 #include "trace.h"
 
 /*
@@ -272,12 +273,102 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
     return BLIT_RC_OK;
 }
 
+/*
+ * A sprite plot: rows of pixels out of guest RAM and into the
+ * framebuffer.  The guest has already clipped and worked out where the
+ * first row lands, so this is a copy -- RISC OS stores sprite rows
+ * bottom first, which the caller expresses with a negative destination
+ * stride rather than this having to know.
+ */
+static uint32_t blit_sprite(RISCOSBlitterState *s)
+{
+    BCM2835FBConfig cfg;
+    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    CPUState *cpu = current_cpu ? current_cpu : first_cpu;
+    uint8_t *row;
+    uint32_t pitch, fbsize, bpp = s->bpp;
+    int32_t x0, y0, x1, y1;
+
+    if (!obj) {
+        return BLIT_RC_NOFB;
+    }
+    if ((s->flags & BLIT_F_SRC_VIRT) && !cpu) {
+        return BLIT_RC_FAULT;
+    }
+    if (bpp == 0 || bpp > 4) {
+        return BLIT_RC_BADGEOM;
+    }
+    bcm2835_fb_get_config(BCM2835_FB(obj), &cfg);
+    pitch = bcm2835_fb_get_pitch(&cfg);
+    fbsize = bcm2835_fb_get_size(&cfg);
+
+    /* The sprite, intersected with the caller's clip rectangle and with
+     * the screen.  All inclusive, all top-left origin. */
+    x0 = MAX(s->dstx, s->clipx0);
+    y0 = MAX(s->dsty, s->clipy0);
+    x1 = MIN(s->dstx + (int32_t)s->width - 1, s->clipx1);
+    y1 = MIN(s->dsty + (int32_t)s->height - 1, s->clipy1);
+    x0 = MAX(x0, 0);
+    y0 = MAX(y0, 0);
+    x1 = MIN(x1, (int32_t)cfg.xres - 1);
+    y1 = MIN(y1, (int32_t)cfg.yres - 1);
+    if (x1 < x0 || y1 < y0) {
+        return BLIT_RC_OK;                  /* wholly clipped: nothing to do */
+    }
+
+    {
+        uint32_t w = (uint32_t)(x1 - x0 + 1);
+        uint32_t h = (uint32_t)(y1 - y0 + 1);
+        uint32_t skip_x = (uint32_t)(x0 - s->dstx);
+        uint32_t skip_y = (uint32_t)(y0 - s->dsty);
+        uint64_t dest;
+
+        if ((uint64_t)w * bpp > BLIT_MAX_WIDTH || h > BLIT_MAX_HEIGHT) {
+            return BLIT_RC_BADGEOM;
+        }
+        row = blit_scratch(s, w * bpp);
+
+        for (uint32_t j = 0; j < h; j++) {
+            uint32_t sy = skip_y + j;       /* row within the sprite */
+            uint64_t src;
+
+            /* Bottom-first storage: the sprite's last row is the top one. */
+            if (s->flags & BLIT_F_BOTTOM_UP) {
+                sy = s->height - 1 - sy;
+            }
+            src = s->src + (uint64_t)sy * s->sstride + (uint64_t)skip_x * bpp;
+            dest = cfg.base + (uint64_t)(y0 + j) * pitch + (uint64_t)x0 * bpp;
+
+            if ((uint64_t)(y0 + j) * pitch + (uint64_t)x0 * bpp + w * bpp
+                > fbsize) {
+                return BLIT_RC_RANGE;
+            }
+            if (s->flags & BLIT_F_SRC_VIRT) {
+                if (cpu_memory_rw_debug(cpu, src, row, w * bpp, false) < 0) {
+                    return BLIT_RC_FAULT;
+                }
+            } else {
+                dma_memory_read(&address_space_memory, src, row, w * bpp,
+                                MEMTXATTRS_UNSPECIFIED);
+            }
+            dma_memory_write(&address_space_memory, dest, row, w * bpp,
+                             MEMTXATTRS_UNSPECIFIED);
+        }
+
+        s->n_copy++;
+        s->bytes += (uint64_t)w * h * bpp;
+    }
+    return BLIT_RC_OK;
+}
+
 static void blit_go(RISCOSBlitterState *s)
 {
     uint32_t rc;
 
     if (!blit_geom_ok(s)) {
         rc = BLIT_RC_BADGEOM;
+    } else if (s->op == BLIT_OP_SPRITE) {
+        rc = blit_sprite(s);            /* geometry is in pixels, not bytes */
     } else if (s->width == 0 || s->height == 0) {
         rc = BLIT_RC_OK;                /* nothing to do, but not an error */
     } else {
@@ -290,6 +381,9 @@ static void blit_go(RISCOSBlitterState *s)
             break;
         case BLIT_OP_COPY:
             rc = blit_copy(s);
+            break;
+        case BLIT_OP_SPRITE:
+            rc = blit_sprite(s);
             break;
         default:
             rc = BLIT_RC_BADOP;
@@ -312,7 +406,7 @@ static uint64_t blit_read(void *opaque, hwaddr offset, unsigned size)
     case BLIT_VERSION:
         return BLIT_VERSION_VALUE;
     case BLIT_FEATURES:
-        return BLIT_FEATURE_FILL | BLIT_FEATURE_COPY;
+        return BLIT_FEATURE_FILL | BLIT_FEATURE_COPY | BLIT_FEATURE_SPRITE;
     case BLIT_GO:
         return s->status;
     default:
@@ -337,6 +431,13 @@ static void blit_write(void *opaque, hwaddr offset, uint64_t value,
     case BLIT_DSTRIDE: s->dstride = v;  break;
     case BLIT_SSTRIDE: s->sstride = v;  break;
     case BLIT_PATLEN:  s->patlen = v;   break;
+    case BLIT_DSTX:    s->dstx = v;     break;
+    case BLIT_DSTY:    s->dsty = v;     break;
+    case BLIT_CLIPX0:  s->clipx0 = v;   break;
+    case BLIT_CLIPY0:  s->clipy0 = v;   break;
+    case BLIT_CLIPX1:  s->clipx1 = v;   break;
+    case BLIT_CLIPY1:  s->clipy1 = v;   break;
+    case BLIT_BPP:     s->bpp = v;      break;
     default:
         if (offset >= BLIT_PATTERN && offset < BLIT_PATTERN + 16) {
             s->pattern[(offset - BLIT_PATTERN) / 4] = v;
@@ -387,6 +488,13 @@ static const VMStateDescription blit_vmstate = {
         VMSTATE_UINT32(width, RISCOSBlitterState),
         VMSTATE_UINT32(height, RISCOSBlitterState),
         VMSTATE_UINT32(patlen, RISCOSBlitterState),
+        VMSTATE_INT32(dstx, RISCOSBlitterState),
+        VMSTATE_INT32(dsty, RISCOSBlitterState),
+        VMSTATE_INT32(clipx0, RISCOSBlitterState),
+        VMSTATE_INT32(clipy0, RISCOSBlitterState),
+        VMSTATE_INT32(clipx1, RISCOSBlitterState),
+        VMSTATE_INT32(clipy1, RISCOSBlitterState),
+        VMSTATE_UINT32(bpp, RISCOSBlitterState),
         VMSTATE_INT32(dstride, RISCOSBlitterState),
         VMSTATE_INT32(sstride, RISCOSBlitterState),
         VMSTATE_UINT32_ARRAY(pattern, RISCOSBlitterState, 4),
