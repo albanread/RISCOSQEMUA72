@@ -453,12 +453,27 @@ hexbuf:
     .equ    W_PACKED,  8
     .equ    W_MODE,    12
     .equ    W_LOG2BPP, 16
+    .equ    W_N52,     20
+    .equ    W_EASY,    24
+    .equ    W_PASSED,  28
+    .equ    W_ACCAREA, 32
+    .equ    W_PASSAREA,36
+    .equ    W_OLDMASK, 40           @ old format, declined for its mask
+    .equ    W_NOTABLE, 44           @ old format, no colour table
+    .equ    W_DEPTH,   48           @ old format, deeper than 8bpp
+    .equ    W_NAME,    52           @ sprite named, not pointed at
+    .equ    W_LBIT,    56           @ left-hand wastage
+    .equ    W_ACTION,  60           @ a GCOL action other than store
+    .equ    W_SCALE,   64           @ genuinely scaling
+    .equ    W_ACTVAL,  68           @ the plot action, kept past r5's reuse
+    .equ    W_ACTSEEN, 72           @ ... and the last one declined
 sv_work:
     .word   0                       @ colour table
     .word   32                      @ bits per source pixel
     .word   0                       @ non-zero when the source is packed
     .word   -1                      @ cached mode number
     .word   0                       @ ... and its Log2BPP
+    .space  4 * 14                  @ counters, mirrored out in sv_pass
 
 sv_handler:
     STMFD   sp!, {r0-r11, lr}
@@ -467,10 +482,9 @@ sv_handler:
     TEQ     r10, #52                @ PutSpriteScaled: the only one that pays
     BNE     sv_count
 
-    ADR     r11, sv_n52
-    LDR     r8, [r11]
+    LDR     r8, [r12, #W_N52]
     ADD     r8, r8, #1
-    STR     r8, [r11]
+    STR     r8, [r12, #W_N52]
 
     @ The case worth taking: the sprite pointed at rather than named,
     @ unmasked, already the screen's depth, whole words edge to edge,
@@ -479,18 +493,49 @@ sv_handler:
     @ a palette, and for a sprite already in the screen's format it has
     @ nothing to say.
     CMP     r0, #512
-    BLO     sv_pass
-    TEQ     r5, #0                  @ GCOL action: store only
-    BNE     sv_pass
+    BHS     .Lsv_pointed
+    LDR     r8, [r12, #W_NAME]
+    ADD     r8, r8, #1
+    STR     r8, [r12, #W_NAME]
+    B       sv_pass                 @ named: would have to search the area
+.Lsv_pointed:
+    @ The plot action is the GCOL action in bits 0..2 and, at 8 and
+    @ above, a request to use the sprite's mask -- below 8 RISC OS plots
+    @ solid even when the sprite has one (vdugrafg: "if GCOL action < 8
+    @ plot as solid anyway").  Store is the only GCOL action taken.
+    @ Bits 0..2 are the GCOL action and bit 3 asks for the mask -- that
+    @ much is certain, from c/PutScaled's "gcol & 7" and "if(!(gcol &
+    @ 8))".  Bit 4 is set on most of the desktop's calls and its meaning
+    @ is not established; ignoring it changed 3468 pixels across a
+    @ cluster of filer icons, so anything carrying it is declined.
+    STR     r5, [r12, #W_ACTVAL]
+    TEQ     r5, #0
+    TEQNE   r5, #8
+    BEQ     .Lsv_actionok
+    LDR     r8, [r12, #W_ACTION]
+    ADD     r8, r8, #1
+    STR     r8, [r12, #W_ACTION]
+    STR     r5, [r12, #W_ACTSEEN]   @ what was actually asked for
+    B       sv_pass
+.Lsv_actionok:
     LDR     r8, [r2, #spLBit]
     TEQ     r8, #0
-    BNE     sv_pass                 @ left-hand wastage
+    BEQ     .Lsv_lbitok
+    LDR     r8, [r12, #W_LBIT]
+    ADD     r8, r8, #1
+    STR     r8, [r12, #W_LBIT]
+    B       sv_pass
+.Lsv_lbitok:
     TEQ     r6, #0
     BEQ     .Lsv_scaleok
     LDMIA   r6, {r8, r9, r10, r11}
     TEQ     r8, r10
     TEQEQ   r9, r11
-    BNE     sv_pass
+    BEQ     .Lsv_scaleok
+    LDR     r8, [r12, #W_SCALE]
+    ADD     r8, r8, #1
+    STR     r8, [r12, #W_SCALE]
+    B       sv_pass
 .Lsv_scaleok:
 
     @ Two shapes are taken.  A type 6 sprite is 32bpp, already the
@@ -511,11 +556,21 @@ sv_handler:
     CMP     r8, #256                @ a mode number, not a packed word
     BHS     sv_pass
     TEQ     r7, #0
-    BEQ     sv_pass                 @ no table: would need the palette
+    BNE     .Lsv_havetable
+    LDR     r9, [r12, #W_NOTABLE]
+    ADD     r9, r9, #1
+    STR     r9, [r12, #W_NOTABLE]
+    B       sv_pass                 @ would need the sprite's own palette
+.Lsv_havetable:
     LDR     r9, [r2, #spImage]
     LDR     r10, [r2, #spTrans]
     TEQ     r9, r10
-    BNE     sv_pass                 @ old-style mask, not one bit a pixel
+    BEQ     .Lsv_oldunmasked
+    LDR     r9, [r12, #W_OLDMASK]
+    ADD     r9, r9, #1
+    STR     r9, [r12, #W_OLDMASK]
+    B       sv_pass                 @ old-style mask, not one bit a pixel
+.Lsv_oldunmasked:
 
     @ Depth comes from the mode number, which costs a SWI, so remember
     @ the last one: a desktop uses very few sprite modes.
@@ -533,7 +588,12 @@ sv_handler:
     LDR     r2, [sp, #8]            @ the SWI had r2; sprite pointer back
 .Lsv_gotdepth:
     CMP     r11, #3                 @ 8bpp or less
-    BHI     sv_pass
+    BLS     .Lsv_depthok
+    LDR     r9, [r12, #W_DEPTH]
+    ADD     r9, r9, #1
+    STR     r9, [r12, #W_DEPTH]
+    B       sv_pass
+.Lsv_depthok:
     MOV     r10, #1
     MOV     r10, r10, LSL r11       @ bits per source pixel
     STR     r10, [r12, #W_SRCBPP]
@@ -623,13 +683,17 @@ sv_haveconst:
     MOV     r11, #OP_SPRITE
     STR     r11, [r10, #BLIT_OP]
 
-    @ A sprite whose mask offset differs from its image offset has one.
-    @ At two bits per pixel and above it is one bit per pixel, least
-    @ significant first, rows padded to whole words.
+    @ Mask the plot only when the action asked for it and the sprite
+    @ actually has one.  At two bits per pixel and above the mask is one
+    @ bit per pixel, least significant first, rows padded to whole words.
+    MOV     r11, #F_SRC_VIRT        @ rows run top down, as the screen does
+    LDR     r8, [r12, #W_ACTVAL]
+    TST     r8, #8
+    BEQ     .Lsv_unmasked
     LDR     r11, [r2, #spImage]
     LDR     r8, [r2, #spTrans]
     TEQ     r11, r8
-    MOVEQ   r11, #F_SRC_VIRT        @ rows run top down, as the screen does
+    MOVEQ   r11, #F_SRC_VIRT
     BEQ     .Lsv_unmasked
     ADD     r8, r8, r2
     STR     r8, [r10, #BLIT_MASK]
@@ -680,15 +744,13 @@ sv_haveconst:
     TEQ     r11, #0
     BNE     sv_pass                 @ refused: leave it to SpriteExtend
 
-    ADR     r8, sv_easyn
-    LDR     r9, [r8]
+    LDR     r9, [r12, #W_EASY]
     ADD     r9, r9, #1
-    STR     r9, [r8]
+    STR     r9, [r12, #W_EASY]
     MUL     r9, r6, r5              @ pixels actually taken on
-    ADR     r8, sv_accarea
-    LDR     r10, [r8]
+    LDR     r10, [r12, #W_ACCAREA]
     ADD     r10, r10, r9
-    STR     r10, [r8]
+    STR     r10, [r12, #W_ACCAREA]
 
     @ Claim.  CallVector pushed the caller's return address before
     @ walking the chain, so passing on is MOV pc, lr and intercepting is
@@ -698,10 +760,9 @@ sv_haveconst:
     LDMFD   sp!, {pc}
 
 sv_pass:
-    ADR     r8, sv_passed
-    LDR     r9, [r8]
+    LDR     r9, [r12, #W_PASSED]
     ADD     r9, r9, #1
-    STR     r9, [r8]
+    STR     r9, [r12, #W_PASSED]
     @ Area of what we turned away, so the split that matters -- pixels,
     @ not calls -- says whether the next case is worth writing.  Only
     @ range C, where r2 points at the sprite rather than naming it.
@@ -713,20 +774,30 @@ sv_pass:
     LDR     r10, [r2, #spHeight]
     ADD     r10, r10, #1
     MUL     r9, r10, r9
-    ADR     r8, sv_passarea
-    LDR     r10, [r8]
+    LDR     r10, [r12, #W_PASSAREA]
     ADD     r10, r10, r9
-    STR     r10, [r8]
-    @ And by sprite type, so the depth still being turned away is a fact
-    @ rather than a guess.  Type 6 is 32bpp; below that is packed.
-    LDR     r9, [r2, #spMode]
-    MOV     r9, r9, LSR #27
-    CMP     r9, #16
-    BHS     sv_count
+    STR     r10, [r12, #W_PASSAREA]
+    @ And by plot action, low four bits: the GCOL action in 0..2 and
+    @ the use-the-mask request at 8.  The sprite-type histogram has
+    @ already said what it had to say, so these are the same buckets.
+    LDR     r9, [sp, #20]           @ r5 as it came in
+    AND     r9, r9, #15
     ADR     r8, sv_bytype
     LDR     r10, [r8, r9, LSL #2]
     ADD     r10, r10, #1
     STR     r10, [r8, r9, LSL #2]
+    @ The counters live in the r12 workspace because ADR cannot reach
+    @ the printed block from the top of this handler any more.  This is
+    @ the one place that can reach both, so mirror them here.
+    ADR     r8, sv_mirror
+    MOV     r9, #0
+.Lsv_mirror:
+    ADD     r10, r12, #W_N52
+    LDR     r11, [r10, r9, LSL #2]
+    STR     r11, [r8, r9, LSL #2]
+    ADD     r9, r9, #1
+    CMP     r9, #14
+    BLO     .Lsv_mirror
     TEQ     r7, #0
     BEQ     sv_count
     ADR     r8, sv_withtable
@@ -793,16 +864,8 @@ sv_maxarea:
     .word   0
 sv_counts:
     .space  4 * 6
-sv_n52:
-    .word   0
-sv_easyn:
-    .word   0
-sv_passed:
-    .word   0
-sv_accarea:
-    .word   0
-sv_passarea:
-    .word   0
+sv_mirror:
+    .space  4 * 14          @ n52, accelerated, passed, areas, rejects
 sv_bytype:
     .space  4 * 16
 sv_withtable:
@@ -959,7 +1022,7 @@ sb_guest:
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
     ADR     r6, sv_maxarea
-    MOV     r7, #29                 @ ..., areas, 16 type buckets, table count
+    MOV     r7, #38                 @ maxarea, 6 reasons, 14 mirrored, 16 types, table
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4
