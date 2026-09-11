@@ -21,9 +21,15 @@ typedef unsigned int   uint32_t;
 typedef int            int32_t;
 typedef unsigned char  uint8_t;
 
-/* ---- the doorbell (0xFD400000, the low-peripheral window) ---------- */
+/* ---- the doorbell ------------------------------------------------- */
 
-#define VMCH_BASE        0xFD400000u
+/* RISC OS maps peripherals into logical space on demand, not at a
+ * fixed window: OS_Memory 13 (MapIOPermanent) hands back the logical
+ * base for the doorbell's physical page at 0xFE005000 (mirrored by
+ * QEMU beside the system timer in the high peripheral window).  The
+ * logical address is only known at runtime. */
+#define VMCH_PHYS        0xFE005000u
+#define VMCH_SIZE        0x4000u
 #define VMCH_MAGIC      0x00
 #define VMCH_FEATURES   0x08
 #define VMCH_CMD        0x0C
@@ -85,10 +91,13 @@ struct vmreq {
 #define XOS_FSControl       0x20029
 #define XOS_Memory          0x20068
 
-#define vmch_reg(idx) (*(volatile uint32_t *)(VMCH_BASE + (uint32_t)(idx) * 4u))
+#define vmch_reg(idx) (vmch[idx])
 
 /* The doorbell masks the request address down to 16 bytes.  Norcroft
  * has no aligned attribute, so over-allocate and line it up in init. */
+/* the doorbell's logical window, from OS_Memory 13 in init */
+static volatile uint32_t *vmch;
+
 static uint8_t reqstore[sizeof(struct vmreq) + 16];
 static struct vmreq *req;
 static uint32_t seq;
@@ -106,6 +115,8 @@ static _kernel_oserror err_access      = { 0xBD,  "HostFS: access denied" };
 static _kernel_oserror err_badpath     = { 0x1E4, "HostFS: bad path" };
 static _kernel_oserror err_full        = { 0x101, "HostFS: directory too big" };
 static _kernel_oserror err_nodev       = { 0x1E4, "HostFS: no doorbell device" };
+static _kernel_oserror err_nomap    = { 0x1E5, "HostFS: OS_Memory 13 failed" };
+static _kernel_oserror err_badmagic = { 0x1E6, "HostFS: magic wrong" };
 static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" };
 static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
 
@@ -289,10 +300,38 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
     return done;
 }
 
+
+/* Map the doorbell on first use: OS_Memory 13 fails when called from
+ * a module's init (the IO dynamic area is off-limits mid-module-load),
+ * but works from any normal context, as the status probe proved. */
+static int ensure_vmch(void)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    if (vmch) {
+        return 1;
+    }
+    r.r[0] = 13;                     /* OS_Memory: MapIOPermanent */
+    r.r[1] = (int)VMCH_PHYS;
+    r.r[2] = (int)VMCH_SIZE;
+    e = _kernel_swi(XOS_Memory, &r, &r);
+    if (e != NULL || r.r[3] == 0) {
+        return 0;
+    }
+    vmch = (volatile uint32_t *)r.r[3];
+    return vmch_reg(VMCH_MAGIC / 4) == VMCH_MAGIC_VALUE
+        && (vmch_reg(VMCH_FEATURES / 4) & VMCH_FEATURE_FS);
+}
+
 /* ---- FS entry handlers: r->r[] is the caller's register frame ------- */
 
 _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t mode = (uint32_t)r->r[0];
     const char *name = (const char *)r->r[1];
     uint32_t flags = O_READ;
@@ -350,6 +389,10 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t h = (uint32_t)r->r[1];
     uint32_t mem = (uint32_t)r->r[2];
     uint32_t n = (uint32_t)r->r[3];
@@ -370,6 +413,10 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t h = (uint32_t)r->r[1];
     uint32_t mem = (uint32_t)r->r[2];
     uint32_t n = (uint32_t)r->r[3];
@@ -393,6 +440,10 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t h = (uint32_t)r->r[1];
     int idx = (int)h - 1;
 
@@ -456,6 +507,10 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t rc = vmch_req_close((uint32_t)r->r[1]);
     int idx = (int)r->r[1] - 1;
 
@@ -468,6 +523,10 @@ _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t reason = (uint32_t)r->r[0];
     const char *name = (const char *)r->r[1];
     uint32_t size, type, attr, cs_lo, cs_hi, rc, h, load, exec, len;
@@ -617,6 +676,10 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
 {
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
+
     uint32_t off, want, buflen, nbytes, n, done, load, exec, entlen, namelen;
     uint8_t *buf, *src;
     uint32_t rc;
@@ -777,25 +840,15 @@ _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
     /* line the request block up to the doorbell's 16-byte mask */
     req = (struct vmreq *)(((uint32_t)reqstore + 15u) & ~15u);
 
-    /* Both ends must be present: the doorbell in the peripheral
-     * window, and its root= property (features bit 0) for FS work. */
-    if (vmch_reg(VMCH_MAGIC / 4) != VMCH_MAGIC_VALUE) {
-        return &err_nodev;
-    }
-    if (!(vmch_reg(VMCH_FEATURES / 4) & VMCH_FEATURE_FS)) {
-        return &err_nofs;
-    }
+    /* The doorbell is mapped on first use (see ensure_vmch): mapping
+     * from init fails because the IO area is off-limits mid-load. */
 
-    /* Our own load address, for the base-relative FSInfo offsets.
-     * OS_Module 18: R1 = module number, R3 = pointer to module code
-     * (Kernel/s/ModHand:1411). R3 is the base FileSwitch must store. */
-    r.r[0] = 18;                         /* OS_Module 18: enumerate by title */
-    r.r[1] = (int)"HostFS";
-    e = _kernel_swi(XOS_Module, &r, &r);
-    if (e != NULL || r.r[3] == 0) {
-        return &err_nodev;
-    }
-    base = (uint32_t)r.r[3];
+    /* The FSInfo offsets are computed as live_address - base and
+     * FileSwitch stores base and adds it back (FSCtrl2), so any
+     * self-consistent base works; base 0 makes the offsets plain
+     * absolute addresses.  (OS_Module 18 cannot be used here: the
+     * module is not yet in the chain while its own init runs.) */
+    base = 0;
 
     /* The filing system information block, built at runtime from live
      * addresses (PRM2 2-532: FileSwitch copies it immediately) */
@@ -861,11 +914,16 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
      * order: 0 = HostFSPing, 1 = HostFSStatus.  Keep this switch and
      * dde/cmhg/HostFS in lockstep if the table is reordered. */
     if (cmd_no == 1) {                   /* *HostFSStatus */
-        uint32_t magic = vmch_reg(VMCH_MAGIC / 4);
-        uint32_t feats = vmch_reg(VMCH_FEATURES / 4);
-
-        printf("HostFS magic=%08X features=%08X registered=%d pw=%08X\r\n",
-               magic, feats, registered, (unsigned int)pw);
+        printf("HostFS vmch=%08X magic=%08X features=%08X registered=%d pw=%08X\r\n",
+               (unsigned int)(unsigned long)vmch,
+               vmch ? vmch_reg(VMCH_MAGIC / 4) : 0xDEAD,
+               vmch ? vmch_reg(VMCH_FEATURES / 4) : 0xDEAD,
+               registered, (unsigned int)pw);
+        r.r[0] = 13;                     /* re-run the mapping probe */
+        r.r[1] = (int)VMCH_PHYS;
+        r.r[2] = (int)VMCH_SIZE;
+        e = _kernel_swi(XOS_Memory, &r, &r);
+        printf("OS_Memory 13: e=%d R3=%08X\r\n", e != NULL, r.r[3]);
         r.r[0] = 0;                      /* our own base, via OS_Module 18 */
         r.r[1] = (int)"HostFS";
         e = _kernel_swi(XOS_Module, &r, &r);
@@ -898,6 +956,9 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
         return &err_unsupported;
     }
 
+    if (!ensure_vmch()) {
+        return &err_nodev;
+    }
     req->cmd = C_PING;
     req->handle = 0;
     req->arglen = 4;

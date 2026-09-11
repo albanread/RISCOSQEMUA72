@@ -235,6 +235,21 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                                 sysbus_mmio_get_region(
                                      SYS_BUS_DEVICE(&s->vmchannel), 0));
 
+    /* RISC OS's logical map is built on demand and the FE00 section
+     * (system timer at 0xFE003000) is provably live device mapping.
+     * The doorbell therefore also lives at 0xFE005000: an unused hole
+     * in that same section, so the guest's translations there are real
+     * device mappings.  (An alias at 0xFEC00000 was bypassed by the
+     * guest: reads there came back right without reaching the device.)
+     */
+    memory_region_init_alias(&s->vmchannel_mr_alias, OBJECT(s),
+                             "vmchannel-high",
+                             sysbus_mmio_get_region(
+                                  SYS_BUS_DEVICE(&s->vmchannel), 0),
+                             0, VMCH_REGION_SIZE);
+    memory_region_add_subregion(&s_base->peri_mr, 0x5000,
+                                &s->vmchannel_mr_alias);
+
     /* Map MPHI to BCM2838 memory map */
     mphi_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s_base->mphi), 0);
     memory_region_init_alias(&s->mphi_mr_alias, OBJECT(s), "mphi", mphi_mr, 0,

@@ -227,6 +227,25 @@ static uint64_t date_cs_for(const GStatBuf *st)
     return (uint64_t)(st->st_mtime + 2208988800ULL) * 100;
 }
 
+/* Development trace to a file: stderr proved unreliable under the
+ * Windows launcher, so every doorbell access lands here instead. */
+static void vmch_trace(const char *fmt, ...)
+{
+    static FILE *f;
+    va_list ap;
+
+    if (!f) {
+        f = fopen("F:/RISCOSDEV/.scratch/vmch-trace.txt", "a");
+        if (!f) {
+            return;
+        }
+    }
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fflush(f);
+}
+
 /* ------------------------------------------------------------------ */
 /* Command execution.  base is the request block's guest address.      */
 
@@ -616,22 +635,24 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         break;
     }
 
-    /* Development trace: every doorbell request, one stderr line.  The
-     * arg text is only decoded for path-carrying commands. */
-    if (cmd != VMCH_CMD_PING) {
-        fprintf(stderr, "vmch: cmd=%u hnd=%08x arglen=%u rc=%u",
-                cmd, ld32(base + VMCH_HDR_HANDLE), arglen, rc);
+    /* Development trace: every doorbell request, one line, with the
+     * first block words so layout disputes can be settled from the
+     * log alone. */
+    {
+        vmch_trace("vmch: cmd=%u seq=%u rc=%u hnd=%08x arglen=%u",
+                cmd, ld32(base + VMCH_HDR_SEQ), rc,
+                ld32(base + VMCH_HDR_HANDLE), arglen);
         if (cmd == VMCH_CMD_OPEN || cmd == VMCH_CMD_CREATE ||
             cmd == VMCH_CMD_DELETE || cmd == VMCH_CMD_CAT ||
             cmd == VMCH_CMD_FILEARGS) {
             uint32_t i;
-            fprintf(stderr, " path=");
+            vmch_trace(" path=");
             for (i = 0; i < arglen && i < 64; i++) {
                 int c = ld8(base + VMCH_HDR_SIZE + i);
-                fputc((c >= 32 && c < 127) ? c : '.', stderr);
+                vmch_trace("%c", (c >= 32 && c < 127) ? c : '.');
             }
         }
-        fputc('\n', stderr);
+        vmch_trace("\n");
     }
 
     st32(base + VMCH_HDR_RC, rc);
@@ -640,9 +661,22 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 /* ------------------------------------------------------------------ */
 /* MMIO                                                                */
 
+static uint64_t vmchannel_read_inner(VMChannelState *s, hwaddr offset,
+                                     unsigned size);
+
 static uint64_t vmchannel_read(void *opaque, hwaddr offset, unsigned size)
 {
     VMChannelState *s = VMCHANNEL(opaque);
+    uint64_t v = vmchannel_read_inner(s, offset, size);
+
+    vmch_trace("vmch RD off=%llx sz=%u -> %08llx\n",
+            (unsigned long long)offset, size, (unsigned long long)v);
+    return v;
+}
+
+static uint64_t vmchannel_read_inner(VMChannelState *s, hwaddr offset,
+                                     unsigned size)
+{
 
     switch (offset) {
     case VMCH_MAGIC:
@@ -663,6 +697,9 @@ static void vmchannel_write(void *opaque, hwaddr offset, uint64_t value,
                             unsigned size)
 {
     VMChannelState *s = VMCHANNEL(opaque);
+
+    vmch_trace("vmch WR off=%llx sz=%u val=%08llx\n",
+            (unsigned long long)offset, size, (unsigned long long)value);
 
     if (offset == VMCH_CMD && size == 4) {
         vmchannel_do(s, (hwaddr)(uint32_t)value & ~(hwaddr)0xf);

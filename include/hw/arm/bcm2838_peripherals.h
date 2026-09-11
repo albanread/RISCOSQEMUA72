@@ -105,8 +105,11 @@ struct BCM2838PeripheralState {
     UnimplementedDeviceState pcie;
     UnimplementedDeviceState genet;
 
-    /* The HostFS doorbell, mapped at VMCHANNEL_OFFSET in the low window */
+    /* The HostFS doorbell, mapped at VMCHANNEL_OFFSET in both windows:
+     * the low alias directly, the high one through vmchannel_mr_alias
+     * (a region cannot live in two containers) */
     VMChannelState vmchannel;
+    MemoryRegion vmchannel_mr_alias;
     char *vmchannel_root;          /* forwarded to the doorbell's root= */
 
     SDHCIState emmc2;
