@@ -345,6 +345,15 @@ reboot, and a `*Cat` typed in the guest appears on the host.
 
 ## 13 — the blitter: render ops, sprites and the pointer on the host (5–8 days)
 
+The Mac expansion of this sprint is designed in
+[`GPUDESIGN.md`](GPUDESIGN.md) — researched against the ROOL Kernel and
+BCMVideo sources and the whole `BCM2835Dev` ROM tree, which settled the
+scope: the **pointer** is answered by the host as the GPU (`'DISP'`,
+the `'AUDS'` pattern), the **sprite plots** are the focus (a `SpriteV`
+module, RISC OS's own extension point), and the **fill** is deferred
+until the project builds its own ROM, where it becomes a real blitter
+device on the machine.
+
 The render operations RISC OS actually issues, who issues them, and what
 they cost today are tabulated in DESIGN.md section 14. The DMA copy path
 described there, `hw/dma/bcm2835_dma.c` moving rows whole, is the baseline
