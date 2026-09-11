@@ -991,7 +991,10 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
         r.r[2] = (int)VMCH_SIZE;
         e = _kernel_swi(XOS_Memory, &r, &r);
         printf("OS_Memory 13: e=%d R3=%08X\r\n", e != NULL, r.r[3]);
-        r.r[0] = 0;                      /* our own base, via OS_Module 18 */
+        r.r[0] = 18;                     /* OS_Module 18: LookupName (not
+                                          * 0 = Run, which enters this
+                                          * resident module as an app and
+                                          * aborts) */
         r.r[1] = (int)"HostFS";
         e = _kernel_swi(XOS_Module, &r, &r);
         printf("OS_Module 18: e=%d R1(num)=%08X R3(base)=%08X R4(pw)=%08X\r\n",
