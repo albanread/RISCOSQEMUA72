@@ -1,0 +1,8 @@
+| Build — compile and link the HostFSFiler module with the DDE.
+| Produces <Obey$Dir>.HostFSFiler,ffa.  Run after SetDDE.
+Set HFiler$Dir <Obey$Dir>
+Dir <Obey$Dir>
+cc -c -zM -zps1 -ffah -IC: -o o.hostfsfiler c.hostfsfiler
+cmhg cmhg.HostFSFiler -o o.head
+link -rmf -o HostFSFiler,ffa o.head o.hostfsfiler C:o.stubs
+Echo Built <HFiler$Dir>.HostFSFiler,ffa

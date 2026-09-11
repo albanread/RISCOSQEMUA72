@@ -1,0 +1,15 @@
+| SetDDE — point the Acorn C/C++ toolchain variables at the DDE on the
+| hostfs disc, without the desktop-only parts of !SetPaths.
+| Note rpcemu's HostFS name mapping: the Windows directory AcornC.C++
+| is seen by RISC OS as AcornC/C++ (first dot becomes a slash).
+Set SetPaths$Dir HostFS::HostFS.$.AcornC/C++.!SetPaths
+/<SetPaths$Dir>.SetLibPath <SetPaths$Dir>.Lib32.
+Set C/C++$Dir <SetPaths$Dir>.^
+Set APCS APCS-32
+Set APCSExport$Dir <C/C++$Dir>.Export.<APCS>
+Set CExport$Dir <APCSExport$Dir>.C
+Set Lib$Dir <APCSExport$Dir>.Lib
+Set Hdr$Dir <APCSExport$Dir>.Hdr
+Set CLIB$Path <Lib$Dir>.clib.
+Set C$Path <CLIB$Path>,<Lib$Dir>.
+Set C$LibRoot C:
