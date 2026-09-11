@@ -48,6 +48,13 @@
     .equ    GVRender_FillRectangle, 2
     .equ    GraphicsV_Complete,    0
 
+    .equ    SpriteV,               0x1F
+    .equ    spWidth,               16      @ width in words - 1
+    .equ    spHeight,              20      @ height in rows - 1
+    .equ    spImage,               32
+    .equ    spTrans,               36      @ == spImage when unmasked
+    .equ    spMode,                40
+
 _start:
 base:
     .word   0                       @ start
@@ -85,12 +92,23 @@ cmdtab:
     .word   0
     .word   st_syntax - base
     .word   st_help   - base
+    .asciz  "SprStats"
+    .balign 4
+    .word   cmd_sprstats - base
+    .word   0
+    .word   sv_syntax - base
+    .word   sv_help   - base
     .byte   0                       @ end of table
     .balign 4
 st_syntax:
     .asciz  "Syntax:\t*BlitStats"
 st_help:
     .asciz  "*BlitStats reports the FillRectangle calls seen on GraphicsV.\r"
+    .balign 4
+sv_syntax:
+    .asciz  "Syntax:\t*SprStats"
+sv_help:
+    .asciz  "*SprStats counts the sprite plots the desktop asks for.\r"
     .balign 4
 cmd_syntax:
     .asciz  "Syntax:\t*BlitFill"
@@ -120,6 +138,11 @@ init:
     MOV     r2, #0
     SWI     XOS_Claim
     BVS     init_fail
+    MOV     r0, #SpriteV
+    ADR     r1, sv_veneer
+    MOV     r2, #0
+    SWI     XOS_Claim
+    BVS     init_fail
     MSR     CPSR_f, #0              @ V clear: no error
     LDMFD   sp!, {r1-r4, pc}
 init_nodev:
@@ -134,8 +157,15 @@ err_nodev:
     .asciz  "No host blitter at this address"
     .balign 4
 
+sv_veneer:
+    B       sv_handler
+
 final:
     STMFD   sp!, {r0-r2, lr}
+    MOV     r0, #SpriteV
+    ADR     r1, sv_veneer
+    MOV     r2, #0
+    SWI     XOS_Release
     MOV     r0, #GraphicsV
     ADR     r1, gv_handler
     MOV     r2, #0
@@ -361,4 +391,98 @@ blit_log:
 hexbuf:
     .space  16
     .balign 4
+
+@ --------------------------------------------------- SpriteV observer
+@ Counts the plotting reasons and passes every call on untouched.  The
+@ kernel only takes its internal fast path when it is the sole owner of
+@ SpriteV, so claiming this sends every sprite op down the vector --
+@ which is the point, but also means the handler must be cheap and must
+@ leave every register alone.
+@
+@ It lives at the end with its data beside it: ADR reaches about a
+@ kilobyte, and a module with no relocations has nothing else to address
+@ with.
+sv_handler:
+    STMFD   sp!, {r0-r11, lr}
+    AND     r5, r0, #0xFF
+    ADR     r6, sv_reasons
+    MOV     r7, #0
+sv_find:
+    LDR     r8, [r6, r7, LSL #2]
+    TEQ     r8, r5
+    BEQ     sv_hit
+    ADD     r7, r7, #1
+    CMP     r7, #6
+    BLO     sv_find
+    B       sv_out
+
+sv_hit:
+    ADR     r6, sv_counts
+    LDR     r8, [r6, r7, LSL #2]
+    ADD     r8, r8, #1
+    STR     r8, [r6, r7, LSL #2]
+
+    @ Sample the first two, and only from range C, where r2 points at
+    @ the sprite rather than naming it.
+    CMP     r0, #512
+    BLO     sv_out
+    ADR     r6, sv_nsample
+    LDR     r8, [r6]
+    CMP     r8, #2
+    BHS     sv_out
+    ADD     r9, r8, #1
+    STR     r9, [r6]
+    ADR     r6, sv_sample
+    ADD     r9, r8, r8, LSL #1      @ six words per sample
+    ADD     r6, r6, r9, LSL #3
+    STR     r0, [r6, #0]
+    LDR     r9, [r2, #spWidth]
+    STR     r9, [r6, #4]
+    LDR     r9, [r2, #spHeight]
+    STR     r9, [r6, #8]
+    LDR     r9, [r2, #spMode]
+    STR     r9, [r6, #12]
+    LDR     r9, [r2, #spImage]
+    STR     r9, [r6, #16]
+    LDR     r9, [r2, #spTrans]
+    STR     r9, [r6, #20]
+sv_out:
+    LDMFD   sp!, {r0-r11, pc}
+
+sv_reasons:
+    .word   28, 34, 48, 49, 50, 52
+sv_nsample:
+    .word   0
+sv_counts:
+    .space  4 * 6
+sv_sample:
+    .space  4 * 12
+sv_hexbuf:
+    .space  16
+    .balign 4
+
+cmd_sprstats:
+    STMFD   sp!, {r0-r8, lr}
+    ADR     r6, sv_nsample
+    MOV     r7, #19                 @ sample count, six counters, two samples
+    MOV     r8, #0
+sp_loop:
+    LDR     r0, [r6], #4
+    ADR     r1, sv_hexbuf
+    MOV     r2, #12
+    SWI     XOS_ConvertHex8
+    BVS     sp_out
+    SWI     XOS_Write0
+    SWI     XOS_WriteI + 32
+    ADD     r8, r8, #1
+    TEQ     r8, #6
+    MOVEQ   r8, #0
+    SWIEQ   XOS_NewLine
+    SUBS    r7, r7, #1
+    BNE     sp_loop
+    SWI     XOS_NewLine
+sp_out:
+    MSR     CPSR_f, #0
+    LDMFD   sp!, {r0-r8, pc}
+
     .ltorg
