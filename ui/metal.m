@@ -130,12 +130,12 @@ typedef struct {
     uint32_t post[4];   /* view w, view h, scaling, scanlines */
 } MetalParams;
 
-/* ------------------------------------------------------------------ */
-/* Logging: a file next to the process, because a windowed build has no
- * console to complain to.  METAL_DEBUG=1 also turns on Metal's own
- * validation, which the environment reads at device creation.          */
+/* The front end's log: a file next to the process, because a windowed
+ * build has no console to complain to.  METAL_DEBUG=1 also turns on
+ * Metal's own validation, which the environment reads at device
+ * creation.  Not static: ui/metal_script.m logs here too. */
 
-static void metal_log(const char *fmt, ...)
+void metal_log(const char *fmt, ...)
 {
     static FILE *f;
     va_list ap;
@@ -1567,6 +1567,7 @@ int metal_backend_init(void)
     delegate = [[MetalDelegate alloc] init];
     [NSApp setDelegate:delegate];
     metal_build_menu();
+    metal_script_init();
 
     if (!metal_create_window()) {
         metal_log("no window");

@@ -12,10 +12,11 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#include "qemu/osdep.h"
+#include "qemu/osdep.h"        /* config-host.h: QEMU_VERSION */
 #include "qemu/error-report.h"
 #include "qemu-main.h"
 #include "qemu/main-loop.h"
+#include "qapi/qapi-types-run-state.h"
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -167,6 +168,47 @@ int metal_glue_cursor_view(MetalCursorView *out)
     out->disp_h = cur.disp_h;
     out->argb = cur.argb;
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Apple Events: the dispatch (riscos-pi4/SCRIPTING.md, Sprint E0)     */
+
+bool metal_glue_script(const char *json, char **reply)
+{
+    const char *state;
+    char *machine;
+
+    *reply = NULL;
+    if (!json) {
+        return false;
+    }
+
+    /*
+     * E0 knows one command; E1 grows this into the table the sdef and
+     * the describe command are generated from.  The envelope is the
+     * contract every reply keeps -- ok, data, and the machine block
+     * that saves the caller a round trip -- and the state read takes
+     * the BQL the way the design's fast class does.
+     */
+    if (strstr(json, "\"ping\"")) {
+        bql_lock();
+        state = RunState_str(runstate_get());
+        bql_unlock();
+        machine = g_strdup_printf("\"machine\":{\"state\":\"%s\"}", state);
+        *reply = g_strdup_printf(
+            "{\"ok\":true,"
+            "\"data\":{\"app\":\"RISCOSQEMU\",\"qemu\":\"%s\","
+            "\"pid\":%d,\"sprint\":\"E0\"},"
+            "\"elapsed_ms\":0,%s}",
+            QEMU_VERSION, (int)getpid(), machine);
+        g_free(machine);
+        return true;
+    }
+    *reply = g_strdup(
+        "{\"ok\":false,"
+        "\"error\":{\"code\":\"invalid-argument\",\"number\":4,"
+        "\"message\":\"E0 knows only ping\"}}");
+    return true;
 }
 
 /* ------------------------------------------------------------------ */

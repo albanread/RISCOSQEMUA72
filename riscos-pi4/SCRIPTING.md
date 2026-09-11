@@ -389,10 +389,11 @@ name, so:
 Days are estimates in this project's usual sense — a budget, not a
 promise. E0's answers gate E1's shape; nothing else starts before them.
 
-- **E0 — prove delivery on the wire (1–2 d).** One handler (`ping`), one
-  minimal bundle, real `osascript`/JXA calls. Settle Q1 (pump delivery),
-  Q2 (round-trip latency vs QMP — publish the number), Q3 (TCC behaviour
-  across ad-hoc rebuilds). Done when `osascript -l JavaScript -e
+- **E0 — prove delivery on the wire (1–2 d). *Done; see §13.*** One
+  handler (`ping`), one minimal bundle, real `osascript`/JXA calls.
+  Settle Q1 (pump delivery), Q2 (round-trip latency vs QMP — publish
+  the number), Q3 (TCC behaviour across ad-hoc rebuilds). Done when
+  `osascript -l JavaScript -e
   'Application("…").ping()'` answers from the real front end, with the
   three measurements written down.
 - **E1 — the bundle and the table (2–3 d).** Proper `.app`, `Info.plist`
@@ -443,6 +444,9 @@ promise. E0's answers gate E1's shape; nothing else starts before them.
 
 ## 11. Open questions, to be settled on the wire
 
+Questions 1–3 were settled by Sprint E0; §13 records the answers. The
+rest stand.
+
 1. **Does the manual pump deliver Apple Events?** Handlers fire on the
    main thread when `sendEvent:` dispatches the high-level event; the pump
    (`nextEventMatchingMask … inMode:NSDefaultRunLoopMode`,
@@ -484,6 +488,63 @@ arrives with FSDESIGN 6C's console capture, over this surface as well as
 the portal's. And **`capture`** is SPRINTS 15's frame-coherence sprint
 delivering its first consumer early, at the observer rather than the
 compositor, where it costs one pause instead of a rendering pipeline.
+
+## 13. E0, as built
+
+One command is on the wire: `ping`, answered from inside the real front
+end with the full envelope — `{"ok":true,"data":{"app":"RISCOSQEMU",
+"qemu":"11.1.0","pid":…,"sprint":"E0"},"elapsed_ms":0,"machine":
+{"state":"running"}}` — and the machine block already rides it. The
+shape is §4's: `ui/metal_script.m` registers one `NSAppleEventManager`
+handler at backend init and marshals; `metal_glue_script()` in
+`ui/metal.c` dispatches and builds the envelope, taking the BQL for the
+state read exactly as the fast class is specified to. The bundle is
+assembled by `riscos-pi4/tools/make-bundle.sh` from `riscos-pi4/app/`
+(Info.plist with `NSAppleScriptEnabled` + `OSAScriptingDefinition`, and
+the hand-written E0 sdef; E1's `mksdef.py` replaces the sdef with the
+generated one). The three measurements:
+
+- **Q1, delivery: positive.** A ping sent from a user Terminal — after
+  one Allow click — reached the handler through the hand-run
+  `nextEventMatchingMask` pump and the reply came back; the log shows
+  `apple event: command (ping)` firing inside the front end. No run-loop
+  fallback needed; §11's first and sharpest risk is closed.
+- **Q2, latency: 16.7 ms per warm Apple Event round trip, against
+  0.1 ms for `query-status` over the QMP socket** (50 warm round trips
+  each, single connection, JXA holding the application object). A
+  factor of ~160: comfortably under the 50 ms bar that would force
+  batching for interactive use, and the definitive statement of the
+  division of labour — one-command control and inspection over Apple
+  Events, chatty loops (input streams, polling) over QMP.
+- **Q3, consent across rebuilds: survived, measured once.** After a
+  real rebuild and re-sign of the ad-hoc bundle, an already-granted
+  sender pinged the new binary with no re-prompt. The design expected
+  cdhash-keyed fragility; this host (an unsigned-but-valid ad-hoc seal)
+  kept the grant across a changed binary. E5's Developer ID remains the
+  durable guarantee and the notarization work stands.
+
+Two lessons from the wire, both already folded into the tree:
+
+- **An sdef is XML first**: a double hyphen inside a comment — the
+  file's own title line, `RISCOSQEMU.sdef -- the scripting dictionary`
+  — made osascript reject the dictionary as corrupt (`-2705`) before
+  any event moved. The dictionary's comments now say why they are
+  written the way they are.
+- **A stale seal kills at launch.** Re-copying a changed executable
+  into an existing bundle without forcing a fresh signature gave
+  `SIGKILL (Code Signature Invalid, "Taskgated Invalid Signature")` —
+  and a swallowed `codesign … || true` hid it. `make-bundle.sh` now
+  removes the old seal, clears extended attributes (`xattr -cr`; Finder
+  info breaks codesign), signs with `-f` and *verifies*, failing loudly
+  on any of it. The first symptom of a bundle that will not start is a
+  crash report named after the binary, not an error from the app.
+
+Also observed: a first send from a background agent's shell can time out
+(`-1712`) with no visible prompt, while a user Terminal's identical send
+prompts and grants cleanly — the TCC ambiguity §7 already carries, now
+with its shape known: agents get consent through a host the user can see
+prompting, which is the Apple Events consent model working as designed,
+and E5's stable identity is what makes that one click last.
 
 ## Sources
 

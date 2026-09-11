@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<!--
+  RISCOSQEMU.sdef: the scripting dictionary, E0 shape.
+
+  The suite code is MQem and command codes are mixed case, never all
+  lowercase (Apple reserves those). E0 carries one command: ping, whose
+  reply is the JSON envelope every command will return. E1 generates
+  this file from the C command table (tools/mksdef.py), so it cannot
+  drift from the dispatch; until then it is written by hand and small
+  on purpose. See riscos-pi4/SCRIPTING.md. XML comments may not contain
+  double hyphens, which is why this comment is written like this.
+-->
+<dictionary xmlns:xs="http://www.w3.org/2001/XMLSchema-instance"
+            xs:schemaLocation="file://localhost/System/Library/DTDs/sdef.xsd"
+            title="RISCOSQEMU">
+	<suite name="RISC OS QEMU suite" code="MQem" description="Controlling and debugging the emulated machine.">
+		<command name="ping" code="MQemPing" description="Round-trip a command through the Apple Event surface; the reply is the JSON envelope.">
+			<direct-parameter>
+				<type type="text" optional="yes"
+				      description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
+	</suite>
+</dictionary>

@@ -23,6 +23,25 @@ int metal_backend_main(void);
 /* Cleanly request the machine to power off (window closed). */
 void metal_backend_request_shutdown(void);
 
+/* The front end's log: metal-debug.txt beside the process, line
+ * buffered, because a windowed build has no console to complain to. */
+void metal_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* ------------------------------------------------------------------ */
+/* Apple Events (riscos-pi4/SCRIPTING.md)                              */
+
+/* Register the handlers with NSAppleEventManager.  Called from
+ * metal_backend_init() on the main thread; the handlers fire inside
+ * the pump's sendEvent:, which is the first thing Sprint E0 verifies.
+ * RISCOSQEMU_SCRIPTING_OFF in the environment skips registration (the
+ * dev kill switch until the settings file carries one). */
+void metal_script_init(void);
+
+/* One command in JSON, one reply envelope out.  The reply is a heap
+ * string the caller frees with g_free; returns false only when no
+ * envelope could be produced at all.  Called on the UI thread. */
+bool metal_glue_script(const char *json, char **reply);
+
 /*
  * A frame's view of the guest framebuffer, gathered by metal_glue_fb_view()
  * on the UI thread without holding the BQL.  The pointers are host

@@ -221,11 +221,14 @@ needed yet.
 
 ## 6. What is not done yet
 
-- **Apple Events and AppleScript are designed, not built.**
-  `riscos-pi4/SCRIPTING.md` is the design: an agents-first scripting
-  surface over the machine-control and debugging functions, and the app
-  bundle, signing and notarization it needs before an unattended agent
-  can rely on it. None of it is in the tree yet.
+- **Apple Events: Sprint E0 is built, E1 on.** `ping` answers over the
+  wire from the bundled app — `riscos-pi4/tools/make-bundle.sh` makes
+  it, `osascript -e 'tell application id
+  "com.github.albanread.RISCOSQEMU-A72" to ping'` proves it — and
+  delivery through the hand-run pump is measured (`SCRIPTING.md` §13:
+  16.7 ms per event, QMP 0.1 ms, consent surviving an ad-hoc rebuild).
+  The command table, the generated sdef and the rest of the surface are
+  E1–E6.
 - **Grab, full screen and the snapshot menu are written but unexercised.**
   ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
 
