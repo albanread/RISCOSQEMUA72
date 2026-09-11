@@ -228,7 +228,9 @@ static uint64_t date_cs_for(const GStatBuf *st)
 }
 
 /* Development trace to a file: stderr proved unreliable under the
- * Windows launcher, so every doorbell access lands here instead. */
+ * Windows launcher, so every doorbell access lands here instead.  If
+ * the directory is missing, try to create it, and if that also fails,
+ * say so once on stderr rather than debugging blind. */
 static void vmch_trace(const char *fmt, ...)
 {
     static FILE *f;
@@ -237,6 +239,15 @@ static void vmch_trace(const char *fmt, ...)
     if (!f) {
         f = fopen("F:/RISCOSDEV/.scratch/vmch-trace.txt", "a");
         if (!f) {
+            g_mkdir_with_parents("F:/RISCOSDEV/.scratch", 0755);
+            f = fopen("F:/RISCOSDEV/.scratch/vmch-trace.txt", "a");
+        }
+        if (!f) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "vmch: cannot open trace file\n");
+            }
             return;
         }
     }

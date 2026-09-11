@@ -246,7 +246,9 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
                              "vmchannel-high",
                              sysbus_mmio_get_region(
                                   SYS_BUS_DEVICE(&s->vmchannel), 0),
-                             0, VMCH_REGION_SIZE);
+                             0, 0x1000);   /* one page: a 0x4000 alias
+                                           * here would shadow the
+                                           * hardware at 0x7E007200 */
     memory_region_add_subregion(&s_base->peri_mr, 0x5000,
                                 &s->vmchannel_mr_alias);
 

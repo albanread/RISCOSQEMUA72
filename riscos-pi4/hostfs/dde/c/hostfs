@@ -29,7 +29,7 @@ typedef unsigned char  uint8_t;
  * QEMU beside the system timer in the high peripheral window).  The
  * logical address is only known at runtime. */
 #define VMCH_PHYS        0xFE005000u
-#define VMCH_SIZE        0x4000u
+#define VMCH_SIZE        0x1000u
 #define VMCH_MAGIC      0x00
 #define VMCH_FEATURES   0x08
 #define VMCH_CMD        0x0C
@@ -286,11 +286,13 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
             break;
         }
         moved = req->handle;             /* bytes actually transferred */
-        if (moved == 0 || moved > chunk) {
-            moved = (moved > chunk) ? chunk : moved;
-            if (moved == 0 && !is_write) {
-                break;                  /* EOF */
-            }
+        if (moved > chunk) {
+            moved = chunk;
+        }
+        if (moved == 0) {
+            break;                      /* nothing moved (EOF, full disc,
+                                         * refused write): stop, and the
+                                         * caller sees the short count */
         }
         done += moved;
         if (moved < chunk && !is_write) {
@@ -303,33 +305,45 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
 
 /* Map the doorbell on first use: OS_Memory 13 fails when called from
  * a module's init (the IO dynamic area is off-limits mid-module-load),
- * but works from any normal context, as the status probe proved. */
-static int ensure_vmch(void)
+ * but works from any normal context, as the status probe proved.
+ * vmch is published only after magic and features validate, so a map
+ * onto a wrong page can never be cached. */
+static _kernel_oserror *ensure_vmch(void)
 {
     _kernel_swi_regs r;
     _kernel_oserror *e;
+    volatile uint32_t *v;
 
     if (vmch) {
-        return 1;
+        return NULL;
     }
     r.r[0] = 13;                     /* OS_Memory: MapIOPermanent */
     r.r[1] = (int)VMCH_PHYS;
     r.r[2] = (int)VMCH_SIZE;
     e = _kernel_swi(XOS_Memory, &r, &r);
     if (e != NULL || r.r[3] == 0) {
-        return 0;
+        return &err_nomap;
     }
-    vmch = (volatile uint32_t *)r.r[3];
-    return vmch_reg(VMCH_MAGIC / 4) == VMCH_MAGIC_VALUE
-        && (vmch_reg(VMCH_FEATURES / 4) & VMCH_FEATURE_FS);
+    v = (volatile uint32_t *)r.r[3];
+    if (v[VMCH_MAGIC / 4] != VMCH_MAGIC_VALUE) {
+        return &err_badmagic;
+    }
+    if (!(v[VMCH_FEATURES / 4] & VMCH_FEATURE_FS)) {
+        return &err_nofs;
+    }
+    vmch = v;
+    return NULL;
 }
 
 /* ---- FS entry handlers: r->r[] is the caller's register frame ------- */
 
 _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t mode = (uint32_t)r->r[0];
@@ -389,8 +403,11 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t h = (uint32_t)r->r[1];
@@ -413,8 +430,11 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t h = (uint32_t)r->r[1];
@@ -440,8 +460,11 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t h = (uint32_t)r->r[1];
@@ -507,8 +530,11 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t rc = vmch_req_close((uint32_t)r->r[1]);
@@ -523,8 +549,11 @@ _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t reason = (uint32_t)r->r[0];
@@ -676,8 +705,11 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
 {
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
 
     uint32_t off, want, buflen, nbytes, n, done, load, exec, entlen, namelen;
@@ -956,8 +988,11 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
         return &err_unsupported;
     }
 
-    if (!ensure_vmch()) {
-        return &err_nodev;
+    {
+        _kernel_oserror *me = ensure_vmch();
+        if (me != NULL) {
+            return me;
+        }
     }
     req->cmd = C_PING;
     req->handle = 0;
