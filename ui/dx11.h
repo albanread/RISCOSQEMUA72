@@ -52,6 +52,33 @@ int dx11_glue_fb_view(Dx11FbView *out);
 void dx11_glue_fb_done(void);
 
 /*
+ * The guest's pointer sprite, Windows twin of metal.h's cursor view.
+ * The VCHIQ peer answers the dispmanx requests the ROM sends for its
+ * hardware pointer, so the sprite exists only on the host: never
+ * written to guest RAM, committed atomically at UpdateSubmit.  The
+ * image words are little-endian 0xAARRGGBB.
+ */
+typedef struct Dx11CursorView {
+    uint32_t generation;            /* commit generation of this view */
+    int stale;                      /* raced a commit: keep the last one */
+    int visible;
+    int32_t x, y;                   /* dest rect, display pixels, top-left */
+    int32_t w, h;                   /* dest rect size, display pixels */
+    int32_t img_w, img_h;           /* the sprite's own resolution, texels */
+    int32_t disp_w, disp_h;         /* the display the rect is measured in */
+    const void *argb;               /* img_w * img_h words */
+} Dx11CursorView;
+
+/*
+ * Fill `out` with the current pointer sprite, gathered the same
+ * lock-free way as the framebuffer view.  Returns 0 only when there
+ * is no sprite at all (no machine yet, service closed); a `stale`
+ * view is reported so the caller keeps the previous frame's.
+ * Thread: UI only.
+ */
+int dx11_glue_cursor_view(Dx11CursorView *out);
+
+/*
  * Input, called from the UI thread's window procedure.  Each call takes
  * the BQL just long enough to run the QEMU input API, the way cocoa's
  * with_bql does; nothing else of QEMU is touched.

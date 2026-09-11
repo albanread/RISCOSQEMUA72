@@ -81,7 +81,7 @@ static struct {
     uint32_t bpp;
     uint32_t xres, yres, pitch, rows;
 
-    ID3D11Texture2D *raw;           /* guest bytes, pitch x rows */
+    ID3D11Buffer *raw;              /* guest bytes, pitch * rows, flat */
     ID3D11ShaderResourceView *raw_srv;
     ID3D11Texture2D *palette;       /* 256 x 1 RGBA8 */
     ID3D11ShaderResourceView *pal_srv;
@@ -98,6 +98,30 @@ static struct {
     ID3D11SamplerState *linear;
     bool up;
 } fb;
+
+/* The guest's pointer sprite: a pipeline and a texture that do not
+ * depend on the guest's mode, built once beside the scale pass.  The
+ * VCHIQ peer answers the dispmanx requests the ROM sends for its
+ * hardware pointer, so the sprite is composited here on top of the
+ * scaled frame -- never written to guest RAM, sharp at any window
+ * scale, and without the scanline mask: on a real Acorn machine the
+ * sprite lay over the CRT, it was not part of its raster. */
+#define DX11_CURSOR_TEXELS 64     /* words per side, as the peer defines */
+static struct {
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader *ps;
+    ID3D11Texture2D *image;        /* DX11_CURSOR_TEXELS^2, BGRA8 */
+    ID3D11ShaderResourceView *image_srv;
+    ID3D11Buffer *rect_cbuf;       /* float4: the NDC dest rect, VS b1 */
+    ID3D11Buffer *dim_cbuf;        /* uint2: sprite size, PS b1 */
+    ID3D11BlendState *blend;       /* straight source alpha */
+    bool up;
+    bool visible;
+    uint32_t generation;
+    int32_t x, y, w, h;            /* dest rect, display pixels */
+    int32_t img_w, img_h;          /* the sprite's own resolution */
+    int32_t disp_w, disp_h;        /* the display the rect is measured in */
+} ptr;
 
 static const wchar_t DX11_CLASS[] = L"qemu-dx11";
 static const wchar_t DX11_TITLE[] = L"RISC OS 5 — Raspberry Pi 4 (QEMU)";
@@ -611,12 +635,45 @@ VSOut vs_main(uint id : SV_VertexID)
     return o;
 }
 
+/* The pointer sprite's quad: one triangle covering the NDC rectangle
+ * R = {x0, y0, x1, y1}, vertices overshooting to 2x the rectangle's
+ * span so no pixel of the rectangle lands on the hypotenuse (a
+ * corner-exact triangle loses its lower right half to the top-left
+ * fill rule).  uv runs 0..1 across the rectangle; the overhang
+ * samples past 1 and the fragment discards it. */
+cbuffer rect : register(b1) { float4 R; }
+
+VSOut vs_rect(uint id : SV_VertexID)
+{
+    VSOut o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(R.xy + t * (R.zw - R.xy), 0, 1);
+    o.uv = t;
+    return o;
+}
+
 #ifdef DECODE
 
-Texture2D<uint>   raw : register(t0);
+/* The raw guest bytes as one flat store indexed by byte address --
+ * the Metal read's twin.  A Texture2D tops out at 16384 texels wide,
+ * which a 3840-wide 32 bpp mode's 15360-byte pitch sits just inside
+ * of but anything wider overflows; a ByteAddressBuffer has no such
+ * ceiling, and the pitch is arbitrary.  Loads are uint-granular, so
+ * each bpp case extracts its bytes from aligned words. */
+ByteAddressBuffer  raw : register(t0);
 Texture2D<float4> pal : register(t1);
 
 cbuffer params : register(b0) { Params P; }
+
+uint fb_word(uint row, uint byte_off)
+{
+    return raw.Load(row * P.dim.z + (byte_off & ~3u));
+}
+
+uint fb_byte(uint row, uint byte_off)
+{
+    return (fb_word(row, byte_off) >> ((byte_off & 3u) * 8)) & 0xff;
+}
 
 float4 ps_main(VSOut v) : SV_Target
 {
@@ -631,24 +688,30 @@ float4 ps_main(VSOut v) : SV_Target
                                  * compiles the tail return and rejects
                                  * uninitialised reads (X4000) */
 #if BPP == 32
-    r = raw.Load(int3(bx * 4 + 0, by, 0)).r;
-    g = raw.Load(int3(bx * 4 + 1, by, 0)).r;
-    b = raw.Load(int3(bx * 4 + 2, by, 0)).r;
+    uint w = fb_word(by, bx * 4);          /* aligned by construction */
+    r = w & 0xff;
+    g = (w >> 8) & 0xff;
+    b = (w >> 16) & 0xff;
     if (P.misc.z == 0) { uint t = r; r = b; b = t; }   /* BGR order */
 #elif BPP == 24
-    r = raw.Load(int3(bx * 3 + 0, by, 0)).r;
-    g = raw.Load(int3(bx * 3 + 1, by, 0)).r;
-    b = raw.Load(int3(bx * 3 + 2, by, 0)).r;
+    /* three bytes from a possibly unaligned offset; the per-byte
+     * helper loads its own aligned word, and the compiler merges the
+     * loads that land in the same word */
+    uint o = bx * 3;
+    r = fb_byte(by, o);
+    g = fb_byte(by, o + 1);
+    b = fb_byte(by, o + 2);
 #elif BPP == 16
-    uint w = raw.Load(int3(bx * 2, by, 0)).r
-           | (raw.Load(int3(bx * 2 + 1, by, 0)).r << 8);   /* RGB565 */
+    uint w = fb_word(by, bx * 2);          /* two pixels per word */
+    uint sh = (bx & 1u) * 16;              /* odd pixel is the high half */
+    w >>= sh;
     r = ((w >> 11) & 31) * 255 / 31;
     g = ((w >>  5) & 63) * 255 / 63;
     b = ((w      ) & 31) * 255 / 31;
 #else
     /* palettised: 8 bpp, or sub-byte 1/2/4 with LSB-first packing */
     uint bpp = P.dim.w;
-    uint byte = raw.Load(int3(bx * bpp / 8, by, 0)).r;
+    uint byte = fb_byte(by, bx * bpp / 8);
     uint idx = (byte >> ((bx * bpp) & 7)) & ((1u << bpp) - 1);
     float4 c = pal.Load(int3(idx, 0, 0));
     return float4(c.rgb, 1);
@@ -694,6 +757,30 @@ float4 ps_main(VSOut v) : SV_Target
 }
 
 #endif
+
+#ifdef POINTER
+
+/* The guest's pointer sprite.  The words are little-endian
+ * 0xAARRGGBB -- BGRA8 in a texture, one Load and a swizzle.  The
+ * triangle's overhang past uv 1 is dropped here, and the blend is
+ * straight alpha so the ROM's anti-fringe fill (transparent pixels
+ * carrying the neighbouring colour at alpha 0) behaves exactly as it
+ * does against the firmware's compositor. */
+Texture2D<uint4> img : register(t0);
+
+cbuffer ptrdim : register(b1) { uint2 dim; }
+
+float4 ps_pointer(VSOut v) : SV_Target
+{
+    if (v.uv.x > 1.0f || v.uv.y > 1.0f) {
+        discard;
+    }
+    uint2 t = min((uint2)(v.uv * (float2)dim), (uint2)dim - 1u);
+    uint4 c = img.Load(int3(t, 0));
+    return float4(c.b, c.g, c.r, c.a) / 255.0f;
+}
+
+#endif
 )xxx";
 
 static ID3D11PixelShader *compile_ps(const char *target,
@@ -729,6 +816,11 @@ static ID3D11PixelShader *compile_ps(const char *target,
     return ps;
 }
 
+static ID3D11PixelShader *compile_ps_entry(const char *target,
+                                           const char **defines,
+                                           size_t npairs, const char *entry);
+static ID3D11VertexShader *compile_vs_entry(const char *entry);
+
 static ID3D11VertexShader *compile_vs(void)
 {
     ID3DBlob *code = nullptr, *errs = nullptr;
@@ -752,6 +844,146 @@ static ID3D11VertexShader *compile_vs(void)
     return vs;
 }
 
+
+/* Entry-point variants for the pointer pass, which lives in the same
+ * shader source behind POINTER. */
+static ID3D11PixelShader *compile_ps_entry(const char *target,
+                                           const char **defines,
+                                           size_t npairs, const char *entry)
+{
+    D3D_SHADER_MACRO macros[8] = {};
+    size_t n = 0;
+    for (size_t i = 0; i + 1 < 2 * npairs && n + 1 < 7; i += 2) {
+        macros[n].Name = defines[i];
+        macros[n].Definition = defines[i + 1];
+        n++;
+    }
+    ID3DBlob *code = nullptr, *errs = nullptr;
+    HRESULT hr = D3DCompile(SHADER_SRC, strlen(SHADER_SRC), nullptr, macros,
+                            nullptr, entry, target, 0, 0, &code, &errs);
+    if (FAILED(hr)) {
+        dx11_log("%s compile failed: %#x", entry, (unsigned)hr);
+        if (errs) {
+            dx11_log("%s compile: %s", entry,
+                     (const char *)errs->GetBufferPointer());
+            errs->Release();
+        }
+        return nullptr;
+    }
+    ID3D11PixelShader *ps = nullptr;
+    hr = dx11.device->CreatePixelShader(code->GetBufferPointer(),
+                                        code->GetBufferSize(), nullptr, &ps);
+    code->Release();
+    if (FAILED(hr)) {
+        dx11_log("CreatePixelShader %s failed: %#x", entry, (unsigned)hr);
+    }
+    return ps;
+}
+
+static ID3D11VertexShader *compile_vs_entry(const char *entry)
+{
+    ID3DBlob *code = nullptr, *errs = nullptr;
+    HRESULT hr = D3DCompile(SHADER_SRC, strlen(SHADER_SRC), nullptr, nullptr,
+                            nullptr, entry, "vs_4_0", 0, 0, &code, &errs);
+    if (FAILED(hr)) {
+        dx11_log("%s compile failed: %#x", entry, (unsigned)hr);
+        if (errs) {
+            dx11_log("%s compile: %s", entry,
+                     (const char *)errs->GetBufferPointer());
+            errs->Release();
+        }
+        return nullptr;
+    }
+    ID3D11VertexShader *vs = nullptr;
+    hr = dx11.device->CreateVertexShader(code->GetBufferPointer(),
+                                         code->GetBufferSize(), nullptr, &vs);
+    code->Release();
+    if (FAILED(hr)) {
+        dx11_log("CreateVertexShader %s failed: %#x", entry, (unsigned)hr);
+    }
+    return vs;
+}
+
+/* The pointer pass: shaders, the sprite texture, its constant buffers
+ * and the straight-alpha blend state.  None of it depends on the
+ * guest's mode, so it is built once at start-up. */
+static bool ptr_build(void)
+{
+    const char *pdef[] = { "POINTER", "1" };
+
+    ptr.vs = compile_vs_entry("vs_rect");
+    ptr.ps = compile_ps_entry("ps_4_0", pdef, 1, "ps_pointer");
+    if (!ptr.vs || !ptr.ps) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = DX11_CURSOR_TEXELS;
+    td.Height = DX11_CURSOR_TEXELS;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;    /* the words are BGRA */
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = dx11.device->CreateTexture2D(&td, nullptr, &ptr.image);
+    if (FAILED(hr)) {
+        dx11_log("pointer texture failed: %#x", (unsigned)hr);
+        return false;
+    }
+    hr = dx11.device->CreateShaderResourceView(ptr.image, nullptr,
+                                               &ptr.image_srv);
+    if (FAILED(hr)) {
+        dx11_log("pointer SRV failed: %#x", (unsigned)hr);
+        return false;
+    }
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = 0;
+    bd.ByteWidth = 16;                     /* float4 / uint2+pad */
+    hr = dx11.device->CreateBuffer(&bd, nullptr, &ptr.rect_cbuf);
+    if (FAILED(hr)) {
+        dx11_log("pointer rect cbuf failed: %#x", (unsigned)hr);
+        return false;
+    }
+    hr = dx11.device->CreateBuffer(&bd, nullptr, &ptr.dim_cbuf);
+    if (FAILED(hr)) {
+        dx11_log("pointer dim cbuf failed: %#x", (unsigned)hr);
+        return false;
+    }
+
+    D3D11_BLEND_DESC bld = {};
+    bld.RenderTarget[0].BlendEnable = TRUE;
+    bld.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bld.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bld.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bld.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bld.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bld.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = dx11.device->CreateBlendState(&bld, &ptr.blend);
+    if (FAILED(hr)) {
+        dx11_log("pointer blend state failed: %#x", (unsigned)hr);
+        return false;
+    }
+
+    ptr.up = true;
+    return true;
+}
+
+static void ptr_release(void)
+{
+    if (ptr.vs) ptr.vs->Release();
+    if (ptr.ps) ptr.ps->Release();
+    if (ptr.image_srv) ptr.image_srv->Release();
+    if (ptr.image) ptr.image->Release();
+    if (ptr.rect_cbuf) ptr.rect_cbuf->Release();
+    if (ptr.dim_cbuf) ptr.dim_cbuf->Release();
+    if (ptr.blend) ptr.blend->Release();
+    memset(&ptr, 0, sizeof(ptr));
+}
 /* ------------------------------------------------------------------ */
 /* The per-mode pipeline                                               */
 
@@ -833,29 +1065,35 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         return false;
     }
 
-    /* raw guest bytes: one texel per byte */
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = v->pitch;
-    td.Height = v->rows;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8_UINT;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DYNAMIC;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = dx11.device->CreateTexture2D(&td, nullptr, &fb.raw);
-    if (FAILED(hr)) {
-        dx11_log("raw texture %ux%u failed: %#x", v->pitch, v->rows, (unsigned)hr);
-        return false;
-    }
-    /* a null desc gives a view in the resource's own format, which is
-     * what every texture here wants; an explicit desc has to repeat the
-     * format exactly or CreateShaderResourceView rejects it */
-    hr = dx11.device->CreateShaderResourceView(fb.raw, nullptr, &fb.raw_srv);
-    if (FAILED(hr)) {
-        dx11_log("raw SRV failed: %#x", (unsigned)hr);
-        return false;
+    /* raw guest bytes: one flat buffer indexed by byte address, the
+     * Metal read's twin.  A Texture2D topped out at 16384 texels wide
+     * (a 3840-wide 32 bpp pitch sits just inside, anything wider
+     * overflows) and forced a row-pitched upload; the buffer takes
+     * any pitch and uploads as one memcpy. */
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = ((v->pitch * v->rows) + 3u) & ~3u;  /* words */
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        hr = dx11.device->CreateBuffer(&bd, nullptr, &fb.raw);
+        if (FAILED(hr)) {
+            dx11_log("raw buffer %ux%u failed: %#x", v->pitch, v->rows,
+                     (unsigned)hr);
+            return false;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        sd.BufferEx.FirstElement = 0;
+        sd.BufferEx.NumElements = bd.ByteWidth / 4;
+        sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        hr = dx11.device->CreateShaderResourceView(fb.raw, &sd, &fb.raw_srv);
+        if (FAILED(hr)) {
+            dx11_log("raw SRV failed: %#x", (unsigned)hr);
+            return false;
+        }
     }
 
     /* the palette at the VideoCore RAM base: 0x00BBGGRR words, which as
@@ -994,11 +1232,7 @@ static void fb_upload(const Dx11FbView *v)
 
     hr = dx11.context->Map(fb.raw, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
     if (SUCCEEDED(hr)) {
-        const uint8_t *src = (const uint8_t *)v->fb;
-        for (uint32_t y = 0; y < v->rows; y++) {
-            memcpy((uint8_t *)map.pData + (size_t)y * map.RowPitch,
-                   src + (size_t)y * v->pitch, v->pitch);
-        }
+        memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
         dx11.context->Unmap(fb.raw, 0);
     } else if (frame_count % 300 == 0) {
         dx11_log("raw Map failed: %#x", (unsigned)hr);
@@ -1015,6 +1249,146 @@ static void fb_upload(const Dx11FbView *v)
             dx11_log("palette Map failed: %#x", (unsigned)hr);
         }
     }
+}
+
+/*
+ * Display space to guest pixels: RISC OS puts its screen on the display
+ * the way the GPU would -- one scale for both axes, the image centred,
+ * whatever is left over as a margin.  The pointer's destination rect
+ * arrives in display pixels (the space the ROM's own scale arithmetic
+ * produced it in), so it crosses the same transform to land on the
+ * framebuffer's pixels.
+ */
+static void dx11_disp_transform(double disp_w, double disp_h,
+                                double fb_w, double fb_h,
+                                double *scale, double *mx, double *my)
+{
+    double k = disp_w / fb_w < disp_h / fb_h ? disp_w / fb_w : disp_h / fb_h;
+
+    if (!(k > 0)) {
+        k = 1.0;
+    }
+    *scale = k;
+    *mx = (disp_w - fb_w * k) / 2.0;
+    *my = (disp_h - fb_h * k) / 2.0;
+}
+
+/*
+ * The host cursor is hidden whenever the guest is drawing the pointer
+ * under it -- which is any time it is over the guest's screen in the
+ * foreground window, not just while grabbed.  The tablet keeps the two
+ * arrows in the same place, so showing both is showing the same
+ * pointer twice.  ShowCursor is counted, so it is called only on a
+ * change.
+ */
+static struct {
+    bool hidden;
+} cursor;
+
+static void dx11_cursor_sync(bool sprite_visible)
+{
+    bool inside = false;
+
+    if (sprite_visible && dx11.hwnd) {
+        POINT p;
+        if (GetCursorPos(&p) && WindowFromPoint(p) == dx11.hwnd) {
+            RECT c;
+            GetClientRect(dx11.hwnd, &c);
+            POINT lc = p;
+            ScreenToClient(dx11.hwnd, &lc);
+            inside = lc.x >= 0 && lc.y >= 0 && lc.x < c.right && lc.y < c.bottom
+                     && GetForegroundWindow() == dx11.hwnd;
+        }
+    }
+    bool want = sprite_visible && inside;
+    if (want == cursor.hidden) {
+        return;
+    }
+    while (ShowCursor(want ? TRUE : FALSE) < (want ? 0 : -1)) {
+        /* drive the counter to the far side so the state is certain */
+        if (want) {
+            break;
+        }
+    }
+    cursor.hidden = want;
+}
+
+/* The guest's pointer sprite, composited on top of the scaled frame.
+ * The peer commits whole transactions at UpdateSubmit, so a generation
+ * move is always a complete new sprite and position; a read that raced
+ * one is reported stale and the previous frame's is kept. */
+static void dx11_draw_pointer(const Dx11FbView *v)
+{
+    Dx11CursorView cv;
+
+    if (!ptr.up && !ptr_build()) {
+        dx11_cursor_sync(false);
+        return;
+    }
+    if (dx11_glue_cursor_view(&cv) && !cv.stale
+        && cv.generation != ptr.generation) {
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = cv.argb;
+        init.SysMemPitch = DX11_CURSOR_TEXELS * 4;
+        dx11.context->UpdateSubresource(ptr.image, 0, nullptr,
+                                        cv.argb, DX11_CURSOR_TEXELS * 4, 0);
+        ptr.generation = cv.generation;
+        ptr.visible = cv.visible != 0;
+        ptr.x = cv.x;
+        ptr.y = cv.y;
+        ptr.w = cv.w;
+        ptr.h = cv.h;
+        ptr.img_w = cv.img_w;
+        ptr.img_h = cv.img_h;
+        ptr.disp_w = cv.disp_w;
+        ptr.disp_h = cv.disp_h;
+    }
+    dx11_cursor_sync(ptr.visible);
+
+    if (!ptr.visible || ptr.w <= 0 || ptr.h <= 0
+        || ptr.img_w <= 0 || ptr.img_h <= 0) {
+        return;
+    }
+
+    /* dest rect: display pixels -> guest pixels -> NDC over the same
+     * fullscreen mapping the scale pass drew, so the sprite follows
+     * the frame whatever the window's aspect is */
+    double dw = ptr.disp_w > 0 ? ptr.disp_w : (double)v->xres;
+    double dh = ptr.disp_h > 0 ? ptr.disp_h : (double)v->yres;
+    double k, mx, my, sx, sy, sw, sh;
+
+    dx11_disp_transform(dw, dh, v->xres, v->yres, &k, &mx, &my);
+    sx = ((double)ptr.x - mx) / k;
+    sy = ((double)ptr.y - my) / k;
+    sw = (double)ptr.w / k;
+    sh = (double)ptr.h / k;
+
+    struct { float rect[4]; } rc = {
+        { (float)(2.0 * sx / (double)v->xres - 1.0),
+          (float)(1.0 - 2.0 * sy / (double)v->yres),
+          0.0f, 0.0f },
+    };
+    rc.rect[2] = (float)(rc.rect[0] + 2.0 * sw / (double)v->xres);
+    rc.rect[3] = (float)(rc.rect[1] - 2.0 * sh / (double)v->yres);
+    struct { uint32_t dim[2]; uint32_t pad[2]; } dm = {
+        { (uint32_t)ptr.img_w, (uint32_t)ptr.img_h }, { 0, 0 },
+    };
+
+    dx11.context->UpdateSubresource(ptr.rect_cbuf, 0, nullptr, &rc, 0, 0);
+    dx11.context->UpdateSubresource(ptr.dim_cbuf, 0, nullptr, &dm, 0, 0);
+    dx11.context->VSSetShader(ptr.vs, nullptr, 0);
+    dx11.context->VSSetConstantBuffers(1, 1, &ptr.rect_cbuf);
+    dx11.context->PSSetShader(ptr.ps, nullptr, 0);
+    dx11.context->PSSetConstantBuffers(1, 1, &ptr.dim_cbuf);
+    dx11.context->PSSetShaderResources(0, 1, &ptr.image_srv);
+    dx11.context->OMSetBlendState(ptr.blend, nullptr, 0xffffffff);
+    dx11.context->Draw(3, 0);
+    dx11.context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ID3D11ShaderResourceView *none = nullptr;
+    dx11.context->PSSetShaderResources(0, 1, &none);
+    ID3D11Buffer *nobuf = nullptr;
+    dx11.context->VSSetConstantBuffers(1, 1, &nobuf);
+    dx11.context->PSSetConstantBuffers(1, 1, &nobuf);
 }
 
 static bool dx11_render_frame(void)
@@ -1056,6 +1430,43 @@ static bool dx11_render_frame(void)
     }
     mouse.gxres = v.xres;            /* the mouse maps onto this screen */
     mouse.gyres = v.yres;
+
+    /* The window opens before the machine exists, at a readable default.
+     * Once the guest's mode has settled (boot passes through smaller
+     * sizes first), the window is resized once to that mode at the
+     * system's DPI scale -- the desktop's default mode at boot, which
+     * with -global bcm2835-property.mode=WxH is the one that was asked
+     * for.  After this one resize the window is the user's. */
+    {
+        static uint32_t stable_gens;
+        static bool sized;
+        static uint32_t last_xres, last_yres;
+        if (!sized) {
+            if (v.xres == last_xres && v.yres == last_yres) {
+                stable_gens++;
+            } else {
+                stable_gens = 0;
+                last_xres = v.xres;
+                last_yres = v.yres;
+            }
+            if (stable_gens == 180) {          /* ~3 s unchanged at 60 fps */
+                UINT dpi = 96;
+                typedef UINT (WINAPI *GDA)(void);
+                HMODULE u = GetModuleHandleW(L"user32.dll");
+                GDA gda = u ? (GDA)GetProcAddress(u, "GetDpiForSystem") : nullptr;
+                if (gda) {
+                    dpi = gda();
+                }
+                int scale = dpi / 96 > 0 ? (int)(dpi / 96) : 1;
+                RECT r = { 0, 0, (LONG)v.xres * scale, (LONG)v.yres * scale };
+                AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(dx11.hwnd, nullptr, 0, 0,
+                             r.right - r.left, r.bottom - r.top,
+                             SWP_NOMOVE | SWP_NOZORDER);
+                sized = true;
+            }
+        }
+    }
     if (!fb.up || v.generation != fb.generation) {
         if (fb_failed && v.generation == fb_failed_generation) {
             return false;               /* same mode, same failure */
@@ -1106,6 +1517,8 @@ static bool dx11_render_frame(void)
                            (float)(client.bottom - client.top), 0, 1 };
     dx11.context->RSSetViewports(1, &vp2);
     dx11.context->Draw(3, 0);
+
+    dx11_draw_pointer(&v);
 
     /* unbind the decoded SRV before a later frame makes it a render target
      * again; leaving it bound is a resource hazard the runtime only warns
@@ -1310,6 +1723,8 @@ extern "C" int dx11_backend_main(void)
     dx11_backend_request_shutdown();
     dx11_glue_fb_done();
 
+    dx11_cursor_sync(false);         /* show the host cursor again */
+    ptr_release();
     if (fb.cbuf) fb.cbuf->Release();
     if (fb.linear) fb.linear->Release();
     if (fb.vs) fb.vs->Release();

@@ -18,6 +18,7 @@
 #include "ui/dx11.h"
 #include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_vsyncgen.h"
+#include "hw/misc/bcm2835_vchiq.h"
 #include "migration/snapshot.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -136,6 +137,32 @@ void dx11_glue_fb_done(void)
         view.mapped = false;
     }
     view.fb = NULL;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* The pointer sprite, answered for by the VCHIQ peer                  */
+
+int dx11_glue_cursor_view(Dx11CursorView *out)
+{
+    VchiqCursor cur;
+
+    if (!bcm2835_vchiq_get_cursor(&cur)) {
+        return 0;                   /* no machine, or the service is closed */
+    }
+    out->generation = cur.generation;
+    out->stale = cur.stale;
+    out->visible = cur.visible;
+    out->x = cur.x;
+    out->y = cur.y;
+    out->w = cur.w;
+    out->h = cur.h;
+    out->img_w = cur.img_w;
+    out->img_h = cur.img_h;
+    out->disp_w = cur.disp_w;
+    out->disp_h = cur.disp_h;
+    out->argb = cur.argb;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
