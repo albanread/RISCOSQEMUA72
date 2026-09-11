@@ -28,3 +28,7 @@ GTAGS
 
 # ROOL material: never committed. See riscos-pi4/README.md, "Licence".
 /riscos-images/
+
+# GVFill build intermediates (the module image itself is kept:
+# it loads without needing the Mac toolchain)
+riscos-pi4/blitter/*.o
