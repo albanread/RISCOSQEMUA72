@@ -962,7 +962,6 @@ static bool fb_upload(const MetalFbView *v)
     memcpy([fb.raw[fb.ring] contents], v->fb, (size_t)v->pitch * v->rows);
     fb.uploaded = true;
     copied++;
-    return true;
 
     if (!fb.pal_valid
         || memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {
