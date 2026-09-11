@@ -1238,23 +1238,45 @@ static bool fb_build_pipeline(const Dx11FbView *v)
 static uint32_t fb_failed_generation;
 static bool fb_failed;
 
-/* Sampling the guest's screen in step with the guest: see the gate at
- * the upload in dx11_render_frame. */
-static uint64_t fb_seq_last;         /* guest frame of the last upload */
-static bool fb_seq_have;
-static unsigned fb_skipped;          /* host frames since the last upload */
-static bool fb_need_upload = true;   /* set whenever the pipeline is new */
 
 /* One frame of the guest's screen.  Returns false if there is nothing to
  * show yet (clear instead). */
 static uint32_t frame_count;
 
 static uint32_t fb_uploads;          /* guest frames actually sampled */
+static uint32_t fb_torn;             /* copies the guest wrote into */
+
+/*
+ * A cheap fingerprint of a few rows spread down the frame.  Taken either
+ * side of the copy it answers the question the eye cannot: did the guest
+ * write to the screen while we were reading it?  If it did, the frame we
+ * captured is a mix of two guest states, which is a tear.
+ */
+static uint32_t fb_probe(const Dx11FbView *v)
+{
+    const uint8_t *p = (const uint8_t *)v->fb;
+    uint32_t h = 2166136261u;
+
+    if (!p || v->rows == 0 || v->pitch < 4) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < 16; i++) {
+        uint32_t row = (uint32_t)((uint64_t)v->rows * i / 16);
+        const uint8_t *r = p + (size_t)row * v->pitch;
+        for (uint32_t b = 0; b + 4 <= 256 && b + 4 <= v->pitch; b += 4) {
+            uint32_t w;
+            memcpy(&w, r + b, 4);
+            h = (h ^ w) * 16777619u;
+        }
+    }
+    return h;
+}
 
 static void fb_upload(const Dx11FbView *v)
 {
     D3D11_MAPPED_SUBRESOURCE map;
     HRESULT hr;
+    uint32_t before = fb_probe(v);
 
     fb_uploads++;
 
@@ -1262,6 +1284,9 @@ static void fb_upload(const Dx11FbView *v)
     if (SUCCEEDED(hr)) {
         memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
         dx11.context->Unmap(fb.raw, 0);
+        if (fb_probe(v) != before) {
+            fb_torn++;              /* the guest wrote while we read */
+        }
     } else if (frame_count % 300 == 0) {
         dx11_log("raw Map failed: %#x", (unsigned)hr);
     }
@@ -1383,6 +1408,33 @@ static void dx11_draw_pointer(const Dx11FbView *v)
             dx11.context->UpdateSubresource(ptr.image, 0, &box,
                                             cv.argb, sw * 4, 0);
         }
+        /* Watch the peer's numbers: the sprite is drawn stretched to the
+         * rect it names, from a 64x64 texture it also sizes, so a bad
+         * img_w/img_h shows neighbouring guest memory and a bad rect
+         * smears it across the screen.  Log anything out of range, and
+         * the first few either way for reference. */
+        {
+            static unsigned seen, bad;
+            bool odd = cv.img_w <= 0 || cv.img_h <= 0
+                       || cv.img_w > DX11_CURSOR_TEXELS
+                       || cv.img_h > DX11_CURSOR_TEXELS
+                       || cv.w <= 0 || cv.h <= 0
+                       || cv.w > 8 * DX11_CURSOR_TEXELS
+                       || cv.h > 8 * DX11_CURSOR_TEXELS
+                       || cv.disp_w <= 0 || cv.disp_h <= 0;
+            if (odd || seen < 8) {
+                if (!odd || bad < 40) {
+                    dx11_log("ptr%s gen %u vis %d img %dx%d rect %d,%d %dx%d "
+                             "disp %dx%d", odd ? " ODD" : "",
+                             cv.generation, cv.visible, cv.img_w, cv.img_h,
+                             cv.x, cv.y, cv.w, cv.h, cv.disp_w, cv.disp_h);
+                }
+                if (odd) {
+                    bad++;
+                }
+                seen++;
+            }
+        }
         ptr.generation = cv.generation;
         ptr.visible = cv.visible != 0;
         ptr.x = cv.x;
@@ -1450,10 +1502,10 @@ static bool dx11_render_frame(void)
 
     if (++frame_count % 300 == 0) {
         dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u, "
-                 "uploads %u, mouse moves %u, button events %u",
+                 "uploads %u, torn %u, mouse moves %u, button events %u",
                  frame_count, fb.up ? "up" : "down",
                  fb.generation, fb.xres, fb.yres, fb.bpp,
-                 fb_uploads, dx11.mouse_moves, dx11.mouse_buttons);
+                 fb_uploads, fb_torn, dx11.mouse_moves, dx11.mouse_buttons);
     }
     /* The status line: window title carries the guest's mode and the
      * presented frame rate, once a second.  (The sprint's instruction
@@ -1530,54 +1582,23 @@ static bool dx11_render_frame(void)
             return false;
         }
         fb_failed = false;
-        fb_need_upload = true;       /* the new buffers hold nothing yet */
     }
 
     /*
-     * Sample the guest's screen in step with the guest, not with us.
+     * Sample the guest's screen every presented frame.
      *
-     * The guest does not paint continuously: its video driver holds
-     * pending screen updates and flushes them at the vsync generator's
-     * half-frame pulse.  Reading the framebuffer on the host's own
-     * present clock therefore lands in the middle of that flush every
-     * so often, and a half-applied flush is a window drawn at both its
-     * old and its new position -- the flash of partial movement.
+     * Pacing this to the guest's vsync instead was tried and made the
+     * artifact worse: the guest writes to the screen continuously, not
+     * only at the video driver's half-frame flush, so there is no quiet
+     * phase to aim at -- and holding each captured frame for two host
+     * frames simply left every tear on screen twice as long.
      *
-     * So upload only when the guest's frame counter has advanced, and
-     * only while the generator says it is in the first half of that
-     * frame, which is after the last flush and before the next.  The
-     * decode, scale and pointer passes still run every host frame, so
-     * the pointer stays as smooth as the display while the frame
-     * content changes at the guest's rate.  As a side effect the full
-     * framebuffer copy now happens once per guest frame instead of once
-     * per host frame.
-     *
-     * fb_skipped is the liveness guard: if the phase never lines up --
-     * a guest frame shorter than our poll, a generator stopped while we
-     * waited -- take the sample anyway rather than leave a stale screen.
+     * fb_probe either side of the copy measures what is actually
+     * happening: whether the guest wrote to the framebuffer while we
+     * were reading it, which is what makes a captured frame a mix of
+     * two guest states.
      */
-    {
-        uint64_t seq = 0;
-        int settled = 0;
-
-        if (!dx11_glue_guest_frame(&seq, &settled)) {
-            fb_upload(&v);                  /* no vsync: pace ourselves */
-        } else if (fb_need_upload || !fb_seq_have) {
-            fb_upload(&v);
-            fb_seq_last = seq;
-            fb_seq_have = true;
-            fb_need_upload = false;
-            fb_skipped = 0;
-        } else if (seq != fb_seq_last && settled) {
-            fb_upload(&v);
-            fb_seq_last = seq;
-            fb_skipped = 0;
-        } else if (++fb_skipped >= 4) {
-            fb_upload(&v);
-            fb_seq_last = seq;
-            fb_skipped = 0;
-        }
-    }
+    fb_upload(&v);
 
     /* decode pass: raw bytes -> linear RGB */
     ID3D11ShaderResourceView *srvs[2] = { fb.raw_srv, fb.pal_srv };
