@@ -908,6 +908,36 @@ static void fb_upload(const MetalFbView *v)
 /* ------------------------------------------------------------------ */
 /* A frame                                                             */
 
+/*
+ * Display space to guest pixels.
+ *
+ * RISC OS puts its screen on the display the way the GPU would: one
+ * scale for both axes, the image centred, and whatever is left over as a
+ * margin. So when the mode's aspect does not match the display's, the
+ * pointer lives inside that margin -- 1280x1024 on a 16:10 display is
+ * scaled by 1.172 and inset by 210 pixels each side.
+ *
+ * A compositor that stretches the framebuffer across the whole window
+ * while placing the pointer as a fraction of the *display* therefore
+ * puts it in a box the user cannot reach the edges of. Undoing exactly
+ * what the guest did is the whole fix, and it costs nothing when the
+ * aspects agree: the margins are zero and this is the identity, which
+ * is why 1280x800 on the same display always worked.
+ */
+static void metal_disp_transform(double disp_w, double disp_h,
+                                 double fb_w, double fb_h,
+                                 double *scale, double *mx, double *my)
+{
+    double k = MIN(disp_w / fb_w, disp_h / fb_h);
+
+    if (!(k > 0)) {
+        k = 1.0;
+    }
+    *scale = k;
+    *mx = (disp_w - fb_w * k) / 2.0;
+    *my = (disp_h - fb_h * k) / 2.0;
+}
+
 static void metal_update_title(void)
 {
     static uint32_t last_second_frame;
@@ -1078,10 +1108,18 @@ static bool metal_render_frame(void)
              * own scale arithmetic produced it in -- and the view is
              * that display; the image keeps its own resolution and is
              * stretched to the rect, whatever mode is underneath. */
-            rect[0] = (float)(2.0 * (double)ptr.x / dw - 1.0);
-            rect[1] = (float)(1.0 - 2.0 * (double)ptr.y / dh);
-            rect[2] = (float)(rect[0] + 2.0 * (double)ptr.w / dw);
-            rect[3] = (float)(rect[1] - 2.0 * (double)ptr.h / dh);
+            double k, mx, my, sx, sy, sw, sh;
+
+            metal_disp_transform(dw, dh, v.xres, v.yres, &k, &mx, &my);
+            sx = ((double)ptr.x - mx) / k;   /* display -> guest pixels */
+            sy = ((double)ptr.y - my) / k;
+            sw = (double)ptr.w / k;
+            sh = (double)ptr.h / k;
+
+            rect[0] = (float)(2.0 * sx / (double)v.xres - 1.0);
+            rect[1] = (float)(1.0 - 2.0 * sy / (double)v.yres);
+            rect[2] = (float)(rect[0] + 2.0 * sw / (double)v.xres);
+            rect[3] = (float)(rect[1] - 2.0 * sh / (double)v.yres);
             dim[0] = (uint32_t)ptr.img_w;
             dim[1] = (uint32_t)ptr.img_h;
             [enc setRenderPipelineState:ptr.pipe];
@@ -1174,15 +1212,19 @@ static bool metal_screenshot_to(NSString *path)
             && cv.disp_w > 0 && cv.disp_h > 0) {
             uint8_t *px = [staging contents];
             const uint8_t *sp = cv.argb;
-            double kx = (double)fb.xres / (double)cv.disp_w;
-            double ky = (double)fb.yres / (double)cv.disp_h;
+            double k, mx, my;
+            double tx, ty;
+            int32_t gx0, gy0, gx1, gy1;
+
+            metal_disp_transform(cv.disp_w, cv.disp_h, fb.xres, fb.yres,
+                                 &k, &mx, &my);
+            gx0 = (int32_t)(((double)cv.x - mx) / k);
+            gy0 = (int32_t)(((double)cv.y - my) / k);
+            gx1 = (int32_t)(((double)cv.x + cv.w - mx) / k);
+            gy1 = (int32_t)(((double)cv.y + cv.h - my) / k);
             /* sprite texels per guest pixel, for the stretch */
-            double tx = (double)cv.img_w / ((double)cv.w * kx);
-            double ty = (double)cv.img_h / ((double)cv.h * ky);
-            int32_t gx0 = (int32_t)(cv.x * kx);
-            int32_t gy0 = (int32_t)(cv.y * ky);
-            int32_t gx1 = (int32_t)((cv.x + cv.w) * kx);
-            int32_t gy1 = (int32_t)((cv.y + cv.h) * ky);
+            tx = (double)cv.img_w / ((double)cv.w / k);
+            ty = (double)cv.img_h / ((double)cv.h / k);
             int32_t x0 = gx0 < 0 ? 0 : gx0;
             int32_t y0 = gy0 < 0 ? 0 : gy0;
             int32_t sx, sy;
