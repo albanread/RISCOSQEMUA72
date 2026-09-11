@@ -93,6 +93,14 @@ struct RISCOSBlitterState {
     int32_t dstride, sstride;
     uint32_t pattern[4];
 
+    /*
+     * Scratch for building rows, kept between blits: a full-screen fill
+     * would otherwise claim and free a megabyte every time.  Not
+     * migrated -- nothing in it outlives a blit.
+     */
+    uint8_t *scratch;
+    uint32_t scratch_len;
+
     uint32_t status;      /* of the last blit */
     uint64_t n_fill;      /* counters, for the trace and for measuring */
     uint64_t n_copy;
