@@ -761,15 +761,19 @@ float4 ps_main(VSOut v) : SV_Target
 #ifdef POINTER
 
 /* The guest's pointer sprite.  The words are little-endian
- * 0xAARRGGBB, which a BGRA8 texture reads channel-correct in one
- * Load -- no swizzle (the Metal twin reads raw bytes and swizzles
- * there instead; doing both swaps R and B, which is exactly how a
- * blue pointer once came out red).  The triangle's overhang past
- * uv 1 is dropped here, and the blend is straight alpha so the
+ * 0xAARRGGBB, so in memory the bytes run B,G,R,A -- exactly what
+ * DXGI_FORMAT_B8G8R8A8_UNORM describes, and the format does the
+ * channel ordering for us.  So this is a float4 read returning the
+ * colour already in 0..1 and already channel-correct: no swizzle
+ * (that is the Metal twin's job, because it reads raw bytes) and no
+ * divide.  Declaring the texture uint4 against a UNORM view is a
+ * type mismatch the runtime answers with undefined data, which is
+ * what once drew the sprite as garbage.  The triangle's overhang
+ * past uv 1 is dropped here, and the blend is straight alpha so the
  * ROM's anti-fringe fill (transparent pixels carrying the
  * neighbouring colour at alpha 0) behaves exactly as it does
  * against the firmware's compositor. */
-Texture2D<uint4> img : register(t0);
+Texture2D<float4> img : register(t0);
 
 cbuffer ptrdim : register(b1) { uint2 dim; }
 
@@ -779,8 +783,7 @@ float4 ps_pointer(VSOut v) : SV_Target
         discard;
     }
     uint2 t = min((uint2)(v.uv * (float2)dim), (uint2)dim - 1u);
-    uint4 c = img.Load(int3(t, 0));
-    return float4(c.r, c.g, c.b, c.a) / 255.0f;
+    return img.Load(int3(t, 0));
 }
 
 #endif
@@ -1136,6 +1139,13 @@ static bool fb_build_pipeline(const Dx11FbView *v)
                                      * source pixels */
     dd.Usage = D3D11_USAGE_DEFAULT;
     dd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    dd.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+                                   /* GenerateMips is a silent no-op
+                                    * without this, and MipLevels 0 has
+                                    * already allocated levels 1..N: the
+                                    * trilinear sample in the scale pass
+                                    * then reads an empty level at any
+                                    * downscale and the frame is black */
     hr = dx11.device->CreateTexture2D(&dd, nullptr, &fb.decoded);
     if (FAILED(hr)) {
         dx11_log("decoded texture %ux%u failed: %#x", v->xres, v->yres, (unsigned)hr);
@@ -1307,17 +1317,29 @@ static void dx11_cursor_sync(bool sprite_visible)
                      && GetForegroundWindow() == dx11.hwnd;
         }
     }
-    bool want = sprite_visible && inside;
-    if (want == cursor.hidden) {
+    bool hide = sprite_visible && inside;
+    if (hide == cursor.hidden) {
         return;
     }
-    while (ShowCursor(want ? TRUE : FALSE) < (want ? 0 : -1)) {
-        /* drive the counter to the far side so the state is certain */
-        if (want) {
-            break;
+    /*
+     * ShowCursor keeps a counter, and the cursor is drawn while it is
+     * >= 0: FALSE decrements (hides), TRUE increments (shows).  So the
+     * call to hide is ShowCursor(FALSE), not ShowCursor(TRUE) -- the
+     * other way round showed a second arrow inside the window and took
+     * the host's cursor away everywhere else.  Drive the counter all
+     * the way to the wanted side, because anything else in the process
+     * may have moved it.
+     */
+    if (hide) {
+        while (ShowCursor(FALSE) >= 0) {
+            /* down to -1 */
+        }
+    } else {
+        while (ShowCursor(TRUE) < 0) {
+            /* up to 0 */
         }
     }
-    cursor.hidden = want;
+    cursor.hidden = hide;
 }
 
 /* The guest's pointer sprite, composited on top of the scaled frame.
@@ -1334,19 +1356,32 @@ static void dx11_draw_pointer(const Dx11FbView *v)
     }
     if (dx11_glue_cursor_view(&cv) && !cv.stale
         && cv.generation != ptr.generation) {
-        D3D11_SUBRESOURCE_DATA init = {};
-        init.pSysMem = cv.argb;
-        init.SysMemPitch = DX11_CURSOR_TEXELS * 4;
-        dx11.context->UpdateSubresource(ptr.image, 0, nullptr,
-                                        cv.argb, DX11_CURSOR_TEXELS * 4, 0);
+        /* The peer packs the sprite tightly at its own width: argb is
+         * img_w * img_h words, which is exactly how the Metal twin
+         * indexes it (t.y * dim.x + t.x).  So the upload must carry the
+         * source's own row pitch, into a destination box of the
+         * sprite's own size.  Handing the whole 64x64 texture a fixed
+         * DX11_CURSOR_TEXELS pitch instead takes each row from the
+         * wrong offset -- the sprite comes out sheared -- and reads
+         * 16 KB out of a buffer that is usually 4. */
+        UINT sw = (UINT)cv.img_w, sh = (UINT)cv.img_h;
+        UINT bw = sw > DX11_CURSOR_TEXELS ? DX11_CURSOR_TEXELS : sw;
+        UINT bh = sh > DX11_CURSOR_TEXELS ? DX11_CURSOR_TEXELS : sh;
+        if (sw > 0 && sh > 0) {
+            D3D11_BOX box = { 0, 0, 0, bw, bh, 1 };
+            dx11.context->UpdateSubresource(ptr.image, 0, &box,
+                                            cv.argb, sw * 4, 0);
+        }
         ptr.generation = cv.generation;
         ptr.visible = cv.visible != 0;
         ptr.x = cv.x;
         ptr.y = cv.y;
         ptr.w = cv.w;
         ptr.h = cv.h;
-        ptr.img_w = cv.img_w;
-        ptr.img_h = cv.img_h;
+        /* dim drives the shader's Load, so it must name what actually
+         * reached the texture, never more than it holds */
+        ptr.img_w = (int32_t)bw;
+        ptr.img_h = (int32_t)bh;
         ptr.disp_w = cv.disp_w;
         ptr.disp_h = cv.disp_h;
     }
