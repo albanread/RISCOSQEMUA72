@@ -125,6 +125,11 @@ int metal_glue_fb_view(MetalFbView *out)
         view.fb_len = fb_len;
         view.generation = gen;
         view.mapped = true;
+        /* Once per mode: is the guest actually running two banks? */
+        metal_log("fb: %ux%u virtual %ux%u offset %u,%u base 0x%x pitch %u",
+                  cfg.xres, cfg.yres, cfg.xres_virtual, cfg.yres_virtual,
+                  cfg.xoffset, cfg.yoffset, cfg.base,
+                  bcm2835_fb_get_pitch(&cfg));
     }
 
     rows = view.fb_len / bcm2835_fb_get_pitch(&cfg);
