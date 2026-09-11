@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
@@ -63,6 +64,25 @@ void bcm2835_vsyncgen_set_hz(BCM2835VsyncGenState *s, uint32_t hz)
 {
     s->hz = hz;
     bcm2835_vsyncgen_restart(s);
+}
+
+bool bcm2835_vsyncgen_frame_phase(BCM2835VsyncGenState *s,
+                                  uint64_t *seq, bool *settled)
+{
+    if (!s || !qatomic_read(&s->hz)) {
+        return false;               /* no vsync: the caller paces itself */
+    }
+    /*
+     * half_next is set by the vsync pulse and cleared by the half-frame
+     * pulse, so it is true exactly while the generator is in the first
+     * half of a frame -- after the guest's last flush and before its
+     * next.  Both reads are relaxed: the front end only needs the
+     * counter to advance, and a phase read one frame stale merely costs
+     * it a frame of latency, never correctness.
+     */
+    *seq = qatomic_read__nocheck(&s->vsyncs);
+    *settled = qatomic_read(&s->half_next);
+    return true;
 }
 
 static void bcm2835_vsyncgen_realize(DeviceState *dev, Error **errp)

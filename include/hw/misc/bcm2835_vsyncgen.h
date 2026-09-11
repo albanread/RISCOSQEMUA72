@@ -40,4 +40,24 @@ struct BCM2835VsyncGenState {
 /* Change the rate while running; 0 stops it. BQL held. */
 void bcm2835_vsyncgen_set_hz(BCM2835VsyncGenState *s, uint32_t hz);
 
+/*
+ * One observation of the frame phase, for a display front end that wants
+ * to read the guest's framebuffer between the guest's own screen-update
+ * flushes rather than on the host's clock.
+ *
+ * *seq counts vsyncs, so it advances once per guest frame.  *settled is
+ * true while the generator is in the first half of a frame: the guest
+ * flushed its pending updates at the last half-frame pulse, half a
+ * period ago, and will not flush again until the next one, so the
+ * framebuffer is as quiet as it ever gets.  Sampling outside that
+ * window can catch a flush in progress, which shows up as a window
+ * drawn half-moved.
+ *
+ * Returns false when no generator is running (hz 0), and the caller
+ * should then pace itself.  The reads are relaxed and no BQL is
+ * required: a front end only needs the counter to advance.
+ */
+bool bcm2835_vsyncgen_frame_phase(BCM2835VsyncGenState *s,
+                                  uint64_t *seq, bool *settled);
+
 #endif

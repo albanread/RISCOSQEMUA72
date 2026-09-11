@@ -103,6 +103,15 @@ void dx11_glue_kbd_hook_window(void *hwnd);
  * machine has no generator. */
 bool dx11_glue_set_vsync_hz(int hz);
 
+/*
+ * The guest's frame phase, so the framebuffer is sampled in step with
+ * the guest instead of the host.  *seq advances once per guest frame;
+ * *settled is non-zero while the guest is between its own screen-update
+ * flushes.  Returns 0 when no vsync generator is running, and the caller
+ * should then sample every frame as before.
+ */
+int dx11_glue_guest_frame(uint64_t *seq, int *settled);
+
 /* Scaler and CRT options for the window: scaling is 0 linear, 1 sharp
  * bilinear, 2 nearest; set once at display init, before any shader is
  * compiled. */

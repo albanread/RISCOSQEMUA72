@@ -265,6 +265,26 @@ bool dx11_glue_set_vsync_hz(int hz)
     return true;
 }
 
+int dx11_glue_guest_frame(uint64_t *seq, int *settled)
+{
+    static BCM2835VsyncGenState *gen;
+    bool quiet = false;
+
+    if (!gen) {
+        Object *obj = object_resolve_path_type("", TYPE_BCM2835_VSYNCGEN,
+                                               NULL);
+        if (!obj) {
+            return 0;               /* machine not built yet */
+        }
+        gen = BCM2835_VSYNCGEN(obj);
+    }
+    if (!bcm2835_vsyncgen_frame_phase(gen, seq, &quiet)) {
+        return 0;                   /* vsync off: caller paces itself */
+    }
+    *settled = quiet;
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Snapshot restore, from the window's system menu                     */
 

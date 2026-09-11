@@ -1238,14 +1238,25 @@ static bool fb_build_pipeline(const Dx11FbView *v)
 static uint32_t fb_failed_generation;
 static bool fb_failed;
 
+/* Sampling the guest's screen in step with the guest: see the gate at
+ * the upload in dx11_render_frame. */
+static uint64_t fb_seq_last;         /* guest frame of the last upload */
+static bool fb_seq_have;
+static unsigned fb_skipped;          /* host frames since the last upload */
+static bool fb_need_upload = true;   /* set whenever the pipeline is new */
+
 /* One frame of the guest's screen.  Returns false if there is nothing to
  * show yet (clear instead). */
 static uint32_t frame_count;
+
+static uint32_t fb_uploads;          /* guest frames actually sampled */
 
 static void fb_upload(const Dx11FbView *v)
 {
     D3D11_MAPPED_SUBRESOURCE map;
     HRESULT hr;
+
+    fb_uploads++;
 
     hr = dx11.context->Map(fb.raw, 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
     if (SUCCEEDED(hr)) {
@@ -1439,10 +1450,10 @@ static bool dx11_render_frame(void)
 
     if (++frame_count % 300 == 0) {
         dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u, "
-                 "mouse moves %u, button events %u",
+                 "uploads %u, mouse moves %u, button events %u",
                  frame_count, fb.up ? "up" : "down",
                  fb.generation, fb.xres, fb.yres, fb.bpp,
-                 dx11.mouse_moves, dx11.mouse_buttons);
+                 fb_uploads, dx11.mouse_moves, dx11.mouse_buttons);
     }
     /* The status line: window title carries the guest's mode and the
      * presented frame rate, once a second.  (The sprint's instruction
@@ -1519,9 +1530,54 @@ static bool dx11_render_frame(void)
             return false;
         }
         fb_failed = false;
+        fb_need_upload = true;       /* the new buffers hold nothing yet */
     }
 
-    fb_upload(&v);
+    /*
+     * Sample the guest's screen in step with the guest, not with us.
+     *
+     * The guest does not paint continuously: its video driver holds
+     * pending screen updates and flushes them at the vsync generator's
+     * half-frame pulse.  Reading the framebuffer on the host's own
+     * present clock therefore lands in the middle of that flush every
+     * so often, and a half-applied flush is a window drawn at both its
+     * old and its new position -- the flash of partial movement.
+     *
+     * So upload only when the guest's frame counter has advanced, and
+     * only while the generator says it is in the first half of that
+     * frame, which is after the last flush and before the next.  The
+     * decode, scale and pointer passes still run every host frame, so
+     * the pointer stays as smooth as the display while the frame
+     * content changes at the guest's rate.  As a side effect the full
+     * framebuffer copy now happens once per guest frame instead of once
+     * per host frame.
+     *
+     * fb_skipped is the liveness guard: if the phase never lines up --
+     * a guest frame shorter than our poll, a generator stopped while we
+     * waited -- take the sample anyway rather than leave a stale screen.
+     */
+    {
+        uint64_t seq = 0;
+        int settled = 0;
+
+        if (!dx11_glue_guest_frame(&seq, &settled)) {
+            fb_upload(&v);                  /* no vsync: pace ourselves */
+        } else if (fb_need_upload || !fb_seq_have) {
+            fb_upload(&v);
+            fb_seq_last = seq;
+            fb_seq_have = true;
+            fb_need_upload = false;
+            fb_skipped = 0;
+        } else if (seq != fb_seq_last && settled) {
+            fb_upload(&v);
+            fb_seq_last = seq;
+            fb_skipped = 0;
+        } else if (++fb_skipped >= 4) {
+            fb_upload(&v);
+            fb_seq_last = seq;
+            fb_skipped = 0;
+        }
+    }
 
     /* decode pass: raw bytes -> linear RGB */
     ID3D11ShaderResourceView *srvs[2] = { fb.raw_srv, fb.pal_srv };
