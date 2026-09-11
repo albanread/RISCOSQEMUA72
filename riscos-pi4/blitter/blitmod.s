@@ -404,57 +404,159 @@ hexbuf:
 @ with.
 sv_handler:
     STMFD   sp!, {r0-r11, lr}
-    AND     r5, r0, #0xFF
+    AND     r10, r0, #0xFF
+
+    @ Is this the one case worth specialising -- PutSpriteScaled, the
+    @ sprite pointed at rather than named, unmasked, already the
+    @ screen's depth, no colour translation, plain store, and not
+    @ actually scaling?  Everything that fails is counted by the reason
+    @ it failed, so the rejects say what a second case would have to be.
+    TEQ     r10, #52
+    BNE     sv_count
+    ADR     r11, sv_n52
+    LDR     r8, [r11]
+    ADD     r8, r8, #1
+    STR     r8, [r11]
+
+    MOV     r11, #0                 @ reject slot
+    CMP     r0, #512                @ r2 a pointer, not a name
+    BLO     sv_rej
+    MOV     r11, #1
+    LDR     r8, [r2, #spImage]
+    LDR     r9, [r2, #spTrans]
+    TEQ     r8, r9                  @ mask present?
+    BNE     sv_rej
+    MOV     r11, #2
+    LDR     r8, [r2, #spMode]
+    MOV     r8, r8, ASR #27         @ sprite type
+    TEQ     r8, #6                  @ 6 = 32bpp
+    BNE     sv_rej
+    MOV     r11, #3
+    TEQ     r7, #0                  @ pixel translation table
+    BNE     sv_rej
+    MOV     r11, #4
+    TEQ     r5, #0                  @ GCOL action: store only
+    BNE     sv_rej
+    MOV     r11, #5
+    TEQ     r6, #0                  @ no scale block means 1:1
+    BEQ     sv_easy
+    LDMIA   r6, {r8, r9, r10, r11}  @ xmul, ymul, xdiv, ydiv
+    TEQ     r8, r10
+    TEQEQ   r9, r11
+    MOV     r11, #5
+    BNE     sv_rej
+sv_easy:
+    ADR     r8, sv_easyn
+    LDR     r9, [r8]
+    ADD     r9, r9, #1
+    STR     r9, [r8]
+    ADR     r8, sv_easyarea
+    LDR     r9, [r2, #spWidth]
+    ADD     r9, r9, #1              @ width in words
+    LDR     r10, [r2, #spHeight]
+    ADD     r10, r10, #1
+    MUL     r9, r10, r9
+    LDR     r10, [r8]
+    ADD     r10, r10, r9
+    STR     r10, [r8]
+    B       sv_sampled
+sv_rej:
+    ADR     r8, sv_rejects
+    LDR     r9, [r8, r11, LSL #2]
+    ADD     r9, r9, #1
+    STR     r9, [r8, r11, LSL #2]
+    ADR     r8, sv_rejarea
+    LDR     r9, [r2, #spWidth]
+    ADD     r9, r9, #1              @ width in words
+    LDR     r10, [r2, #spHeight]
+    ADD     r10, r10, #1
+    MUL     r9, r10, r9
+    LDR     r10, [r8]
+    ADD     r10, r10, r9
+    STR     r10, [r8]
+
+sv_sampled:
+    @ Sample the biggest sprite seen rather than the first: the average
+    @ reject is ninety thousand words, so one very large sprite is being
+    @ replotted over and over and it is the one worth identifying.
+    CMP     r0, #512
+    BLO     sv_count
+    LDR     r9, [r2, #spWidth]
+    ADD     r9, r9, #1
+    LDR     r10, [r2, #spHeight]
+    ADD     r10, r10, #1
+    MUL     r9, r10, r9             @ area in words
+    ADR     r8, sv_maxarea
+    LDR     r10, [r8]
+    CMP     r9, r10
+    BLS     sv_count
+    STR     r9, [r8]
+    ADR     r8, sv_sample
+    STR     r0, [r8, #0]
+    STR     r5, [r8, #4]            @ plot action
+    STR     r6, [r8, #8]            @ scale block
+    STR     r7, [r8, #12]           @ translation table
+    LDR     r9, [r2, #spWidth]
+    STR     r9, [r8, #16]
+    LDR     r9, [r2, #spHeight]
+    STR     r9, [r8, #20]
+    LDR     r9, [r2, #spMode]
+    STR     r9, [r8, #24]
+    LDR     r9, [r2, #spImage]
+    LDR     r10, [r2, #spTrans]
+    SUB     r9, r10, r9             @ 0 when unmasked
+    STR     r9, [r8, #28]
+    LDR     r9, [r2, #spImage]
+    STR     r9, [r8, #32]           @ where the palette ends
+    TEQ     r6, #0
+    BEQ     sv_count
+    LDMIA   r6, {r0, r2}
+    STR     r0, [r8, #36]
+    STR     r2, [r8, #40]
+
+sv_count:
+    LDR     r10, [sp]               @ r0 as it came in
+    AND     r10, r10, #0xFF
     ADR     r6, sv_reasons
     MOV     r7, #0
 sv_find:
     LDR     r8, [r6, r7, LSL #2]
-    TEQ     r8, r5
+    TEQ     r8, r10
     BEQ     sv_hit
     ADD     r7, r7, #1
     CMP     r7, #6
     BLO     sv_find
     B       sv_out
-
 sv_hit:
     ADR     r6, sv_counts
     LDR     r8, [r6, r7, LSL #2]
     ADD     r8, r8, #1
     STR     r8, [r6, r7, LSL #2]
-
-    @ Sample the first two, and only from range C, where r2 points at
-    @ the sprite rather than naming it.
-    CMP     r0, #512
-    BLO     sv_out
-    ADR     r6, sv_nsample
-    LDR     r8, [r6]
-    CMP     r8, #2
-    BHS     sv_out
-    ADD     r9, r8, #1
-    STR     r9, [r6]
-    ADR     r6, sv_sample
-    ADD     r9, r8, r8, LSL #1      @ six words per sample
-    ADD     r6, r6, r9, LSL #3
-    STR     r0, [r6, #0]
-    LDR     r9, [r2, #spWidth]
-    STR     r9, [r6, #4]
-    LDR     r9, [r2, #spHeight]
-    STR     r9, [r6, #8]
-    LDR     r9, [r2, #spMode]
-    STR     r9, [r6, #12]
-    LDR     r9, [r2, #spImage]
-    STR     r9, [r6, #16]
-    LDR     r9, [r2, #spTrans]
-    STR     r9, [r6, #20]
 sv_out:
     LDMFD   sp!, {r0-r11, pc}
 
+@ Counts say how often, area says how much: a backdrop tile is worth a
+@ hundred icons, so the split that matters is pixels, not calls.  The
+@ accumulation is inlined at both sites rather than called: a BL to a
+@ named symbol leaves an R_ARM_CALL relocation that objcopy cannot
+@ resolve, and the module then branches into nowhere.
+
 sv_reasons:
     .word   28, 34, 48, 49, 50, 52
-sv_nsample:
+sv_maxarea:
     .word   0
 sv_counts:
     .space  4 * 6
+sv_n52:
+    .word   0
+sv_easyn:
+    .word   0
+sv_rejects:
+    .space  4 * 6           @ name, mask, depth, translation, action, scale
+sv_easyarea:
+    .word   0
+sv_rejarea:
+    .word   0
 sv_sample:
     .space  4 * 12
 sv_hexbuf:
@@ -463,8 +565,8 @@ sv_hexbuf:
 
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
-    ADR     r6, sv_nsample
-    MOV     r7, #19                 @ sample count, six counters, two samples
+    ADR     r6, sv_maxarea
+    MOV     r7, #29                 @ ..., 6 rejects, two areas, sample
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4
