@@ -200,18 +200,17 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
     }
 
     /*
-     * Mapping the span pays for the gaps between rows, and unmapping
-     * dirties all of it -- which costs twice, once here and again in
-     * the display, since dirty pages are what it re-reads.  Over a
-     * session the fills wrote 18.7 MB and dirtied 35.9.  Only map when
-     * the rows nearly touch; a narrow rectangle goes row by row, which
-     * dirties just what changed.
+     * Map the span and write the rows into it.  Unmapping dirties the
+     * gaps between rows as well, about twice the bytes actually
+     * written, and that was briefly thought worth avoiding -- but the
+     * Metal front end maps guest RAM and copies the whole framebuffer
+     * every frame (ui/metal.c, ui/metal.m), so nothing here reads the
+     * dirty bitmap.  Going row by row to dirty less made a narrow fill
+     * cost a microsecond instead of half of one and bought nothing.
+     * Over-marking is safe for a backend that does read it.
      */
     blit_span(s, s->dstride, &lo, &span);
-    host = NULL;
-    if ((uint64_t)s->width * 2 >= (uint64_t)ABS(s->dstride)) {
-        host = blit_map(dest + lo, span, &mapped);
-    }
+    host = blit_map(dest + lo, span, &mapped);
     if (host) {
         for (uint32_t y = 0; y < s->height; y++) {
             memcpy(host + ((int64_t)y * s->dstride - lo), row, s->width);
