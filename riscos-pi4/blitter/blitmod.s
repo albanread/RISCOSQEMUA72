@@ -506,13 +506,14 @@ sv_sampled:
     LDR     r10, [r2, #spTrans]
     SUB     r9, r10, r9             @ 0 when unmasked
     STR     r9, [r8, #28]
-    LDR     r9, [r2, #spImage]
-    STR     r9, [r8, #32]           @ where the palette ends
-    TEQ     r6, #0
-    BEQ     sv_count
-    LDMIA   r6, {r0, r2}
-    STR     r0, [r8, #36]
-    STR     r2, [r8, #40]
+    @ The name says what is being replotted; everything else has been
+    @ inference.  Twelve bytes at +4, space padded.
+    LDR     r9, [r2, #4]
+    STR     r9, [r8, #32]
+    LDR     r9, [r2, #8]
+    STR     r9, [r8, #36]
+    LDR     r9, [r2, #12]
+    STR     r9, [r8, #40]
 
 sv_count:
     LDR     r10, [sp]               @ r0 as it came in
