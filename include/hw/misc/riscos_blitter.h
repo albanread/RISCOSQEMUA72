@@ -64,6 +64,8 @@
 #define BLIT_CLIPX1     0x54
 #define BLIT_CLIPY1     0x58
 #define BLIT_BPP        0x5c    /* bytes per pixel, source and dest */
+#define BLIT_MASK       0x60    /* 1bpp transparency mask, guest virtual */
+#define BLIT_MSTRIDE    0x64    /* bytes per mask row */
 #define BLIT_REGION_SIZE 0x1000
 
 #define BLIT_MAGIC_VALUE   0x54494c42  /* 'B','L','I','T' little-endian */
@@ -72,6 +74,7 @@
 #define BLIT_FEATURE_FILL  0x1
 #define BLIT_FEATURE_COPY  0x2
 #define BLIT_FEATURE_SPRITE 0x4
+#define BLIT_FEATURE_MASK   0x8
 
 #define BLIT_F_FB          0x1  /* DEST is a framebuffer byte offset */
 /*
@@ -89,6 +92,13 @@
  * on the guest side instead of a rewrite here.
  */
 #define BLIT_F_BOTTOM_UP   0x4
+/*
+ * A 1bpp transparency mask at BLIT_MASK: one bit per pixel, least
+ * significant first, rows padded to whole words, and a set bit means
+ * the pixel is plotted.  RISC OS uses this shape for every sprite of
+ * two bits per pixel or more.
+ */
+#define BLIT_F_MASK        0x8
 
 #define BLIT_OP_NOP        0
 #define BLIT_OP_FILL       1
@@ -124,7 +134,7 @@ struct RISCOSBlitterState {
     uint32_t op, flags, dest, src, width, height, patlen;
     int32_t dstride, sstride;
     int32_t dstx, dsty, clipx0, clipy0, clipx1, clipy1;
-    uint32_t bpp;
+    uint32_t bpp, mask, mstride;
     uint32_t pattern[4];
 
     /*

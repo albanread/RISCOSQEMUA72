@@ -67,6 +67,9 @@
     .equ    OP_SPRITE,    3
     .equ    F_SRC_VIRT,   2
     .equ    F_BOTTOM_UP,  4
+    .equ    F_MASK,       8
+    .equ    BLIT_MASK,    0x60
+    .equ    BLIT_MSTRIDE, 0x64
     .equ    XOS_SpriteOp,          0x2002E
     .equ    XOS_ReadMonotonicTime, 0x20042
     .equ    XOS_WriteC,            0x20000
@@ -456,10 +459,6 @@ sv_handler:
     @ nothing to say.
     CMP     r0, #512
     BLO     sv_pass
-    LDR     r8, [r2, #spImage]
-    LDR     r9, [r2, #spTrans]
-    TEQ     r8, r9
-    BNE     sv_pass                 @ masked
     LDR     r8, [r2, #spMode]
     MOV     r8, r8, ASR #27
     TEQ     r8, #6                  @ sprite type 6 = 32bpp
@@ -550,7 +549,23 @@ sv_haveconst:
 
     MOV     r11, #OP_SPRITE
     STR     r11, [r10, #BLIT_OP]
-    MOV     r11, #F_SRC_VIRT        @ rows run top down, as the screen does
+
+    @ A sprite whose mask offset differs from its image offset has one.
+    @ At two bits per pixel and above it is one bit per pixel, least
+    @ significant first, rows padded to whole words.
+    LDR     r11, [r2, #spImage]
+    LDR     r8, [r2, #spTrans]
+    TEQ     r11, r8
+    MOVEQ   r11, #F_SRC_VIRT        @ rows run top down, as the screen does
+    BEQ     .Lsv_unmasked
+    ADD     r8, r8, r2
+    STR     r8, [r10, #BLIT_MASK]
+    ADD     r8, r5, #31
+    MOV     r8, r8, LSR #5
+    MOV     r8, r8, LSL #2
+    STR     r8, [r10, #BLIT_MSTRIDE]
+    MOV     r11, #F_SRC_VIRT + F_MASK
+.Lsv_unmasked:
     STR     r11, [r10, #BLIT_FLAGS]
     LDR     r11, [r2, #spImage]
     ADD     r11, r11, r2            @ logical: the host walks the page tables

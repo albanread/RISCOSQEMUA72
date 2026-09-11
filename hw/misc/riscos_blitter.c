@@ -395,6 +395,39 @@ static bool blit_src_read(BlitSrcWin *w, uint64_t va, uint8_t *dst,
     return true;
 }
 
+/*
+ * Copy the pixels the mask says are solid.  Whole groups of 32 go as a
+ * block either way -- an icon is mostly solid interior and empty
+ * border, so the per-pixel path is the exception rather than the rule.
+ */
+static void blit_merge(uint8_t *dst, const uint8_t *src, const uint8_t *mbits,
+                       uint32_t first_bit, uint32_t w, uint32_t bpp)
+{
+    uint32_t x = 0;
+
+    while (x < w) {
+        uint32_t b = first_bit + x;
+        uint32_t in_word = b & 31;
+        uint32_t n = MIN(w - x, 32 - in_word);
+        uint32_t word = ldl_le_p(mbits + ((b >> 5) << 2));
+        uint32_t bits = (word >> in_word) & (n == 32 ? 0xffffffffu
+                                                     : ((1u << n) - 1));
+
+        if (bits == (n == 32 ? 0xffffffffu : (1u << n) - 1)) {
+            memcpy(dst + (size_t)x * bpp, src + (size_t)x * bpp,
+                   (size_t)n * bpp);
+        } else if (bits) {
+            for (uint32_t i = 0; i < n; i++) {
+                if (bits & (1u << i)) {
+                    memcpy(dst + (size_t)(x + i) * bpp,
+                           src + (size_t)(x + i) * bpp, bpp);
+                }
+            }
+        }
+        x += n;
+    }
+}
+
 static uint32_t blit_sprite(RISCOSBlitterState *s)
 {
     BCM2835FBConfig cfg;
@@ -447,7 +480,12 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
         if (first + span > fbsize) {
             return BLIT_RC_RANGE;
         }
-        row = blit_scratch(s, w * bpp);
+        {
+            /* source row, a destination row when the framebuffer is not
+             * mapped, and the mask row, in one allocation */
+            uint32_t need = w * bpp * 2 + ((w + 63) / 8) + 8;
+            row = blit_scratch(s, need);
+        }
         /*
          * Mapping the whole span pays for the gaps between rows: a
          * 128-row sprite on a 1920-wide screen spans a megabyte to
@@ -477,10 +515,35 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
                 dma_memory_read(&address_space_memory, src, row, w * bpp,
                                 MEMTXATTRS_UNSPECIFIED);
             }
-            if (fbhost) {
+            dest = cfg.base + first + (uint64_t)j * pitch;
+
+            if (s->flags & BLIT_F_MASK) {
+                uint8_t *drow = row + w * bpp;
+                uint8_t *mrow = drow + w * bpp;
+                uint32_t mbytes = ((skip_x + w + 31) / 32 - skip_x / 32) * 4;
+                uint64_t mva = s->mask + (uint64_t)sy * s->mstride
+                               + (uint64_t)(skip_x / 32) * 4;
+                uint8_t *target;
+
+                if (!blit_src_read(&win, mva, mrow, mbytes)) {
+                    rc = BLIT_RC_FAULT;
+                    break;
+                }
+                if (fbhost) {
+                    target = fbhost + (uint64_t)j * pitch;
+                } else {
+                    dma_memory_read(&address_space_memory, dest, drow,
+                                    w * bpp, MEMTXATTRS_UNSPECIFIED);
+                    target = drow;
+                }
+                blit_merge(target, row, mrow, skip_x & 31, w, bpp);
+                if (!fbhost) {
+                    dma_memory_write(&address_space_memory, dest, drow,
+                                     w * bpp, MEMTXATTRS_UNSPECIFIED);
+                }
+            } else if (fbhost) {
                 memcpy(fbhost + (uint64_t)j * pitch, row, w * bpp);
             } else {
-                dest = cfg.base + first + (uint64_t)j * pitch;
                 dma_memory_write(&address_space_memory, dest, row, w * bpp,
                                  MEMTXATTRS_UNSPECIFIED);
             }
@@ -545,7 +608,8 @@ static uint64_t blit_read(void *opaque, hwaddr offset, unsigned size)
     case BLIT_VERSION:
         return BLIT_VERSION_VALUE;
     case BLIT_FEATURES:
-        return BLIT_FEATURE_FILL | BLIT_FEATURE_COPY | BLIT_FEATURE_SPRITE;
+        return BLIT_FEATURE_FILL | BLIT_FEATURE_COPY | BLIT_FEATURE_SPRITE
+               | BLIT_FEATURE_MASK;
     case BLIT_GO:
         return s->status;
     default:
@@ -577,6 +641,8 @@ static void blit_write(void *opaque, hwaddr offset, uint64_t value,
     case BLIT_CLIPX1:  s->clipx1 = v;   break;
     case BLIT_CLIPY1:  s->clipy1 = v;   break;
     case BLIT_BPP:     s->bpp = v;      break;
+    case BLIT_MASK:    s->mask = v;     break;
+    case BLIT_MSTRIDE: s->mstride = v;  break;
     default:
         if (offset >= BLIT_PATTERN && offset < BLIT_PATTERN + 16) {
             s->pattern[(offset - BLIT_PATTERN) / 4] = v;
@@ -607,6 +673,7 @@ static void blit_reset(DeviceState *dev)
     RISCOSBlitterState *s = RISCOS_BLITTER(dev);
 
     s->op = s->flags = s->dest = s->src = 0;
+    s->mask = s->mstride = 0;
     s->width = s->height = s->patlen = 0;
     s->dstride = s->sstride = 0;
     memset(s->pattern, 0, sizeof(s->pattern));
@@ -635,6 +702,8 @@ static const VMStateDescription blit_vmstate = {
         VMSTATE_INT32(clipx1, RISCOSBlitterState),
         VMSTATE_INT32(clipy1, RISCOSBlitterState),
         VMSTATE_UINT32(bpp, RISCOSBlitterState),
+        VMSTATE_UINT32(mask, RISCOSBlitterState),
+        VMSTATE_UINT32(mstride, RISCOSBlitterState),
         VMSTATE_INT32(dstride, RISCOSBlitterState),
         VMSTATE_INT32(sstride, RISCOSBlitterState),
         VMSTATE_UINT32_ARRAY(pattern, RISCOSBlitterState, 4),
