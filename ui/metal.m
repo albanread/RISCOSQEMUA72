@@ -924,9 +924,9 @@ static bool fb_damage_on(void)
     return on != 0;
 }
 
-static void fb_upload(const MetalFbView *v)
+static bool fb_upload(const MetalFbView *v)
 {
-    static uint64_t frames, copied;
+    static uint64_t frames, copied, on_settle, on_timeout;
     static unsigned held;
     static bool pending;
     bool drawing = riscos_blitter_take_damage() != 0;
@@ -940,12 +940,20 @@ static void fb_upload(const MetalFbView *v)
     settled = pending && !drawing;
     if (fb.uploaded && !settled && ++held < METAL_SETTLE_MAX) {
         if (fb_damage_on() && frames % 300 == 0) {
-            metal_log("upload: %llu of %llu frames copied (%.1f%%)",
+            metal_log("upload: %llu of %llu frames copied (%.1f%%), "
+                      "%llu on settle, %llu on timeout",
                       (unsigned long long)copied,
                       (unsigned long long)frames,
-                      100.0 * copied / frames);
+                      100.0 * copied / frames,
+                      (unsigned long long)on_settle,
+                      (unsigned long long)on_timeout);
         }
-        return;
+        return false;
+    }
+    if (settled) {
+        on_settle++;
+    } else if (fb.uploaded) {
+        on_timeout++;
     }
     held = 0;
     pending = false;
@@ -954,6 +962,7 @@ static void fb_upload(const MetalFbView *v)
     memcpy([fb.raw[fb.ring] contents], v->fb, (size_t)v->pitch * v->rows);
     fb.uploaded = true;
     copied++;
+    return true;
 
     if (!fb.pal_valid
         || memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {
@@ -961,6 +970,7 @@ static void fb_upload(const MetalFbView *v)
         memcpy([fb.palette contents], fb.pal_cache, sizeof(fb.pal_cache));
         fb.pal_valid = true;
     }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
