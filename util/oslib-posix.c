@@ -1033,3 +1033,14 @@ int qemu_shm_alloc(size_t size, Error **errp)
 
     return fd;
 }
+
+unsigned qemu_thread_prefer_performance_cores(void)
+{
+    /*
+     * Nothing portable to do here yet.  Linux exposes asymmetric cores
+     * through capacity in sysfs and through sched_setaffinity, but the
+     * policy of which ones to take belongs with the platform, so leave
+     * the scheduler alone rather than guess.
+     */
+    return 0;
+}

@@ -31,6 +31,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
+#include "qemu/error-report.h"
 #include "hw/core/boards.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
@@ -83,6 +84,16 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu->thread_id = qemu_get_thread_id();
     cpu->neg.can_do_io = true;
     current_cpu = cpu;
+
+    /* this thread is the guest's hot loop: keep it off the slow cores */
+    {
+        unsigned fast = qemu_thread_prefer_performance_cores();
+
+        if (fast) {
+            info_report("vCPU %d confined to the %u performance cores",
+                        cpu->cpu_index, fast);
+        }
+    }
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 

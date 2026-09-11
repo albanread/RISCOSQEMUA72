@@ -31,6 +31,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
+#include "qemu/error-report.h"
 #include "exec/cpu-common.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
@@ -194,6 +195,16 @@ static void *rr_cpu_thread_fn(void *arg)
 
     cpu->thread_id = qemu_get_thread_id();
     cpu->neg.can_do_io = true;
+
+    /* the one thread that runs every vCPU: keep it off the slow cores */
+    {
+        unsigned fast = qemu_thread_prefer_performance_cores();
+
+        if (fast) {
+            info_report("round-robin vCPU thread confined to the %u "
+                        "performance cores", fast);
+        }
+    }
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 

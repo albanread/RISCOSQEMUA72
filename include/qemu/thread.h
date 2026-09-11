@@ -218,6 +218,23 @@ G_NORETURN void qemu_thread_exit(void *retval);
 void qemu_thread_set_name(const char *name);
 const char *qemu_thread_get_name(void);
 
+/**
+ * qemu_thread_prefer_performance_cores:
+ *
+ * On a host whose cores are not all alike -- a package with fast
+ * "performance" cores beside slow "efficient" ones -- confine the
+ * calling thread to the fast ones, and tell the power manager not to
+ * demote it again.  For the emulator's hot loops (a vCPU thread above
+ * all) the difference is most of the guest's speed.
+ *
+ * A no-op where the host's cores are uniform, where the platform has no
+ * such notion, or when QEMU_VCPU_ECORES is set in the environment.
+ *
+ * Returns: the number of logical processors the thread was confined to,
+ * or 0 if nothing was changed.
+ */
+unsigned qemu_thread_prefer_performance_cores(void);
+
 struct Notifier;
 /**
  * qemu_thread_atexit_add:

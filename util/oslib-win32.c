@@ -932,3 +932,107 @@ int qemu_ftruncate64(int fd, int64_t length)
     SetFilePointer(h, li.LowPart, &li.HighPart, FILE_BEGIN);
     return res ? 0 : -1;
 }
+
+/*
+ * Hybrid hosts put fast and slow cores in one package and let the
+ * scheduler move work between them.  The emulator's hot loop is a vCPU
+ * thread, so it matters which kind it lands on.
+ *
+ * What this does NOT do by default is pin the thread.  Measured on an
+ * i7-12700 (8 performance cores, 4 efficient), confining the vCPU
+ * threads to the performance cores with SetThreadAffinityMask ran the
+ * guest about 13% slower than leaving them alone, and far less evenly:
+ * three alternating pairs of 30 s boots gave 2.55/3.15/2.54 Gi pinned
+ * against 3.14/3.19/3.20 Gi unpinned.  A hard affinity mask overrides
+ * Intel's Thread Director, which already knows which core is fastest
+ * and can favour the best-binned one; we only take that choice away.
+ *
+ * What is left is the half that cannot override anything: tell the power
+ * manager the thread is not background work, so it is not a candidate
+ * for the efficiency quality-of-service class -- the mechanism that
+ * would otherwise park a long-running thread on the slow cores.
+ * Placement stays the scheduler's decision.
+ *
+ * On this desktop that hint measured as nothing either way (2.94 against
+ * 2.96 Gi over the same alternating pairs, inside the run-to-run
+ * spread): plugged in, Windows already treats a busy vCPU thread as
+ * performance work.  It is kept because the case it exists for is the
+ * one not measured here -- a laptop on battery, where the efficiency
+ * class is applied far more readily.
+ *
+ * QEMU_VCPU_PIN restores the hard affinity for anyone who wants to
+ * measure it on another machine; QEMU_VCPU_ECORES leaves the thread
+ * entirely alone.  Only the caller's own processor group is considered,
+ * which is the whole machine at 64 or fewer logical processors.
+ */
+unsigned qemu_thread_prefer_performance_cores(void)
+{
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *info, *p, *end;
+    THREAD_POWER_THROTTLING_STATE throttle;
+    DWORD len = 0;
+    BYTE lo = 0xff, hi = 0;
+    KAFFINITY mask = 0, bit;
+    unsigned n = 0;
+
+    if (getenv("QEMU_VCPU_ECORES")) {
+        return 0;                   /* asked to leave the scheduler alone */
+    }
+
+    /* not background work: keep this thread out of the efficiency class */
+    throttle.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttle.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttle.StateMask = 0;         /* 0 here means "manage for speed" */
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
+                         &throttle, sizeof(throttle));
+
+    if (!getenv("QEMU_VCPU_PIN")) {
+        return 0;                   /* placement is the scheduler's call */
+    }
+
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len)
+        || GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0) {
+        return 0;
+    }
+    info = g_malloc0(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        g_free(info);
+        return 0;
+    }
+    end = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)((BYTE *)info + len);
+
+    /* which classes are present?  a uniform host has only the one */
+    for (p = info; p < end; p = (void *)((BYTE *)p + p->Size)) {
+        if (p->Size == 0) {
+            break;
+        }
+        if (p->Relationship == RelationProcessorCore) {
+            lo = MIN(lo, p->Processor.EfficiencyClass);
+            hi = MAX(hi, p->Processor.EfficiencyClass);
+        }
+    }
+    if (hi == lo) {
+        g_free(info);
+        return 0;                   /* every core alike: nothing to choose */
+    }
+
+    /* the fast cores of this group; Windows numbers them highest */
+    for (p = info; p < end; p = (void *)((BYTE *)p + p->Size)) {
+        if (p->Size == 0) {
+            break;
+        }
+        if (p->Relationship == RelationProcessorCore
+            && p->Processor.EfficiencyClass == hi
+            && p->Processor.GroupCount > 0
+            && p->Processor.GroupMask[0].Group == 0) {
+            mask |= p->Processor.GroupMask[0].Mask;
+        }
+    }
+    g_free(info);
+    if (!mask || !SetThreadAffinityMask(GetCurrentThread(), mask)) {
+        return 0;
+    }
+    for (bit = mask; bit; bit &= bit - 1) {
+        n++;
+    }
+    return n;
+}
