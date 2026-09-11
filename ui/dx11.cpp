@@ -761,11 +761,14 @@ float4 ps_main(VSOut v) : SV_Target
 #ifdef POINTER
 
 /* The guest's pointer sprite.  The words are little-endian
- * 0xAARRGGBB -- BGRA8 in a texture, one Load and a swizzle.  The
- * triangle's overhang past uv 1 is dropped here, and the blend is
- * straight alpha so the ROM's anti-fringe fill (transparent pixels
- * carrying the neighbouring colour at alpha 0) behaves exactly as it
- * does against the firmware's compositor. */
+ * 0xAARRGGBB, which a BGRA8 texture reads channel-correct in one
+ * Load -- no swizzle (the Metal twin reads raw bytes and swizzles
+ * there instead; doing both swaps R and B, which is exactly how a
+ * blue pointer once came out red).  The triangle's overhang past
+ * uv 1 is dropped here, and the blend is straight alpha so the
+ * ROM's anti-fringe fill (transparent pixels carrying the
+ * neighbouring colour at alpha 0) behaves exactly as it does
+ * against the firmware's compositor. */
 Texture2D<uint4> img : register(t0);
 
 cbuffer ptrdim : register(b1) { uint2 dim; }
@@ -777,7 +780,7 @@ float4 ps_pointer(VSOut v) : SV_Target
     }
     uint2 t = min((uint2)(v.uv * (float2)dim), (uint2)dim - 1u);
     uint4 c = img.Load(int3(t, 0));
-    return float4(c.b, c.g, c.r, c.a) / 255.0f;
+    return float4(c.r, c.g, c.b, c.a) / 255.0f;
 }
 
 #endif
@@ -1123,10 +1126,14 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     D3D11_TEXTURE2D_DESC dd = {};
     dd.Width = v->xres;
     dd.Height = v->yres;
-    dd.MipLevels = 1;
     dd.ArraySize = 1;
     dd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     dd.SampleDesc.Count = 1;
+    dd.MipLevels = 0;              /* full chain: the scale pass's
+                                     * trilinear sampler then area-filters
+                                     * any downscale to the window instead
+                                     * of point-sampling 4 of every ~4x4
+                                     * source pixels */
     dd.Usage = D3D11_USAGE_DEFAULT;
     dd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     hr = dx11.device->CreateTexture2D(&dd, nullptr, &fb.decoded);
@@ -1491,6 +1498,17 @@ static bool dx11_render_frame(void)
     D3D11_VIEWPORT vp = { 0, 0, (float)v.xres, (float)v.yres, 0, 1 };
     dx11.context->RSSetViewports(1, &vp);
     dx11.context->Draw(3, 0);
+
+    /* the mip chain over the fresh decode: each level is the 2x2
+     * average of the one above, so whatever the window size, the
+     * trilinear sample in the scale pass averages every source pixel
+     * an output pixel covers (a plain bilinear at half scale touches
+     * 4 texels of the ~4.1 covered and text dissolves into shimmer).
+     * The texture must first be unbound as a render target or the
+     * generation reads it while it is still the draw target, which
+     * the driver answers with stripes */
+    dx11.context->OMSetRenderTargets(0, nullptr, nullptr);
+    dx11.context->GenerateMips(fb.dec_srv);
 
     /* scale pass: decoded surface over the whole client area */
     ID3D11ShaderResourceView *dec = fb.dec_srv;
