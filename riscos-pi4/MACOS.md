@@ -221,14 +221,15 @@ needed yet.
 
 ## 6. What is not done yet
 
-- **Apple Events: Sprint E0 is built, E1 on.** `ping` answers over the
-  wire from the bundled app — `riscos-pi4/tools/make-bundle.sh` makes
-  it, `osascript -e 'tell application id
-  "com.github.albanread.RISCOSQEMU-A72" to ping'` proves it — and
-  delivery through the hand-run pump is measured (`SCRIPTING.md` §13:
-  16.7 ms per event, QMP 0.1 ms, consent surviving an ad-hoc rebuild).
-  The command table, the generated sdef and the rest of the surface are
-  E1–E6.
+- **Apple Events: Sprints E0 and E1 are built.** `ping` and `describe`
+  answer over the wire from the properly-launched app —
+  `riscos-pi4/tools/run-app.sh` (an `open --args` launch, **no QMP**:
+  the app persona's only always-on channel is Apple Events) over the
+  bundle `make-bundle.sh` assembles. The command table in `ui/metal.c`
+  is the one source of truth; `mksdef.py` generates the dictionary
+  from it and `describe` returns it as JSON. `SCRIPTING.md` §13–14
+  record the measurements (16.7 ms per event, QMP 0.1 ms) and the wire
+  lessons. The control and debug commands are E2–E3.
 - **Grab, full screen and the snapshot menu are written but unexercised.**
   ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
 

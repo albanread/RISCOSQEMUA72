@@ -17,6 +17,10 @@ BIN="${1:-$ROOT/build-macos/qemu-system-aarch64}"
 APP="$ROOT/build-macos/RISCOSQEMU.app"
 
 [[ -x "$BIN" ]] || { print -u2 "no such binary: $BIN"; exit 1 }
+# The sdef and the schema regenerate from the command table first, so a
+# stale dictionary cannot ship (mksdef.py is the mkcmos.py precedent of
+# parsing the source that the dispatch actually uses).
+python3 "$ROOT/riscos-pi4/tools/mksdef.py" || exit 1
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/"
 cp "$ROOT/riscos-pi4/app/Info.plist" "$APP/Contents/"

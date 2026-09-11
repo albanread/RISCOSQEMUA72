@@ -30,17 +30,32 @@ void metal_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* ------------------------------------------------------------------ */
 /* Apple Events (riscos-pi4/SCRIPTING.md)                              */
 
-/* Register the handlers with NSAppleEventManager.  Called from
- * metal_backend_init() on the main thread; the handlers fire inside
- * the pump's sendEvent:, which is the first thing Sprint E0 verifies.
- * RISCOSQEMU_SCRIPTING_OFF in the environment skips registration (the
- * dev kill switch until the settings file carries one). */
-void metal_script_init(void);
+/* Register the command handlers with NSAppleEventManager, one per
+ * event id in the C table.  Called from metal_backend_init() on the
+ * main thread and again after the pump's finishLaunching; the handlers
+ * fire inside the pump's sendEvent:, which is the first thing Sprint
+ * E0 verified.  RISCOSQEMU_SCRIPTING_OFF in the environment skips
+ * registration (the dev kill switch until the settings file carries
+ * one). */
+void metal_script_register(void);
 
-/* One command in JSON, one reply envelope out.  The reply is a heap
- * string the caller frees with g_free; returns false only when no
- * envelope could be produced at all.  Called on the UI thread. */
-bool metal_glue_script(const char *json, char **reply);
+/* One command, one reply envelope out.  The event id names the command
+ * -- it is what AppleScript actually addressed, so it is authoritative;
+ * a direct parameter that parses as a JSON object carries arguments,
+ * and a "cmd" key inside it overrides (the raw-text form).  The reply
+ * is a heap string the caller frees with g_free; returns false only
+ * when no envelope could be produced at all.  Called on the UI
+ * thread. */
+bool metal_glue_script(uint32_t event_class, uint32_t event_id,
+                       const char *json, char **reply);
+
+/* The four-character event codes of every command in the table, for
+ * handler registration: writes up to max {class, id} pairs and returns
+ * the count.  NSAppleEventManager dispatches exact pairs, so one
+ * handler per command id is required -- a handler for one id does not
+ * serve another in the same suite. */
+size_t metal_glue_script_events(uint32_t *classes, uint32_t *ids,
+                                size_t max);
 
 /*
  * A frame's view of the guest framebuffer, gathered by metal_glue_fb_view()

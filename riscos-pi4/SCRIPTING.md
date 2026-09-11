@@ -50,11 +50,25 @@ Apple Events close the gaps that matter to an agent host:
 - **The platform's future comes free**: a Shortcuts action set is the same
   sdef plus one `.intentdefinition`, later, if ever wanted.
 
-QMP stays. It is the deep, verbose, cross-platform channel the tools
-already use (`probe.py`, `ticks.py`, `run.py`); nothing here replaces it.
-The Apple Event surface is the curated, typed, discoverable façade over the
-same core — and where QMP already has the function, this calls the same C
-entry points in-process rather than proxying text through a socket.
+QMP stays — for the developer. It is the deep, verbose, cross-platform
+channel the tools already use (`probe.py`, `ticks.py`, `run.py`), and
+nothing here replaces it in that persona. The Apple Event surface is the
+curated, typed, discoverable façade over the same core — and where QMP
+already has the function, this calls the same C entry points in-process
+rather than proxying text through a socket. But the two channels have
+different perimeters and only one of them is governed: a TCP socket on
+127.0.0.1 lets *any* local process drive the machine with no prompt,
+while Apple Events carry TCC's per-sender consent. **The shipped app
+persona therefore leaves QMP off unless explicitly asked for** — the
+Apple Event surface is the only always-on way in — and §8's E5
+notarizes that shape. The two personas are the product plan, not a
+compromise: the app is for users emulating RISC OS with some
+automation, and the developer workbench of this same code embeds into
+an IDE with editors and tools (SPRINTS' tier two), where the deep
+channels and the shared window live. (For the record of §3:
+notarization is a malware scan with no policy against listening
+sockets — Chrome's CDP port ships notarized — so this is a design
+decision about consent, not an Apple requirement.)
 
 ## 2. AGENTS FIRST, and what that dictates
 
@@ -361,6 +375,9 @@ name, so:
   is documented as part of the threat model.
 - **A kill switch**: `scripting=off` in the settings file (and a
   `-display metal,scripting=off` suboption), default on.
+- **One always-on channel**: the shipped app persona leaves QMP off
+  unless asked (§1) — a localhost socket is a consent-free control
+  channel, and the point of this surface is that its perimeter is TCC's.
 - **An audit trail**: every command logged to `metal-debug.txt`
   (rate-limited), which is where the front end's failures already land.
 - **TCC does the perimeter**: the *sender* is prompted by macOS for
@@ -396,11 +413,12 @@ promise. E0's answers gate E1's shape; nothing else starts before them.
   `osascript -l JavaScript -e
   'Application("…").ping()'` answers from the real front end, with the
   three measurements written down.
-- **E1 — the bundle and the table (2–3 d).** Proper `.app`, `Info.plist`
-  keys, the C command table, `mksdef.py`, `describe`, the envelope, the
-  error taxonomy, single-flight, timeouts. Done when the sdef opens in
-  Script Editor with real terminology, and `describe` returns the table an
-  agent can drive the machine with.
+- **E1 — the bundle and the table (2–3 d). *Done; see §14.*** Proper
+  `.app`, `Info.plist` keys, the C command table, `mksdef.py`,
+  `describe`, the envelope, the error taxonomy, single-flight,
+  timeouts. Done when the sdef opens in Script Editor with real
+  terminology, and `describe` returns the table an agent can drive the
+  machine with.
 - **E2 — control (2 d).** Lifecycle, pause/resume, snapshots, both
   screenshots, the input set, counters in the envelope. Done when a
   script — written by an agent from `describe` alone, no human — cold
@@ -545,6 +563,53 @@ prompts and grants cleanly — the TCC ambiguity §7 already carries, now
 with its shape known: agents get consent through a host the user can see
 prompting, which is the Apple Events consent model working as designed,
 and E5's stable identity is what makes that one click last.
+
+## 14. E1, as built
+
+The command table is the single source of truth and everything is
+generated from it: `tools/mksdef.py` parses the marked array in
+`ui/metal.c` and writes the sdef and `commands.json` (the mkcmos.py
+precedent; `make-bundle.sh` re-runs it so a stale dictionary cannot
+ship), `describe` serialises the same array at runtime, and the
+dispatch resolves both by event id and by name. `describe` answers with
+the table through real terminology — `tell application id "…" to
+describe` — and the raw-text form (`ping '{"cmd":"describe"}'`) and JXA
+(`JSON.parse(app.describe())`) both work. The envelope, the error
+taxonomy, the JSON escaping and the waiting parameter's clamps are all
+in; single-flight holds by construction while commands are fast.
+
+Four things the wire taught, each costing a build:
+
+- **One handler per event id.** NSAppleEventManager dispatches exact
+  (class, id) pairs: a handler for `Ping` does not serve `Desc` in the
+  same suite, so E0's single registration meant `describe` compiled,
+  was sent, and came back as an unhandled empty reply. Registration now
+  walks the table's codes (`metal_glue_script_events()`), is
+  idempotent, and runs a second time after the pump's
+  `finishLaunching` in case AppKit's own scripting initialisation
+  pre-empts ours.
+- **The event id is the command.** E0's "omitted parameter means ping"
+  shortcut could not survive a second command — bare `describe`
+  answered ping's envelope until the handler passed the addressed
+  event id through and the C side resolved by it. A `"cmd"` key in a
+  JSON direct parameter still overrides, so the raw-text form keeps
+  working for agents that prefer it.
+- **Deploy as a proper application.** Launching the bundle's executable
+  directly left the app half-registered, and terminology, TCC and event
+  routing behaved inconsistently mid-session (fast empty replies with
+  no handler fired, until a relaunch). The canonical app launch is
+  `open -n RISCOSQEMU.app --args …`, which is `tools/run-app.sh` — and
+  that script carries the persona split of §1: **no QMP socket unless
+  `WITH_QMP=1`**, Apple Events the only always-on channel in the app
+  persona. A properly-launched app also has `cwd=/`, so
+  `metal-debug.txt` silently does not appear — the log's proper home is
+  Application Support, which arrives with Sprint 17's settings file
+  and is noted here so the silence is not mysterious.
+- **Pipe every reply through a JSON parser in the test, always.**
+  describe's first envelope was invalid by one pair of braces — object
+  contents where the envelope promised an object — invisible in a
+  glance at the string and impossible to miss in `python3 -m
+  json.tool`.
 
 ## Sources
 

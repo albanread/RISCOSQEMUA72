@@ -25,10 +25,13 @@
 
 #include "ui/metal.h"
 
-/* The suite and command codes, allocated in the sdef.  Mixed case on
- * purpose: Apple reserves all-lowercase four-character codes. */
-#define AE_SUITE 'MQem'
-#define AE_PING  'Ping'
+/* The suite and command codes come from the C table -- one handler per
+ * event id, because NSAppleEventManager dispatches exact (class, id)
+ * pairs and a handler for one id does not serve another in the same
+ * suite.  Mixed case on purpose: Apple reserves all-lowercase codes. */
+static uint32_t g_classes[16];
+static uint32_t g_ids[16];
+static size_t g_ncodes;
 
 static id g_handler;
 
@@ -46,16 +49,18 @@ static id g_handler;
     NSAppleEventDescriptor *direct, *result;
     char *out = NULL;
 
-    /* The direct parameter is the JSON command object; omitted means
-     * ping, which is every command E0 has. */
+    /* The direct parameter, when present, is a JSON object of
+     * arguments; the event id itself names the command. */
     direct = [event descriptorForKeyword:keyDirectObject];
     if (direct) {
         cmd = [direct stringValue];
     }
-    metal_log("apple event: command %s",
-              cmd ? [cmd UTF8String] : "(ping)");
+    metal_log("apple event: command %s (event class 0x%08x id 0x%08x)",
+              cmd ? [cmd UTF8String] : "(by event id)",
+              (unsigned)event.eventClass, (unsigned)event.eventID);
 
-    metal_glue_script(cmd ? [cmd UTF8String] : "{\"cmd\":\"ping\"}", &out);
+    metal_glue_script(event.eventClass, event.eventID,
+                      cmd ? [cmd UTF8String] : NULL, &out);
     result = [NSAppleEventDescriptor
         descriptorWithString:[NSString stringWithUTF8String:
             out ? out
@@ -63,23 +68,34 @@ static id g_handler;
                   "\"number\":5,\"message\":\"no reply\"}}"]];
     g_free(out);
     [reply setDescriptor:result forKeyword:keyDirectObject];
+    metal_log("apple event: replied %zu bytes", strlen(out ?: ""));
 }
 
 @end
 
-void metal_script_init(void)
+/* Idempotent: called at backend init and again once the pump has run
+ * finishLaunching, in case AppKit's own scripting initialisation (the
+ * NSAppleScriptEnabled machinery) installs its handler set after ours
+ * and pre-empts it. */
+void metal_script_register(void)
 {
-    /* The dev kill switch; the settings file and the display suboption
-     * arrive with the rest of the surface (SCRIPTING.md section 7). */
+    NSAppleEventManager *em = [NSAppleEventManager sharedAppleEventManager];
+    size_t n, i;
+
     if (getenv("RISCOSQEMU_SCRIPTING_OFF")) {
-        metal_log("apple events: off (RISCOSQEMU_SCRIPTING_OFF)");
         return;
     }
-
-    g_handler = [[MetalScriptHandler alloc] init];
-    [[NSAppleEventManager sharedAppleEventManager]
-        setEventHandler:g_handler
-            andSelector:@selector(handleEvent:withReplyEvent:)
-        forEventClass:AE_SUITE andEventID:AE_PING];
-    metal_log("apple events: 'MQem' handler registered");
+    if (!g_handler) {
+        g_handler = [[MetalScriptHandler alloc] init];
+    }
+    if (!g_ncodes) {
+        g_ncodes = metal_glue_script_events(g_classes, g_ids, 16);
+    }
+    n = g_ncodes;
+    for (i = 0; i < n; i++) {
+        [em setEventHandler:g_handler
+                  andSelector:@selector(handleEvent:withReplyEvent:)
+              forEventClass:g_classes[i] andEventID:g_ids[i]];
+    }
+    metal_log("apple events: %zu handler%s registered", n, n == 1 ? "" : "s");
 }

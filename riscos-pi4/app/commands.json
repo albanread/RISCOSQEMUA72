@@ -1,0 +1,21 @@
+{
+  "surface": 1,
+  "suite": "MQem",
+  "reply": "JSON envelope: {ok, data | error, elapsed_ms, machine}",
+  "commands": [
+    {
+      "name": "ping",
+      "code": "MQemPing",
+      "help": "Round-trip a command through the surface; the reply is the envelope.",
+      "args": null,
+      "class": "fast"
+    },
+    {
+      "name": "describe",
+      "code": "MQemDesc",
+      "help": "The whole command table as JSON: names, help, arguments, classes.",
+      "args": null,
+      "class": "fast"
+    }
+  ]
+}
