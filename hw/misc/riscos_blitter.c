@@ -39,11 +39,19 @@ static bool blit_geom_ok(RISCOSBlitterState *s)
  * than just the first and last because a signed stride can step out of
  * the buffer and back in again.
  */
+static Object *blit_fb(RISCOSBlitterState *s)
+{
+    if (!s->fb) {
+        s->fb = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    }
+    return s->fb;
+}
+
 static bool blit_fb_resolve(RISCOSBlitterState *s, uint64_t *addr,
                             int32_t stride, bool *have_fb)
 {
     BCM2835FBConfig cfg;
-    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
+    Object *obj = blit_fb(s);
     int64_t off = (int64_t)(uint32_t)*addr;
     uint32_t fbsize;
 
@@ -280,19 +288,82 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
  * bottom first, which the caller expresses with a negative destination
  * stride rather than this having to know.
  */
+/*
+ * Translating the source a row at a time is what a debug interface
+ * invites and it is far too slow: a page-table walk per row, and a
+ * 128-row sprite pays 128 of them to read 64K that spans sixteen
+ * pages.  Walk it a page at a time instead and keep the mapping until
+ * the rows leave that page.
+ */
+typedef struct {
+    CPUState *cpu;
+    uint64_t page;          /* guest virtual page currently mapped */
+    uint8_t *host;          /* ... and where it lives, or NULL */
+    void *mapped;
+    hwaddr maplen;
+    bool valid;
+} BlitSrcWin;
+
+static void blit_src_drop(BlitSrcWin *w)
+{
+    if (w->mapped) {
+        address_space_unmap(&address_space_memory, w->mapped, w->maplen,
+                            false, 0);
+        w->mapped = NULL;
+    }
+    w->valid = false;
+}
+
+static bool blit_src_read(BlitSrcWin *w, uint64_t va, uint8_t *dst,
+                          uint32_t len)
+{
+    while (len) {
+        uint64_t page = va & ~(uint64_t)0xfff;
+        uint32_t off = va & 0xfff;
+        uint32_t n = MIN(len, 0x1000 - off);
+
+        if (!w->valid || w->page != page) {
+            TranslateForDebugResult tres;
+            hwaddr plen = 0x1000;
+
+            blit_src_drop(w);
+            if (!cpu_translate_for_debug(w->cpu, page, &tres)) {
+                return false;
+            }
+            w->mapped = address_space_map(&address_space_memory, tres.physaddr,
+                                          &plen, false, tres.attrs);
+            if (!w->mapped || plen < 0x1000) {
+                blit_src_drop(w);
+                return false;
+            }
+            w->maplen = plen;
+            w->host = w->mapped;
+            w->page = page;
+            w->valid = true;
+        }
+        memcpy(dst, w->host + off, n);
+        dst += n;
+        va += n;
+        len -= n;
+    }
+    return true;
+}
+
 static uint32_t blit_sprite(RISCOSBlitterState *s)
 {
     BCM2835FBConfig cfg;
-    Object *obj = object_resolve_path_type("", TYPE_BCM2835_FB, NULL);
-    CPUState *cpu = current_cpu ? current_cpu : first_cpu;
-    uint8_t *row;
+    Object *obj = blit_fb(s);
+    BlitSrcWin win = { .cpu = current_cpu ? current_cpu : first_cpu };
+    uint8_t *row, *fbhost = NULL;
+    hwaddr fbmapped = 0;
     uint32_t pitch, fbsize, bpp = s->bpp;
+    uint32_t rc = BLIT_RC_OK;
     int32_t x0, y0, x1, y1;
 
     if (!obj) {
         return BLIT_RC_NOFB;
     }
-    if ((s->flags & BLIT_F_SRC_VIRT) && !cpu) {
+    if ((s->flags & BLIT_F_SRC_VIRT) && !win.cpu) {
         return BLIT_RC_FAULT;
     }
     if (bpp == 0 || bpp > 4) {
@@ -302,8 +373,8 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
     pitch = bcm2835_fb_get_pitch(&cfg);
     fbsize = bcm2835_fb_get_size(&cfg);
 
-    /* The sprite, intersected with the caller's clip rectangle and with
-     * the screen.  All inclusive, all top-left origin. */
+    /* The sprite, against the caller's clip rectangle and the screen.
+     * All inclusive, all top-left origin. */
     x0 = MAX(s->dstx, s->clipx0);
     y0 = MAX(s->dsty, s->clipy0);
     x1 = MIN(s->dstx + (int32_t)s->width - 1, s->clipx1);
@@ -313,7 +384,7 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
     x1 = MIN(x1, (int32_t)cfg.xres - 1);
     y1 = MIN(y1, (int32_t)cfg.yres - 1);
     if (x1 < x0 || y1 < y0) {
-        return BLIT_RC_OK;                  /* wholly clipped: nothing to do */
+        return BLIT_RC_OK;                  /* wholly clipped */
     }
 
     {
@@ -321,48 +392,69 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
         uint32_t h = (uint32_t)(y1 - y0 + 1);
         uint32_t skip_x = (uint32_t)(x0 - s->dstx);
         uint32_t skip_y = (uint32_t)(y0 - s->dsty);
-        uint64_t dest;
+        uint64_t first = (uint64_t)y0 * pitch + (uint64_t)x0 * bpp;
+        uint64_t span = (uint64_t)(h - 1) * pitch + (uint64_t)w * bpp;
 
         if ((uint64_t)w * bpp > BLIT_MAX_WIDTH || h > BLIT_MAX_HEIGHT) {
             return BLIT_RC_BADGEOM;
         }
+        if (first + span > fbsize) {
+            return BLIT_RC_RANGE;
+        }
         row = blit_scratch(s, w * bpp);
+        /*
+         * Mapping the whole span pays for the gaps between rows: a
+         * 128-row sprite on a 1920-wide screen spans a megabyte to
+         * write 64K, and unmapping dirties all of it.  Only worth it
+         * when the rows nearly touch; otherwise write them one at a
+         * time, which dirties exactly what changed.
+         */
+        if ((uint64_t)w * bpp * 2 >= pitch) {
+            fbhost = blit_map(cfg.base + first, span, &fbmapped);
+        }
 
         for (uint32_t j = 0; j < h; j++) {
-            uint32_t sy = skip_y + j;       /* row within the sprite */
-            uint64_t src;
+            uint32_t sy = skip_y + j;
+            uint64_t src, dest;
 
-            /* Bottom-first storage: the sprite's last row is the top one. */
             if (s->flags & BLIT_F_BOTTOM_UP) {
                 sy = s->height - 1 - sy;
             }
             src = s->src + (uint64_t)sy * s->sstride + (uint64_t)skip_x * bpp;
-            dest = cfg.base + (uint64_t)(y0 + j) * pitch + (uint64_t)x0 * bpp;
 
-            if ((uint64_t)(y0 + j) * pitch + (uint64_t)x0 * bpp + w * bpp
-                > fbsize) {
-                return BLIT_RC_RANGE;
-            }
             if (s->flags & BLIT_F_SRC_VIRT) {
-                if (cpu_memory_rw_debug(cpu, src, row, w * bpp, false) < 0) {
-                    return BLIT_RC_FAULT;
+                if (!blit_src_read(&win, src, row, w * bpp)) {
+                    rc = BLIT_RC_FAULT;
+                    break;
                 }
             } else {
                 dma_memory_read(&address_space_memory, src, row, w * bpp,
                                 MEMTXATTRS_UNSPECIFIED);
             }
-            dma_memory_write(&address_space_memory, dest, row, w * bpp,
-                             MEMTXATTRS_UNSPECIFIED);
+            if (fbhost) {
+                memcpy(fbhost + (uint64_t)j * pitch, row, w * bpp);
+            } else {
+                dest = cfg.base + first + (uint64_t)j * pitch;
+                dma_memory_write(&address_space_memory, dest, row, w * bpp,
+                                 MEMTXATTRS_UNSPECIFIED);
+            }
         }
 
-        s->n_copy++;
-        s->bytes += (uint64_t)w * h * bpp;
+        blit_src_drop(&win);
+        if (fbhost) {
+            blit_unmap(fbhost, fbmapped);
+        }
+        if (rc == BLIT_RC_OK) {
+            s->n_copy++;
+            s->bytes += (uint64_t)w * h * bpp;
+        }
     }
-    return BLIT_RC_OK;
+    return rc;
 }
 
 static void blit_go(RISCOSBlitterState *s)
 {
+    int64_t t0 = g_get_monotonic_time();
     uint32_t rc;
 
     if (!blit_geom_ok(s)) {
@@ -392,7 +484,8 @@ static void blit_go(RISCOSBlitterState *s)
     }
 
     trace_riscos_blitter_go(s->op, s->width, s->height,
-                            s->dstride, s->sstride, rc);
+                            s->dstride, s->sstride, rc,
+                            (uint32_t)(g_get_monotonic_time() - t0));
     s->status = rc;
 }
 
@@ -473,6 +566,7 @@ static void blit_reset(DeviceState *dev)
     memset(s->pattern, 0, sizeof(s->pattern));
     s->status = BLIT_RC_OK;
     s->n_fill = s->n_copy = s->bytes = 0;
+    s->fb = NULL;
     /* the scratch is a cache, not state: it survives a reset */
 }
 

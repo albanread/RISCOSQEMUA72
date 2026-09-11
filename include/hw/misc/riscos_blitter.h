@@ -135,6 +135,14 @@ struct RISCOSBlitterState {
     uint8_t *scratch;
     uint32_t scratch_len;
 
+    /*
+     * The framebuffer device, found once.  object_resolve_path_type()
+     * walks the composition tree, which is tens of microseconds -- more
+     * than a small blit costs to perform, and it was being paid on
+     * every one.  The device does not change identity.
+     */
+    Object *fb;
+
     uint32_t status;      /* of the last blit */
     uint64_t n_fill;      /* counters, for the trace and for measuring */
     uint64_t n_copy;

@@ -468,4 +468,4 @@ iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
 
 # riscos_blitter.c
-riscos_blitter_go(uint32_t op, uint32_t w, uint32_t h, int32_t ds, int32_t ss, uint32_t rc) "op %u %ux%u stride dst %d src %d -> rc %u"
+riscos_blitter_go(uint32_t op, uint32_t w, uint32_t h, int32_t ds, int32_t ss, uint32_t rc, uint32_t us) "op %u %ux%u stride dst %d src %d -> rc %u in %u us"

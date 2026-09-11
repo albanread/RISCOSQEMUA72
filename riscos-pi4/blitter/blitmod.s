@@ -67,6 +67,9 @@
     .equ    OP_SPRITE,    3
     .equ    F_SRC_VIRT,   2
     .equ    F_BOTTOM_UP,  4
+    .equ    XOS_SpriteOp,          0x2002E
+    .equ    XOS_ReadMonotonicTime, 0x20042
+    .equ    XOS_WriteC,            0x20000
 
 _start:
 base:
@@ -111,6 +114,12 @@ cmdtab:
     .word   0
     .word   sv_syntax - base
     .word   sv_help   - base
+    .asciz  "SprBench"
+    .balign 4
+    .word   cmd_sprbench - base
+    .word   0
+    .word   sb_syntax - base
+    .word   sb_help   - base
     .byte   0                       @ end of table
     .balign 4
 st_syntax:
@@ -122,6 +131,10 @@ sv_syntax:
     .asciz  "Syntax:\t*SprStats"
 sv_help:
     .asciz  "*SprStats counts the sprite plots the desktop asks for.\r"
+sb_syntax:
+    .asciz  "Syntax:\t*SprBench"
+sb_help:
+    .asciz  "*SprBench replots the last big sprite, host and guest, and times both.\r"
     .balign 4
 cmd_syntax:
     .asciz  "Syntax:\t*BlitFill"
@@ -486,6 +499,26 @@ sv_scaled_ok:
     SUB     r9, r7, r4
     SUB     r9, r9, r6              @ top edge, top origin
 
+    ADR     r10, sv_accoff
+    LDR     r10, [r10]
+    TEQ     r10, #0
+    BNE     sv_pass                 @ *SprBench turns it off to compare
+
+    @ Keep the biggest sprite seen, not the last: *SprBench replots it,
+    @ and the last one is usually a 128x128 wallpaper tile whose plot
+    @ rounds to nothing either way.
+    MUL     r10, r6, r5
+    ADR     r11, sv_lastarea
+    LDR     r11, [r11]
+    CMP     r10, r11
+    BLS     .Lsv_nokeep
+    ADR     r11, sv_lastarea
+    STR     r10, [r11]
+    ADR     r10, sv_lastspr
+    STR     r2, [r10]
+    STR     r1, [r10, #4]
+.Lsv_nokeep:
+
     ADR     r10, blit_log
     LDR     r10, [r10]
     TEQ     r10, #0
@@ -614,9 +647,106 @@ sv_accarea:
     .word   0
 sv_passarea:
     .word   0
+sv_accoff:
+    .word   0
+sv_lastspr:
+    .word   0
+    .word   0
+sv_lastarea:
+    .word   0
 sv_hexbuf:
     .space  16
     .balign 4
+
+@ ------------------------------------------------------------ *SprBench
+@ Replot the last sprite the accelerator took on, forty times, with the
+@ host doing it and then with SpriteExtend doing it.  A real sprite at
+@ a real size, and the guest's own clock, because every attempt to time
+@ this from outside was swamped by the pacing of the input driving it.
+cmd_sprbench:
+    STMFD   sp!, {r0-r9, lr}
+    ADR     r6, sv_lastspr
+    LDR     r7, [r6]
+    TEQ     r7, #0
+    BEQ     sb_none
+
+    MOV     r0, #26                 @ restore default windows: the Wimp
+    SWI     XOS_WriteC              @ leaves one that clips everything away
+
+    @ Pass one: the host does the plotting.
+    ADR     r6, sv_accoff
+    MOV     r0, #0
+    STR     r0, [r6]
+    SWI     XOS_ReadMonotonicTime
+    MOV     r9, r0
+    MOV     r8, #200
+.Lsb_l1:
+    ADR     r6, sv_lastspr
+    LDR     r2, [r6]
+    LDR     r1, [r6, #4]
+    LDR     r0, =512 + 52
+    MOV     r3, #0
+    MOV     r4, #0
+    MOV     r5, #0
+    MOV     r6, #0
+    MOV     r7, #0
+    SWI     XOS_SpriteOp
+    SUBS    r8, r8, #1
+    BNE     .Lsb_l1
+    SWI     XOS_ReadMonotonicTime
+    SUB     r0, r0, r9
+    ADR     r6, sb_host
+    STR     r0, [r6]
+
+    @ Pass two: SpriteExtend does it, exactly as before any of this.
+    ADR     r6, sv_accoff
+    MOV     r0, #1
+    STR     r0, [r6]
+    SWI     XOS_ReadMonotonicTime
+    MOV     r9, r0
+    MOV     r8, #200
+.Lsb_l2:
+    ADR     r6, sv_lastspr
+    LDR     r2, [r6]
+    LDR     r1, [r6, #4]
+    LDR     r0, =512 + 52
+    MOV     r3, #0
+    MOV     r4, #0
+    MOV     r5, #0
+    MOV     r6, #0
+    MOV     r7, #0
+    SWI     XOS_SpriteOp
+    SUBS    r8, r8, #1
+    BNE     .Lsb_l2
+    SWI     XOS_ReadMonotonicTime
+    SUB     r0, r0, r9
+    ADR     r6, sb_guest
+    STR     r0, [r6]
+
+    ADR     r6, sv_accoff
+    MOV     r0, #0
+    STR     r0, [r6]
+
+    ADR     r6, sb_host
+    MOV     r8, #2                  @ host centiseconds, then guest
+.Lsb_print:
+    LDR     r0, [r6], #4
+    ADR     r1, sv_hexbuf
+    MOV     r2, #12
+    SWI     XOS_ConvertHex8
+    SWI     XOS_Write0
+    SWI     XOS_WriteI + 32
+    SUBS    r8, r8, #1
+    BNE     .Lsb_print
+    SWI     XOS_NewLine
+sb_none:
+    MSR     CPSR_f, #0
+    LDMFD   sp!, {r0-r9, pc}
+
+sb_host:
+    .word   0
+sb_guest:
+    .word   0
 
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
