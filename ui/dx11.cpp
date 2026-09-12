@@ -1262,65 +1262,81 @@ static bool fb_failed;
  * show yet (clear instead). */
 static uint32_t frame_count;
 
-static uint32_t fb_uploads;          /* whole frames shown */
-static uint32_t fb_held;             /* frames held back, guest mid-draw */
-static uint32_t fb_forced;           /* held so long we showed one anyway */
-static unsigned fb_hold_run;         /* consecutive holds */
-
-/* How long the display may be held while the guest is still painting.
- * Emulated RISC OS repaints far slower than the real machine, so a
- * window redraw can span many of our frames; this has to outlast one or
- * the hold is pointless.  Beyond it we show what we have rather than
- * freeze. */
-#define FB_HOLD_MAX 12               /* ~200 ms at 60 Hz */
+static uint32_t fb_uploads;          /* frames copied */
+static uint32_t fb_skipped;          /* frames the copy was skipped */
+static uint32_t fb_dropped;          /* copies dropped, guest drew during */
+static bool fb_seen_damage;          /* the blitter has ever reported */
+static uint64_t fb_copy_us;          /* time actually spent copying */
 
 /*
- * A fingerprint of the guest's screen, taken either side of the copy.
- * If it changes across the copy then the guest painted while we were
- * reading, and the bytes we took are a splice of two different guest
- * states -- which during a window move is the window drawn in two
- * places at once.
- *
- * Every row is sampled, at a fixed pair of columns plus one that walks
- * across the width, so a change anywhere is likely to be seen while the
- * whole probe stays a few tens of KB against a multi-MB frame.
+ * How long the copy may be deferred while waiting for the guest to stop
+ * drawing.  Bounded for two reasons, both the Metal twin's: continuous
+ * drawing -- a drag, a scroll -- never settles and still has to animate,
+ * and text and lines are plotted straight to memory without passing
+ * through the blitter, so nothing raises the flag for them.
  */
-static uint32_t fb_probe(const Dx11FbView *v)
+#define FB_SETTLE_MAX 4              /* frames */
+
+/*
+ * A switch for measuring.  With DX11_NO_DAMAGE set the screen is copied
+ * every presented frame the way it was before, so the two behaviours can
+ * be compared inside one binary instead of across two builds.
+ */
+static bool fb_damage_gate(void)
 {
-    const uint8_t *p = (const uint8_t *)v->fb;
-    uint32_t h = 2166136261u;
-    uint32_t span;
+    static int on = -1;
 
-    if (!p || v->rows == 0 || v->pitch < 32) {
-        return 0;
+    if (on < 0) {
+        const char *e = getenv("DX11_NO_DAMAGE");
+        on = !(e && *e && *e != '0');
     }
-    span = v->pitch - 16;
-    for (uint32_t y = 0; y < v->rows; y++) {
-        const uint8_t *r = p + (size_t)y * v->pitch;
-        uint32_t cols[3] = { 0, span / 2, (y * 149u) % span };
-
-        for (int c = 0; c < 3; c++) {
-            uint32_t off = cols[c] & ~3u;
-            for (uint32_t b = 0; b < 16; b += 4) {
-                uint32_t w;
-                memcpy(&w, r + off + b, 4);
-                h = (h ^ w) * 16777619u;
-            }
-        }
-    }
-    return h;
+    return on != 0;
 }
 
+/*
+ * Copy the guest's screen, but only when it is worth copying.
+ *
+ * The blitter sets a word on the vCPU thread every time a blit lands,
+ * so one atomic read answers both of the questions that matter: has the
+ * guest drawn anything since we last looked, and is it drawing right
+ * now.  Copy when it has drawn and then stopped; skip entirely when it
+ * has not drawn at all, which at rest is most frames; and when it
+ * painted while we were reading, drop that copy rather than show a
+ * splice of two guest states.  This replaces fingerprinting the
+ * framebuffer to guess the same thing: the device already knows.
+ */
 static void fb_upload(const Dx11FbView *v)
 {
+    static bool pending;             /* drawn since we last showed a frame */
+    static unsigned held;            /* frames since we last showed one */
+    unsigned next = fb.raw_cur ^ 1u;
+    bool drew = riscos_blitter_take_damage() != 0;
+    bool settled;
     D3D11_MAPPED_SUBRESOURCE map;
     HRESULT hr;
-    unsigned next = fb.raw_cur ^ 1u;
-    uint32_t before = fb_probe(v);
-    bool whole;
 
-    /* Read into the buffer we are not showing, so a copy that turns out
-     * to be a splice costs nothing: the good one is still on screen. */
+    if (drew) {
+        fb_seen_damage = true;
+        pending = true;
+    }
+
+    /*
+     * Deliberately not the Metal twin here.  Only the blitter raises
+     * that flag, so a guest running without GVFill raises it never, and
+     * gating on it regardless would drop the whole display to the
+     * settle cadence for a guest that is drawing perfectly normally.
+     * Until the blitter has been seen at least once, copy every frame
+     * as before and cost nothing.
+     */
+    settled = pending && !drew;
+    if (fb_damage_gate() && fb_seen_damage && fb.have_good && !settled
+        && ++held < FB_SETTLE_MAX) {
+        fb_skipped++;
+        return;                      /* the previous whole frame stands */
+    }
+    held = 0;
+    pending = false;
+
     hr = dx11.context->Map(fb.raw[next], 0, D3D11_MAP_WRITE_DISCARD, 0, &map);
     if (FAILED(hr)) {
         if (frame_count % 300 == 0) {
@@ -1328,22 +1344,16 @@ static void fb_upload(const Dx11FbView *v)
         }
         return;
     }
-    memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
-    dx11.context->Unmap(fb.raw[next], 0);
-
-    whole = (fb_probe(v) == before);
-    if (whole || !fb.have_good || fb_hold_run >= FB_HOLD_MAX) {
-        if (!whole && fb.have_good) {
-            fb_forced++;        /* the guest never stopped; show it anyway */
-        }
-        fb.raw_cur = next;
-        fb.have_good = true;
-        fb_hold_run = 0;
-        fb_uploads++;
-    } else {
-        fb_held++;              /* keep the previous whole frame up */
-        fb_hold_run++;
+    {
+        LARGE_INTEGER a, b, f;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        memcpy(map.pData, v->fb, (size_t)v->pitch * v->rows);
+        QueryPerformanceCounter(&b);
+        fb_copy_us += (uint64_t)((b.QuadPart - a.QuadPart) * 1000000
+                                 / f.QuadPart);
     }
+    dx11.context->Unmap(fb.raw[next], 0);
 
     if (memcmp(fb.pal_cache, v->palette, sizeof(fb.pal_cache)) != 0) {
         memcpy(fb.pal_cache, v->palette, sizeof(fb.pal_cache));
@@ -1356,6 +1366,22 @@ static void fb_upload(const Dx11FbView *v)
             dx11_log("palette Map failed: %#x", (unsigned)hr);
         }
     }
+
+    /* Painted while we were reading?  Then the bytes we took splice two
+     * guest states; keep the last whole frame and take it again. */
+    if (riscos_blitter_take_damage()) {
+        fb_seen_damage = true;
+        pending = true;
+        if (fb_damage_gate() && fb.have_good && ++held < FB_SETTLE_MAX) {
+            fb_dropped++;
+            return;
+        }
+        held = 0;
+    }
+
+    fb.raw_cur = next;
+    fb.have_good = true;
+    fb_uploads++;
 }
 
 /*
@@ -1556,10 +1582,13 @@ static bool dx11_render_frame(void)
 
     if (++frame_count % 300 == 0) {
         dx11_log("frame %u: pipeline %s, fb gen %u, %ux%u bpp %u, "
-                 "shown %u, held %u, forced %u, mouse moves %u, buttons %u",
+                 "copied %u, skipped %u, dropped %u, copy %llu ms, "
+                 "blitter %s, mouse moves %u, buttons %u",
                  frame_count, fb.up ? "up" : "down",
                  fb.generation, fb.xres, fb.yres, fb.bpp,
-                 fb_uploads, fb_held, fb_forced,
+                 fb_uploads, fb_skipped, fb_dropped,
+                 (unsigned long long)(fb_copy_us / 1000),
+                 fb_seen_damage ? "seen" : "absent",
                  dx11.mouse_moves, dx11.mouse_buttons);
     }
     /* The status line: window title carries the guest's mode and the
@@ -1640,18 +1669,15 @@ static bool dx11_render_frame(void)
     }
 
     /*
-     * Sample the guest's screen every presented frame.
+     * Take the guest's screen when it is worth taking: fb_upload asks
+     * the blitter what the guest has drawn rather than guessing.
      *
-     * Pacing this to the guest's vsync instead was tried and made the
-     * artifact worse: the guest writes to the screen continuously, not
-     * only at the video driver's half-frame flush, so there is no quiet
-     * phase to aim at -- and holding each captured frame for two host
-     * frames simply left every tear on screen twice as long.
-     *
-     * fb_probe either side of the copy measures what is actually
-     * happening: whether the guest wrote to the framebuffer while we
-     * were reading it, which is what makes a captured frame a mix of
-     * two guest states.
+     * Pacing this to the guest's vsync was tried first and made things
+     * worse, because the Wimp does not paint on vsync -- it paints when
+     * a task next polls -- so there is no quiet phase to aim at, and
+     * holding each frame for two host frames left every tear up twice
+     * as long.  The blitter's damage word answers the question that
+     * actually matters, exactly and for free.
      */
     fb_upload(&v);
 

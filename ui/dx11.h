@@ -48,6 +48,14 @@ typedef struct Dx11FbView {
  */
 int dx11_glue_fb_view(Dx11FbView *out);
 
+/*
+ * Screen damage: a word set on the vCPU thread by the riscos-blitter
+ * whenever a blit lands, taken and cleared here.  Declared in this
+ * header rather than the device's so the C++ side can ask without
+ * dragging QOM into a .cpp file, exactly as metal.h does.
+ */
+unsigned riscos_blitter_take_damage(void);
+
 /* Drop any cached mapping (called once from the UI loop at exit). */
 void dx11_glue_fb_done(void);
 
