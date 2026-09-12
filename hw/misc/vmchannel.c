@@ -31,6 +31,40 @@
 #include <sys/statvfs.h>
 #endif
 
+/*
+ * mingw has no pread/pwrite.  The doorbell runs each op synchronously
+ * under the BQL, one at a time, so seek-transfer-seek-back is race-free
+ * where the POSIX names would be the natural spelling.
+ */
+#ifdef _WIN32
+static ssize_t vmch_pread(int fd, void *buf, size_t len, off_t off)
+{
+    off_t save = lseek(fd, 0, SEEK_CUR);
+    ssize_t n = -1;
+
+    if (save >= 0 && lseek(fd, off, SEEK_SET) >= 0) {
+        n = read(fd, buf, (unsigned int)len);
+        lseek(fd, save, SEEK_SET);
+    }
+    return n;
+}
+
+static ssize_t vmch_pwrite(int fd, const void *buf, size_t len, off_t off)
+{
+    off_t save = lseek(fd, 0, SEEK_CUR);
+    ssize_t n = -1;
+
+    if (save >= 0 && lseek(fd, off, SEEK_SET) >= 0) {
+        n = write(fd, buf, (unsigned int)len);
+        lseek(fd, save, SEEK_SET);
+    }
+    return n;
+}
+
+#define pread(fd, buf, len, off)  vmch_pread((fd), (buf), (len), (off))
+#define pwrite(fd, buf, len, off) vmch_pwrite((fd), (buf), (len), (off))
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Guest RAM access: physical, little-endian, through the system AS   */
 
