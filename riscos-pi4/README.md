@@ -12,18 +12,22 @@
 > everything below as a progress report rather than a product.
 >
 > It does now boot to a networked desktop on two hosts, with keyboard,
-> mouse and sound, which is further than that paragraph was written for.
+> mouse, sound, a filing system into directories on the host, and most of
+> the desktop's drawing done by the host — further than that paragraph
+> was ever written for.
 
 
 A QEMU fork that boots **RISC OS 5.30 on an emulated Cortex-A72 in 32-bit
 mode** — `-M raspi4b` with the CPU in AArch32 — from the RISC OS Open SD
 image to the desktop, with a USB keyboard, a mouse, an Ethernet-over-USB
 interface that takes a DHCP lease from QEMU's own network during the boot
-sequence, and **sound**. Power-on to an idle, networked desktop is about 27
-seconds on an i7-12700, and 20.8 on an M4: it runs on **macOS as well as
-Windows**, with a native front end on each.
+sequence, **sound**, and **HostFS** — a filing system whose files live in a
+directory on the host, readable and writable from the running desktop with
+no reboot. Power-on to an idle, networked desktop is about 27 seconds on an
+i7-12700, and 20.8 on an M4: it runs on **macOS as well as Windows**, with a
+native front end on each.
 
-Sound is the newest of those and the one with the least hardware behind it.
+Sound is the one with the least hardware behind it.
 RISC OS reaches the speaker through a VCHIQ service and nothing else — no
 PWM, no I2S, no VideoCore — so the fork answers the service, gathers the
 samples out of the pagelist each bulk transfer describes, and hands them to
@@ -57,8 +61,10 @@ connect handshake, a framebuffer allocated through the VideoCore property
 channel; **SDFS** from a card image on EMMC2, and the `!Boot` sequence of
 the ROOL image running off it; **USB** through the DWC2 controller —
 keyboard and mouse, on the root port or behind a hub — which on a Pi 4
-means the FIQ path RISC OS drives it from; and **networking**, RISC OS's
-`EtherUSB` binding a CDC-Ethernet `usb-net` on QEMU's user-mode network.
+means the FIQ path RISC OS drives it from; **networking**, RISC OS's
+`EtherUSB` binding a CDC-Ethernet `usb-net` on QEMU's user-mode network;
+and **HostFS**, files in and out of a running guest through a doorbell
+device.
 
 The machine now has its own **window** on both hosts: `-display dx11`
 (Sprints U0–U2) puts a Win32 window on the main thread with the guest
@@ -100,9 +106,15 @@ from the Windows waitable timer — so that thread's precision did not have
 to be reproduced. `riscos-pi4/MACOS.md` is that record, with the rest of
 the numbers.
 
-The screen is 800×600 because the firmware channel now answers
-`GET_EDID_BLOCK` with a monitor of that size and the image's own CMOS says
-MonitorType EDID; RISC OS's ScreenModes does the rest.
+The screen is 800×600 by default because the firmware channel answers
+`GET_EDID_BLOCK` with a synthetic monitor of that size and the image's own
+CMOS says MonitorType EDID; RISC OS's ScreenModes does the rest. That EDID
+is now a table — 640×480 through 1920×1200, the 16:10 sizes Macs actually
+have included — and `-global bcm2835-property.mode=1920x1200` picks the
+preferred timing; the range-limits descriptor capping the pixel clock at
+50 MHz was the gate that took finding. A mid-session mode change through
+the Display Manager rebuilds the front end's pipeline without a flicker
+(verified 32bpp → 8bpp → 32bpp in one session, and at 1920×1080 on dx11).
 
 **Sound**, through the VCHIQ audio service RISC OS actually uses:
 `BCMSound` opens `'AUDS'` and ships PCM over the channel this fork
@@ -123,20 +135,64 @@ bulk-writes a 32×32 ARGB image, moves arrive as element transactions
 committed at `UpdateSubmit`, and the window composites the sprite over
 the frame — sharp at any scale, never in guest RAM, the save-under tax
 gone from every redraw. `riscos-pi4/GPUDESIGN.md` is the design and the
-build record.
+build record. The Windows twin has landed: the D3D11 front end composites
+the same sprite through the same peer.
 
-Not working yet: `SET_CLOCK_RATE` is still NYI. There is no way to get files
-into a running guest except through the card image. The boot spends about
-five seconds reading the card at a millisecond per stall for reasons that
-are measured but not yet understood (DESIGN.md §12). A 256-colour mode and
-a mid-session mode change are implemented but not yet driven through the
-new input path. The networking claim above predates the window work and
-wants re-verifying against a fetch.
+**Host files, both ways.** `HostFS:` is a real filing system whose root is
+a directory on the host: a file dropped into the share is on the desktop
+without a reboot, a file saved from RISC OS appears on the host with honest
+metadata (type from the `,xxx` suffix, date from the mtime — the DOS-disc
+convention), and a filer module puts the share on the icon bar as a disc.
+Underneath is a doorbell device at an address the HAL does not name: the
+guest writes a request block into its own RAM and pokes a register, and
+QEMU runs the command synchronously under the BQL — no interrupts, no
+ring, nothing to migrate beyond four registers — with every host path
+clamped to the configured root. `riscos-pi4/FSDESIGN.md` is the design;
+the SMB route it replaced is dead for a structural reason (the ROM's
+LanManFS speaks SMB1 only, this Windows speaks SMB2 only), recorded with
+the evidence in `SPRINTS.md`.
+
+**The desktop's drawing is moving to the host.** A `riscos-blitter` device
+fills rectangles, copies and plots sprites straight into guest RAM at
+memory speed; `GVFill`, a soft-loaded module, claims the fill and sprite
+vectors and hands it the work, passing through everything it does not
+understand. On a 1920×1200 desktop with NetSurf and a filer window,
+**98.2% of sprite pixels** are plotted by the host, the plot itself runs
+at **6.1x** SpriteExtend's speed — 490us a plot against 80us, 62us of
+which is the host blit — and a pixel compare against the same scene
+without the module reads **0 differing pixels of 2,304,000**, re-run
+after every change. Masked sprites drew the desktop wrong and were backed
+out whole; what is still passed up is one plot-action bit whose meaning
+only the ROM's assembly veneer can settle. `riscos-pi4/blitter/README.md`
+is the build and the numbers, and `riscos-pi4/BANKS.md` is the next step
+on top of it: double-buffered desktop drawing through the second screen
+bank the kernel already allocates, so a mistimed swap shows a complete
+older frame instead of a torn one.
+
+Neither front end reads the screen on its own clock any more. dx11 steps
+its read to the guest's vsync phase and fingerprints every row either side
+of the copy, declining to show a frame it caught mid-repaint — a window
+move on an emulated machine spans many host frames, and the splice was
+the flash of a window in two places at once. The Metal front end copies
+when the blitter's flag says the guest has stopped drawing, which cut its
+framebuffer copies to **25% of frames** over 4500 measured: the desktop
+is idle almost all of the time, because the Wimp only draws when a task
+asks it to.
+
+Not working yet: `SET_CLOCK_RATE` is still NYI (the property channel now
+logs which clock it asks for). The boot spends about five seconds reading
+the card at a millisecond per stall for reasons that are measured but not
+yet understood (DESIGN.md §12). GVFill still passes up masked sprites and
+the calls carrying an unexplained plot-action bit — 56 of the 59 it
+declines. The Apple Events surface stops at E3: breakpoints, single step
+and the signing of E4–E6 are not built. The Metal settle-copy's saving is
+held to 75% — copies down to a quarter of frames — because text and lines
+are plotted straight to memory and never raise the blitter's flag.
 
 ## What it changes
 
-Four of these are plain QEMU bugs with nothing RISC OS-specific about them, and
-are candidates for upstream:
+Nine of these are plain QEMU bugs with nothing RISC OS-specific about
+them, and are candidates for upstream:
 
 | Commit | Who else it affects |
 | --- | --- |
@@ -164,6 +220,20 @@ infrastructure:
 - `hw/misc`: a **VCHIQ peer** for mailbox channel 3, plus the VC→ARM and
   ARM→VC doorbells — answering the `'AUDS'` audio and `'DISP'` pointer
   services, refusing the rest
+- `hw/misc/vmchannel.c`: the **doorbell device behind `HostFS:`** — a
+  request block written into guest RAM, run synchronously inside the MMIO
+  write under the BQL; no interrupts, no ring, nothing to migrate beyond
+  four registers, and every host path clamped to the configured root
+- `hw/misc/riscos_blitter.c`: the **blitter** — fill, copy and sprite
+  plot into guest RAM at host memory speed, reached through a doorbell at
+  `0xFD404000` whose page the guest maps with `OS_Memory 13`
+- `util/oslib-win32.c`, `util/oslib-posix.c`: **hybrid-core placement**
+  for vCPU threads — fast and slow cores are detected, but pinning
+  measured 13% slower on an i7-12700 and stays off (`QEMU_VCPU_PIN`
+  forces it); what ships is only the opt-out from the efficiency QoS
+  class, so a busy vCPU is never parked on the slow cores — on macOS the
+  same nothing-overridden choice, via the QoS ladder (`QEMU_VCPU_ECORES`
+  opts out of all of it)
 - `hw/misc/bcm2835_property`: the touch and GPIO virtual buffer tags, and the
   GPIO state tags; and **`GET_EDID_BLOCK`**, answered with an EDID block for
   an 800×600 monitor, which is what turns the 640×256 fallback into a desktop
@@ -177,6 +247,11 @@ infrastructure:
   thread, QEMU's loop on a worker, joined at the same boundary `ui/dx11.h`
   declares; MSL compiled at start-up and specialised with function
   constants, where the Windows side compiles HLSL with `D3DCompile`
+- `ui/metal_script.m`, `riscos-pi4/app/`: the **Apple Events scripting
+  surface** (sprints E0–E3 of `SCRIPTING.md`) — `ping`, `describe` and
+  the command table, lifecycle, snapshots, both screenshots, paced
+  typing, and the debugging set `hmp`/`mem`/`regs`/`pc`/`disa`/`capture`,
+  answered in a JSON envelope from inside the front end
 - `ui/dx11.c`, `ui/dx11.cpp`: the **D3D 11 windowed display** (`-display
   dx11`), Windows-only — a Win32 window and flip-model swap chain on the
   main thread, QEMU's loop on a worker, joined at an `extern "C"` boundary
@@ -188,6 +263,10 @@ infrastructure:
   the address shadowed twice over
 - `scripts/symlink-install-tree`: survive a build host without symlink
   permission — a local Windows workaround, **not** for upstream
+
+The guest side of the newest work is RISC OS modules kept in
+`riscos-pi4/`: `hostfs/` builds `HostFS,ffa` and its filer, `blitter/`
+builds `GVFill,ffa` — soft-loaded, `*RMKill`-able, no ROM splice.
 
 ## The design principle
 
@@ -279,11 +358,12 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -device usb-kbd,bus=usb-bus.0,port=1.1 \
     -device usb-tablet,bus=usb-bus.0,port=1.2 \
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 \
+    -global bcm2838-peripherals.vmchannel-root=$HOME/riscos-share \
     -display dx11 \
     -qmp tcp:127.0.0.1:4455,server,nowait
 ```
 
-Three things about that line:
+Things worth knowing about that line:
 
 - `--base CMOS` starts from the distribution's settings; without it, use
   `--filesystem 192` to boot from SDFS and expect a 640×256 desktop, since
@@ -305,6 +385,13 @@ Three things about that line:
   and slirp's DHCP server answers during the boot. Without it, press Escape
   and the desktop arrives with the usual "Machine startup has not completed
   successfully" box.
+- `-global bcm2838-peripherals.vmchannel-root=<dir>` turns that host
+  directory into `HostFS:` inside the guest (`FSDESIGN.md`); left out, the
+  doorbell stays but file commands report off. `GVFill` rides the same
+  channel once loaded: `*RMLoad hostfs:$.GVFill,ffa`. A wider desktop is
+  one property — `-global bcm2835-property.mode=1920x1200`. On the Mac,
+  `tools/run-macos.sh` is this line with those options wrapped up
+  (`RISCOS_HOSTFS`, `MODE`), passing extra arguments through.
 
 **Both parts of the first pair are needed to reach the desktop.** A Raspberry Pi has no CMOS
 chip, so the HAL takes its settings from a blob the firmware leaves in memory
@@ -362,18 +449,23 @@ RISC OS at all. See `tools/README.md`.
 
 `riscos-pi4/DESIGN.md` is the full record: what was measured, what was tried,
 which hypotheses were wrong, and why each fix is shaped the way it is.
-`riscos-pi4/MACOS.md` is the macOS port; `riscos-pi4/SOUND.md` is the design
-for the sound that is not there yet — researched against the ROM's own
-sources, and turning out to need no audio hardware at all, because RISC OS
-reaches the speaker through the VCHIQ service this fork already owns.
+`riscos-pi4/MACOS.md` is the macOS port; `riscos-pi4/SOUND.md` is the
+research and the three sprints behind the sound — which needed no audio
+hardware at all, because RISC OS reaches the speaker through the VCHIQ
+service this fork already owns. `riscos-pi4/FSDESIGN.md` is `HostFS:` and
+the vmchannel device; `riscos-pi4/blitter/README.md` is GVFill and its
+numbers; `riscos-pi4/BANKS.md` is the double-buffering plan the blitter
+makes cheap.
 `riscos-pi4/SCRIPTING.md` designs the macOS app's Apple Events surface —
 an AppleScript/JXA control and debugging API whose first user is an AI
-agent, and the bundle and signing that go with it.
+agent — and records sprints E0–E3 as built: `describe` returns the
+command table an agent drives the machine with, and a scripted session's
+`capture` matched the same `x/i` over QMP byte for byte.
 `riscos-pi4/GPUDESIGN.md` expands Sprint 13 for the Mac, its scope
 settled by reading the ROOL ROM sources tree-wide: the pointer as a
-sprite the host answers for over `'DISP'`, the sprite plots accelerated
-through a `SpriteV` module — and the rectangle fill deferred until the
-project builds its own ROM and a real blitter device with it.
+sprite the host answers for over `'DISP'`, and the sprite plots and
+fills accelerated through a `SpriteV` module and a blitter device that
+arrived without waiting for a ROM build of our own.
 
 ## Licence
 
