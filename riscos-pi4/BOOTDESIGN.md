@@ -395,6 +395,13 @@ risk in our code:
 
 ### 5.5 Measurement
 
+**Measured 13 Sep; the numbers are in `FSDESIGN-V1.md` §13 B2.** In short:
+HostFS boots in 14.4 s against the card's 15.7 s, with 2,657 doorbells
+against 2.4 million SDHCI register accesses — and 0.1 s of host time. §5.3's
+"one to two orders of magnitude" holds for crossings, not for wall-clock,
+because under TCG the emulated CPU, not the crossings, is what a boot
+waits on. The rest of this section is the plan as written.
+
 Instrument both: count MMIO accesses for an SD boot against
 filing-system calls for a HostFS boot.  That ratio carries most of the
 argument, and it stays honest later when someone optimises the SD model
@@ -437,6 +444,10 @@ What is worth designing:
 ---
 
 ## 7. CMOS has to persist
+
+**Built 13 Sep, as neither option below:** HostFS keeps CMOS in the share
+the way SDCMOS keeps it on a card, and the launcher boots from that file
+(`FSDESIGN-V1.md` §13 B2). No device and no HAL change was needed.
 
 `*Configure FileSystem HostFS` and `*Configure Boot` are how the boot
 source is chosen, and they live in CMOS.  Today the CMOS blob is static:

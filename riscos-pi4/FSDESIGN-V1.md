@@ -912,6 +912,7 @@ Measured on the Mac Pi 4 machine, TCG, soft-loaded module:
 | D1 Icon and Filer | HostFSFiler 2.00 on RAMFSFiler's pattern, also from ROM; Free_Register and Func 35 | cold boot: icon present; click opens the share with real icons; double-click opens Text; Free window shows the host volume |
 | D2 A disc in the Filer | Func/File 8 create directory, Args 8 write zeroes, File 10 block size | by mouse: new directory, drag-copy both ways, Info, rename, delete — each checked on the host |
 | B1 Boot off it | Func 10 runs `&.!Boot`; `RISCOS_BOOT=hostfs`; names: Latin-1/UTF-8, typed names round trip, directories take no type | no card attached: clean desktop from the share in 13.5–14.3 s, as the SD boot; 2,668 doorbells |
+| B2 Persistence, measurement | CMOS kept on the share (SDCMOS's job); SD vs HostFS boot measured | `*Configure` survives power-off; boot 14.4 s vs 15.7 s; 2.4 M MMIO traps vs 2.7 k doorbells; 0.1 s host time |
 
 ### The acceptance rule for everything below
 
@@ -1107,12 +1108,41 @@ option 2; Func 27 reports 2 when there is a `!Boot`):
   whatever the scans cost is lost in the emulated CPU's time. It moves to B2,
   to be justified by measurement if at all.
 
-### B2 — persistence and measurement
+### B2 — persistence and measurement: done
 
-Persistent CMOS, so `*Configure` survives power-off; the SD-versus-HostFS
-boot comparison of `BOOTDESIGN.md` §5.5, as MMIO accesses against
-filing-system calls and wall-clock; and the typed-name index, only if that
-comparison finds the scans costing something.
+Done 13 Sep.
+
+**CMOS persists.** SDCMOS saves a Pi's CMOS to the card after every write
+and unloads itself without one, so a HostFS boot kept nothing. HostFS now
+does SDCMOS's job for the share: after start-up, if the configured filing
+system is HostFS and the share holds `$.CMOS` (type Configuration), it
+claims ByteV and runs `*SaveCMOS HostFS:$.CMOS` after every CMOS write —
+the 2,052-byte blob the HAL loads. `RISCOS_BOOT=hostfs` boots from that
+file, seeding it from `cmos.bin` the first time, with FileSystem HostFS
+forced. Verified: `*Configure Delay 20`, power off, relaunch, and `*Status
+Delay` says 20. A share that is not the boot disc is never written to.
+
+**The measurement** (`BOOTDESIGN.md` §5.5), the same ROM, the same tree —
+the card's `BootDDE` taken out so that card and share boot identical
+`!Boot`s — on the Mac under TCG, to a settled desktop:
+
+| | SD card | HostFS |
+| --- | --- | --- |
+| wall-clock, 3 runs | 16.3, 15.1, 15.8 s (15.7) | 14.0, 14.5, 14.8 s (14.4) |
+| host crossings | 2,434,544 SDHCI register accesses | 2,657 doorbells |
+| of which data | 2,351,650 reads of the buffer data port | 311 reads, whole |
+| device commands | 827 (730 CMD18, 26 CMD25) | — |
+| host time in the device | not measured | 0.103 s in all (39 µs a request) |
+
+HostFS is faster by 1.3 s, 8%: the boot is bound by the emulated CPU, and
+under TCG an MMIO access is a function call, not an exit, so nine hundred
+times fewer crossings buy little. Under hardware virtualisation each of
+those 2.4 million accesses would be a VM exit, and the gap would be the
+design's argument; under TCG it is a footnote.
+
+**The typed-name index is not worth building.** The 722 lookups that miss
+and scan a directory cost 33 ms of a 14.8 s boot. It stays unbuilt until a
+workload says otherwise.
 
 ### Edges, folded in where they start to matter
 
