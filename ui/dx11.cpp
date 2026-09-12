@@ -170,7 +170,6 @@ static void dx11_mouse_send_abs(int gx, int gy);
 static struct {
     bool have_last;
     int last_x, last_y;
-    bool swallow_up;                /* the middle-up of a grab click */
     /* the guest pointer position we last sent, in guest pixels: the
      * anchor for relative motion while grabbed (absolute while not) */
     int gx, gy;
@@ -396,15 +395,15 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_RBUTTONDOWN:
-        if (!kbd.on && msg == WM_MBUTTONDOWN) {
-            /* Middle click captures the pointer (Ctrl+Alt+G or focus
-             * loss releases).  Left clicks go straight through to the
-             * guest now that the tablet keeps the two arrows together,
-             * so entering the window costs nothing. */
-            dx11_set_grab(true);
-            mouse.swallow_up = true;   /* balance: the down was ours */
-            return 0;
-        }
+        /*
+         * All three buttons belong to the guest.  RISC OS is built on
+         * them -- Select, Menu, Adjust -- and Menu is the middle one,
+         * the button the desktop uses most: a front end that keeps it
+         * for itself leaves the guest unable to open a menu at all.
+         * The grab is Ctrl+Alt+G, and since the tablet keeps the host
+         * and guest pointers together there is nothing to grab for in
+         * ordinary use anyway.
+         */
         SetCapture(h);                  /* the up arrives even outside */
         dx11_glue_mouse_btn(msg == WM_LBUTTONDOWN ? 0
                             : msg == WM_MBUTTONDOWN ? 1 : 2, true);
@@ -413,10 +412,6 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_LBUTTONUP:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP:
-        if (msg == WM_MBUTTONUP && mouse.swallow_up) {
-            mouse.swallow_up = false;
-            return 0;
-        }
         dx11_glue_mouse_btn(msg == WM_LBUTTONUP ? 0
                             : msg == WM_MBUTTONUP ? 1 : 2, false);
         if (!(w & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON))) {
