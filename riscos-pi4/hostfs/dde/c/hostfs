@@ -129,6 +129,11 @@ _kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
 /* in s.head: OS_FSControl 12 with the information block there */
 _kernel_oserror *hostfs_register(void *pw);
 
+/* in s.head: Free_Register (or with deregister, Free_DeRegister) so that
+ * *ShowFree and the filer's Free window can read HostFS's free space */
+struct hostws;
+_kernel_oserror *hostfs_free_register(struct hostws *ws, int deregister);
+
 /* in s.head: the constant error blocks, by number, in its table's order */
 _kernel_oserror *hostfs_error(int which);
 #define ERR_NOTFOUND     0
@@ -207,6 +212,8 @@ struct catent {
  * blocks and the FS information block.
  */
 struct hostws {
+    uint32_t w_freesave[8];             /* FreeEntry's registers, in s.head:
+                                         * it must be first */
     volatile uint32_t *w_vmch;          /* doorbell, from OS_Memory 13 */
     struct vmreq *w_req;                /* page-aligned inside w_reqstore */
     uint32_t w_req_phys;                /* its physical address */
@@ -1060,6 +1067,24 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         r->r[2] = (int)REQW(2);         /* disc size */
         return NULL;
 
+    case 35:                           /* read free space in 64 bits:
+                                        * OS_FSControl 55, which the Free
+                                        * module's window asks first */
+        req->cmd = C_FS_FUNC;
+        req->handle = 0;
+        REQW(0) = 35;
+        put_path(ws, (const char *)r->r[1]);
+        rc = vmch_go(ws);
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        r->r[0] = (int)REQW(0);         /* free space, low word */
+        r->r[1] = (int)REQW(1);         /* free space, high word */
+        r->r[2] = (int)REQW(2);         /* biggest object creatable */
+        r->r[3] = (int)REQW(3);         /* disc size, low word */
+        r->r[4] = (int)REQW(4);         /* disc size, high word */
+        return NULL;
+
     case 16:                           /* shutdown */
     case 17:                           /* print banner */
     case 28:                           /* WriteBootOption: no-op */
@@ -1265,6 +1290,9 @@ _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
     }
 
     registered = 1;
+
+    /* Free space for *ShowFree.  No Free module is no reason to refuse. */
+    (void)hostfs_free_register(ws, 0);
     return NULL;
 }
 
@@ -1289,6 +1317,7 @@ _kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw)
                 (void)vmch_req_close(ws, h);
             }
         }
+        (void)hostfs_free_register(ws, 1);
         r.r[0] = 16;                     /* FSControl_RemoveFS, by name */
         r.r[1] = (int)DISC_NAME;
         (void)swix(XOS_FSControl, &r, &r);

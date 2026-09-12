@@ -32,11 +32,14 @@
 
         EXPORT  swix
         EXPORT  hostfs_register
+        EXPORT  hostfs_free_register
         EXPORT  hostfs_error
 
 V_bit           *       1 :SHL: 28
 XOS_FSControl   *       &20029
 XOS_CallASWIR12 *       &20071
+XFree_Register  *       &644C0
+XFree_DeRegister *      &644C1
 
 Module_Base
         DCD     0                               ; start: not an application
@@ -214,6 +217,130 @@ FSInfo
         DCD     0                               ; extra information word
 
 FSName  =       "HostFS", 0
+        ALIGN
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *hostfs_free_register(struct hostws *ws, int deregister)
+;
+; Tell the Free module how to read HostFS's free space (Free_Register), so
+; *ShowFree and the filer's Free entry work — or, with deregister non-zero,
+; stop (Free_DeRegister matches all three registers).  R2 is the value
+; FreeEntry receives in R12: the workspace.
+; ---------------------------------------------------------------------------
+hostfs_free_register
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r2, r0
+        MOV     r4, r1
+        MOV     r0, #220
+        ADRL    r1, FreeEntry
+        TEQ     r4, #0
+        BNE     %FT10
+        SWI     XFree_Register
+        B       %FT20
+; Not SWIEQ Register then SWINE DeRegister: the flags a SWI returns are its
+; own, and with Z clear after Free_Register the pair registered and then at
+; once deregistered.
+10      SWI     XFree_DeRegister
+20      MOVVC   r0, #0
+        LDMFD   sp!, {r4-r11, pc}
+
+; ---------------------------------------------------------------------------
+; FreeEntry: what the Free module calls (Desktop/Free/s/StartLoop,
+; CallEntry).  In: R0 = reason, R1 = filing system number, R2 -> buffer,
+; R3 -> device name, R12 = the workspace.
+;
+; The calling convention is not the usual one.  CallEntry enters with
+; Push "PC" and LDR PC, so the return address is on the caller's stack and
+; LR holds nothing of use (it is CallEntry's list node): return by pulling
+; PC, as the Free module's own handlers and SDFS's veneer do.  The caller may
+; be in user or SVC mode, and nothing else may go on its stack, so the
+; registers are saved in the first eight words of struct hostws
+; (w_freesave): R0 at +0, R2 at +8.  All registers are preserved except the
+; results; V set with R0 -> error.
+; ---------------------------------------------------------------------------
+FreeEntry
+        STMIA   r12, {r0-r7}
+        TEQ     r0, #1
+        BEQ     Free_GetName
+        TEQ     r0, #2
+        BEQ     Free_GetSpace
+        TEQ     r0, #3
+        BEQ     Free_ComparePath
+        TEQ     r0, #4
+        BEQ     Free_GetSpace64
+        LDMIA   r12, {r0-r7}                    ; anything else: nothing
+        LDR     pc, [sp], #4
+
+; [R2] <- the device's name; R0 = its length with the terminator.
+Free_GetName
+        ADRL    r4, FSName
+        MOV     r5, r2
+10      LDRB    r6, [r4], #1
+        STRB    r6, [r5], #1
+        TEQ     r6, #0
+        BNE     %BT10
+        SUB     r0, r5, r2
+        STR     r0, [r12]
+        LDMIA   r12, {r0-r7}
+        LDR     pc, [sp], #4
+
+; Z set if the file is on this device.  HostFS has one disc, so it is.
+Free_ComparePath
+        LDMIA   r12, {r0-r7}
+        CMP     r0, r0                          ; Z set, V clear
+        LDR     pc, [sp], #4
+
+; [R2] <- total, free and used, each 32 bits.
+Free_GetSpace
+        BL      Free_Read
+        BVS     Free_Error
+        LDR     r4, [r12, #8]
+        STR     r2, [r4, #0]
+        STR     r0, [r4, #4]
+        SUB     r2, r2, r0
+        STR     r2, [r4, #8]
+        LDMIA   r12, {r0-r7}
+        LDR     pc, [sp], #4
+
+; [R2] <- total, free and used, each 64 bits; R0 = 0 says it worked.  On
+; an error the Free module falls back to the 32-bit call, which is what an
+; older host that knows no Func 35 gets.
+Free_GetSpace64
+        MOV     r6, #0
+        MOV     r0, #55                         ; OS_FSControl 55: R0/R1 free,
+        ADRL    r1, Free_Path                   ; R3/R4 size
+        SWI     XOS_FSControl
+        BVS     Free_Error
+        LDR     r5, [r12, #8]
+        STR     r3, [r5, #0]
+        STR     r4, [r5, #4]
+        STR     r0, [r5, #8]
+        STR     r1, [r5, #12]
+        SUBS    r3, r3, r0                      ; used = size - free
+        SBC     r4, r4, r1
+        STR     r3, [r5, #16]
+        STR     r4, [r5, #20]
+        STR     r6, [r12]
+        LDMIA   r12, {r0-r7}
+        LDR     pc, [sp], #4
+
+; OS_FSControl 49 on the share: R0 = free, R2 = size.  LR goes in R5
+; because a SWI from SVC mode overwrites LR_svc.
+Free_Read
+        MOV     r5, lr
+        MOV     r0, #49
+        ADRL    r1, Free_Path
+        SWI     XOS_FSControl
+        MOV     pc, r5
+
+; Return the error: R0 -> it, V still set from the SWI.
+Free_Error
+        STR     r0, [r12]
+        LDMIA   r12, {r0-r7}
+        LDR     pc, [sp], #4
+
+Free_Path
+        =       "HostFS:$", 0
         ALIGN
 
 ; ---------------------------------------------------------------------------

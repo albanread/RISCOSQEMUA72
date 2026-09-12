@@ -1283,16 +1283,22 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
     case VMCH_CMD_FS_FUNC: {
         /*
-         * FSEntry_Func reasons the host can answer better than the module.
-         * For now only 30, read free space (PRM 2-584): R0 free, R1
-         * biggest object creatable, R2 disc size — for the volume holding
-         * the share.  *Free calls it, and so does something in !Boot, so a
-         * booting HostFS needs a plausible answer rather than an error.
+         * FSEntry_Func reasons the host can answer better than the module:
+         * the free space on the volume holding the share.
          *
-         * Func 30 is 32-bit.  A modern volume overflows it, so the values
-         * saturate at 4 GiB rather than wrapping to a small number, which
-         * would make a full disc look nearly empty or the reverse.  The
-         * 64-bit reasons (35, 36) are the answer if anything needs more.
+         * 30, read free space (PRM 2-584, OS_FSControl 49): R0 free, R1
+         * biggest object creatable, R2 disc size.  *Free calls it, and so
+         * does something in !Boot, so a booting HostFS needs a plausible
+         * answer rather than an error.  It is 32-bit, and a modern volume
+         * overflows it, so the values saturate at 4 GiB rather than
+         * wrapping to a small number, which would make a full disc look
+         * nearly empty or the reverse.
+         *
+         * 35, read free space in 64 bits (OS_FSControl 55; FileSwitch
+         * hdr/LowFSI fsfunc_ReadFreeSpace64): R0/R1 free, low and high
+         * words; R2 biggest object; R3/R4 disc size.  The Free module's
+         * window asks this first.  The biggest object stays saturated: a
+         * RISC OS file's length is 32 bits whatever the disc.
          */
         uint32_t reason = ld32(base + VMCH_HDR_REGS + 0);
         uint64_t free_b = 0, total_b = 0;
@@ -1301,7 +1307,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             rc = VMCH_RC_NOROOT;
             break;
         }
-        if (reason != 30) {
+        if (reason != 30 && reason != 35) {
             rc = VMCH_RC_BADCMD;
             break;
         }
@@ -1328,6 +1334,15 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             total_b = total.QuadPart;
         }
 #endif
+        if (reason == 35) {
+            st32(base + VMCH_HDR_REGS + 0, (uint32_t)free_b);
+            st32(base + VMCH_HDR_REGS + 4, (uint32_t)(free_b >> 32));
+            st32(base + VMCH_HDR_REGS + 8, free_b > 0xFFFFFFFFull
+                                            ? 0xFFFFFFFFu : (uint32_t)free_b);
+            st32(base + VMCH_HDR_REGS + 12, (uint32_t)total_b);
+            st32(base + VMCH_HDR_REGS + 16, (uint32_t)(total_b >> 32));
+            break;
+        }
         st32(base + VMCH_HDR_REGS + 0, free_b > 0xFFFFFFFFull
                                         ? 0xFFFFFFFFu : (uint32_t)free_b);
         st32(base + VMCH_HDR_REGS + 4, free_b > 0xFFFFFFFFull
