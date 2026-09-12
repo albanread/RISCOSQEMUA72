@@ -198,26 +198,16 @@ static void put_path(const char *path)
 /* one catalogue entry as cached from CAT */
 struct catent {
     uint32_t load, exec, len, attr, type;
-    char name[48];
+    char name[40];
 };
 static struct catent catents[128];
 
-/* load/exec for a typed, dated file: load's low byte carries
- * centiseconds 39..32, exec carries 31..0 */
-static void stamp_load_exec(uint32_t type, uint32_t cs_hi, uint32_t cs_lo,
-                            uint32_t *load, uint32_t *exec)
-{
-    if (type == 0xFFF || (cs_hi == 0 && cs_lo == 0)) {
-        *load = *exec = (type == 0xFFF) ? 0xFFFFFFFFu : 0;
-        return;
-    }
-    *load = 0xFFF00000u | (type << 8) | (cs_hi & 0xFFu);
-    *exec = cs_lo;
-}
-
-/* FILEARGS: 5-word response size,type,attr,cs_lo,cs_hi */
+/* FILEARGS response: size, type, attr, cs_lo, cs_hi, load, exec.
+ * load and exec are computed host-side; nothing in this module
+ * knows how a load address is put together any more. */
 static uint32_t info_of(const char *path, uint32_t *size, uint32_t *type,
-                        uint32_t *attr, uint32_t *cs_lo, uint32_t *cs_hi)
+                        uint32_t *attr, uint32_t *cs_lo, uint32_t *cs_hi,
+                        uint32_t *load, uint32_t *exec)
 {
     uint32_t rc;
     uint32_t *resp;
@@ -235,6 +225,8 @@ static uint32_t info_of(const char *path, uint32_t *size, uint32_t *type,
     *attr = resp[2];
     *cs_lo = resp[3];
     *cs_hi = resp[4];
+    *load = resp[5];                 /* computed host-side: the module */
+    *exec = resp[6];                 /* never has to know the format */
     return RC_OK;
 }
 
@@ -459,7 +451,7 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     }
     idx = h - 1;
 
-    rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+    rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi, &load, &exec);
     if (rc == RC_NOTFOUND) {
         size = 0;                       /* newly created file */
         type = 0xFFF;
@@ -467,7 +459,6 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
         vmch_req_close(h);
         return rc_to_error(rc);
     }
-    stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
 
     hptr[idx] = 0;
     hext[idx] = size;
@@ -668,7 +659,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     switch (reason) {
     case 5:                            /* read catalogue info */
     case 9:                            /* ...without length */
-        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
+        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi, &load, &exec);
         {
             uint32_t obj = objtype_of(rc, type);
 
@@ -681,8 +672,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
                 size = 0;
                 attr = 3;
             } else {
-                stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
-            }
+                        }
             r->r[2] = (int)load;
             r->r[3] = (int)exec;
             r->r[4] = (int)size;
@@ -826,15 +816,19 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                    | ((uint32_t)en[54] << 16) | ((uint32_t)en[55] << 24);
             e->attr = ((uint32_t)en[56]) | ((uint32_t)en[57] << 8)
                     | ((uint32_t)en[58] << 16) | ((uint32_t)en[59] << 24);
-            /* v0 leaves files undated: dates would need a FILEARGS
-             * per name; the type word still carries the filetype */
-            for (int k = 0; k < 47; k++) {
+            /* load/exec arrive ready-made at +40/+44, so a listing is
+             * dated without a FILEARGS per name */
+            e->load = ((uint32_t)en[40]) | ((uint32_t)en[41] << 8)
+                    | ((uint32_t)en[42] << 16) | ((uint32_t)en[43] << 24);
+            e->exec = ((uint32_t)en[44]) | ((uint32_t)en[45] << 8)
+                    | ((uint32_t)en[46] << 16) | ((uint32_t)en[47] << 24);
+            for (int k = 0; k < 39; k++) {
                 e->name[k] = en[k];
                 if (!en[k]) {
                     break;
                 }
             }
-            e->name[47] = 0;
+            e->name[39] = 0;
         }
 
         /* fill the caller's buffer from the continuation offset */
@@ -850,11 +844,12 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                 break;
             }
             if (e->type == 0) {
-                load = exec = 0;
+                load = exec = 0;        /* directories carry neither */
                 e->len = 0;
                 e->attr = 3;
             } else {
-                stamp_load_exec(e->type, 0, 0, &load, &exec);
+                load = e->load;
+                exec = e->exec;
             }
             {
                 uint32_t *w = (uint32_t *)buf;

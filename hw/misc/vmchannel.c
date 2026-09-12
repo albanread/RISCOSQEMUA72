@@ -283,10 +283,77 @@ static bool win32_reserved(const char *name, size_t len)
  * set.  The guest path must start with '$' and consist of plain
  * components separated by '.'.
  */
+static char *guest_leaf_of(const char *host_leaf, bool is_dir,
+                           uint32_t *type);
+
+/*
+ * The real host leafname inside `dir` that RISC OS would call `want`.
+ *
+ * The fast path is one stat: `readme/txt` is `readme.txt` on the host, so
+ * translating slashes back to dots usually hits.  Only when that misses
+ * does it read the directory and forward-map every entry, which is what
+ * finds `notes` inside `notes,ffb` — the suffix is consumed by the
+ * presented name, so it cannot be recovered by rewriting the wanted one.
+ * That scan is also where case-insensitivity happens: RISC OS is
+ * case-blind, and a case-sensitive host would otherwise hide files.
+ *
+ * Returns an allocated host path.  A name that matches nothing comes back
+ * as the literal translation, so CREATE can make it.
+ */
+static char *resolve_leaf(const char *dir, const char *want)
+{
+    char *naive = g_strdup(want);
+    char *cand;
+    GStatBuf st;
+    GDir *d;
+    const char *name;
+    char *found = NULL;
+
+    for (char *q = naive; *q; q++) {
+        if (*q == '/') {
+            *q = '.';
+        }
+    }
+    cand = g_build_filename(dir, naive, NULL);
+    if (g_stat(cand, &st) == 0) {
+        g_free(naive);
+        return cand;
+    }
+    g_free(cand);
+
+    d = g_dir_open(dir, 0, NULL);
+    if (d) {
+        while ((name = g_dir_read_name(d)) != NULL) {
+            char *one = g_build_filename(dir, name, NULL);
+            GStatBuf est;
+            bool isdir = g_stat(one, &est) == 0 && S_ISDIR(est.st_mode);
+            uint32_t type;
+            char *leaf = guest_leaf_of(name, isdir, &type);
+
+            if (g_ascii_strcasecmp(leaf, want) == 0) {
+                g_free(leaf);
+                found = one;
+                break;
+            }
+            g_free(leaf);
+            g_free(one);
+        }
+        g_dir_close(d);
+    }
+    if (found) {
+        g_free(naive);
+        return found;
+    }
+    cand = g_build_filename(dir, naive, NULL);   /* not there: for CREATE */
+    g_free(naive);
+    return cand;
+}
+
 static char *host_path(VMChannelState *s, const char *guest, int *rc)
 {
     size_t len = strlen(guest);
-    char *p, *out, *end;
+    char *cur;
+    const char *c;
 
     if (!s->root) {
         *rc = VMCH_RC_NOROOT;
@@ -297,71 +364,71 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         return NULL;
     }
 
-    /*
-     * The translated path is never longer than the guest path ('.' maps
-     * to one separator, '$' to the root), so root + separator + len + 1
-     * is a true upper bound.  The first version of this wrote the
-     * components past an allocation of root+separator and corrupted the
-     * heap on the first real OPEN/CAT/FILEARGS.
-     */
-    p = g_malloc(strlen(s->root) + 1 + len + 1);
-    strcpy(p, s->root);
-    out = p + strlen(s->root);
-    end = p + strlen(s->root) + 1 + len;
-    if (guest[1]) {
-        *out++ = G_DIR_SEPARATOR;
-    }
-
-    /* walk the rest: each component until '.' must be a plain name */
-    const char *c = guest + 1;
+    cur = g_strdup(s->root);
+    c = guest + 1;
     while (*c == '.') {
         c++;                            /* leading dots are separators */
     }
-    bool fresh = true;                  /* true: at component start */
-    char *comp = out;                   /* start of the current component */
-    for (; *c; c++) {
-        if (*c == '.') {
-            if (fresh || win32_reserved(comp, out - comp)) {
-                g_free(p);              /* "..", empty, or a device name */
+
+    while (*c) {
+        const char *e = c;
+        size_t n;
+        char *comp, *next;
+
+        while (*e && *e != '.') {
+            /* '/' is legal here: it is how RISC OS spells a dot in a
+             * foreign leafname.  Host separators are not. */
+            if (*e == '\\' || *e == ':') {
+                g_free(cur);
                 *rc = VMCH_RC_BADPATH;
                 return NULL;
             }
-            *out++ = G_DIR_SEPARATOR;
-            fresh = true;
-        } else if (*c == '/' || *c == '\\' || *c == ':') {
-            g_free(p);                  /* host separators from the guest */
+            e++;
+        }
+        n = (size_t)(e - c);
+        if (n == 0 || win32_reserved(c, n)) {
+            g_free(cur);                /* "..", empty, or a device name */
             *rc = VMCH_RC_BADPATH;
             return NULL;
-        } else {
-            if (fresh) {
-                comp = out;             /* remember where this name began */
-                fresh = false;
-            }
-            *out++ = *c;
         }
-        g_assert(out <= end);
+        comp = g_strndup(c, n);
+        next = resolve_leaf(cur, comp);
+        g_free(comp);
+        g_free(cur);
+        cur = next;
+
+        c = e;
+        while (*c == '.') {
+            c++;
+        }
     }
-    if (!fresh && win32_reserved(comp, out - comp)) {
-        g_free(p);
-        *rc = VMCH_RC_BADPATH;
-        return NULL;
+
+    /*
+     * Whatever the components said, the answer must still be inside the
+     * share: resolve it and check the prefix, so a symlink pointing out
+     * is refused like any other escape.
+     */
+    {
+        char *real = realpath(cur, NULL);
+        char *rootreal = realpath(s->root, NULL);
+        bool ok = true;
+
+        if (real && rootreal) {
+            size_t rl = strlen(rootreal);
+            ok = strncmp(real, rootreal, rl) == 0 &&
+                 (real[rl] == '\0' || real[rl] == G_DIR_SEPARATOR);
+        }
+        free(real);
+        free(rootreal);
+        if (!ok) {
+            g_free(cur);
+            *rc = VMCH_RC_BADPATH;
+            return NULL;
+        }
     }
-    if (fresh && out > p + strlen(s->root) + 1) {
-        g_free(p);                      /* trailing '.' after a component */
-        *rc = VMCH_RC_BADPATH;
-        return NULL;
-    }
-    /* Bare "$" (out at root) and "$." (out at root + separator) both
-     * name the root itself; strip a lone trailing separator so the host
-     * sees the directory, not "dir/". */
-    if (out > p + strlen(s->root) && out[-1] == G_DIR_SEPARATOR) {
-        out--;
-    }
-    *out = '\0';
-    return p;
+    return cur;
 }
 
-/* Fetch the arg text (NUL-terminated) from the block. */
 static char *arg_text(hwaddr base, uint32_t arglen)
 {
     char *p;
@@ -413,21 +480,152 @@ static int alloc_handle(VMChannelState *s)
     return -1;
 }
 
-static int riscos_type_for(const char *name, const GStatBuf *st)
-{
-    const char *comma = strrchr(name, ',');
+/*
+ * Extension -> filetype.  The table is data: VMCH_TYPEMAP names a file of
+ * "ext<TAB>type<TAB>name<TAB>description" lines, generated from ROOL's
+ * allocation list by riscos-pi4/tools/mktypemap.py.  The handful below is
+ * only a fallback for when no file is given.
+ *
+ * No entry may map to an executable type (&FFA Module, &FF8 Absolute,
+ * &FFC Utility, &FEB Obey, &FFB BASIC, &FFE Command): an extension is a
+ * guess, and a guess must not tell the desktop that a host file is code.
+ * Only an explicit ,xxx suffix may say that.  The generator enforces the
+ * same rule.
+ */
+static const struct { const char *ext; uint32_t type; } typemap_builtin[] = {
+    { "txt", 0xFFF }, { "c", 0xFFF }, { "h", 0xFFF }, { "s", 0xFFF },
+    { "cpp", 0xFFF }, { "py", 0xFFF }, { "md", 0xFFF }, { "json", 0xFFF },
+    { "log", 0xFFF }, { "csv", 0xFFF }, { "xml", 0xF80 }, { "html", 0xFAF },
+    { "htm", 0xFAF }, { "png", 0xB60 }, { "jpg", 0xC85 }, { "jpeg", 0xC85 },
+    { "gif", 0x695 }, { "pdf", 0xADF }, { "zip", 0xA91 }, { "gz", 0xF89 },
+    { "tar", 0xC46 }, { "wav", 0xFB1 }, { "mod", 0xCB6 },
+};
 
-    if (S_ISDIR(st->st_mode)) {
-        return 0;                       /* 0 = directory in RISC OS terms */
+static GHashTable *typemap;             /* lowercased ext -> type + 1 */
+
+static void typemap_load(void)
+{
+    const char *file = getenv("VMCH_TYPEMAP");
+    size_t i;
+
+    if (typemap) {
+        return;
     }
-    if (comma) {
-        char *end;
-        long t = strtol(comma + 1, &end, 16);
-        if (end != comma + 1 && *end == '\0' && t >= 0 && t < 0x1000) {
-            return (int)t;              /* "name,ff8" style suffix */
+    typemap = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    for (i = 0; i < ARRAY_SIZE(typemap_builtin); i++) {
+        g_hash_table_insert(typemap, g_strdup(typemap_builtin[i].ext),
+                            GUINT_TO_POINTER(typemap_builtin[i].type + 1));
+    }
+    if (file && *file) {
+        char *text = NULL;
+        if (g_file_get_contents(file, &text, NULL, NULL)) {
+            char **lines = g_strsplit(text, "\n", -1);
+            unsigned n = 0;
+            for (i = 0; lines[i]; i++) {
+                char **f;
+                unsigned long t;
+                char *endp;
+                if (lines[i][0] == '#' || lines[i][0] == '\0') {
+                    continue;
+                }
+                f = g_strsplit(lines[i], "\t", -1);
+                if (f[0] && f[1]) {
+                    t = strtoul(f[1], &endp, 16);
+                    if (*endp == '\0' && t < 0x1000) {
+                        g_hash_table_insert(typemap, g_ascii_strdown(f[0], -1),
+                                            GUINT_TO_POINTER((guint)t + 1));
+                        n++;
+                    }
+                }
+                g_strfreev(f);
+            }
+            g_strfreev(lines);
+            g_free(text);
+            vmch_trace("vmch: typemap %s: %u entries\n", file, n);
+        } else {
+            warn_report("vmchannel: cannot read VMCH_TYPEMAP file %s", file);
         }
     }
-    return 0xFFF;
+}
+
+static uint32_t type_for_ext(const char *ext)
+{
+    char *low;
+    gpointer v;
+
+    if (!ext || !*ext) {
+        return 0xFFF;
+    }
+    typemap_load();
+    low = g_ascii_strdown(ext, -1);
+    v = g_hash_table_lookup(typemap, low);
+    g_free(low);
+    return v ? (uint32_t)(GPOINTER_TO_UINT(v) - 1) : 0xFFF;
+}
+
+/*
+ * A host leafname as RISC OS should see it, and its filetype.
+ *
+ *   notes,ffb   -> "notes",      &FFB   the RISC OS typed-file convention;
+ *                                       the suffix is consumed, not shown
+ *   readme.txt  -> "readme/txt", &FFF   DOSFS's convention: a dot in a
+ *                                       foreign name becomes a slash, which
+ *                                       is what makes it nameable at all
+ *   hello       -> "hello",      &FFF
+ *
+ * Returns a newly allocated leafname; *type gets the filetype, or 0 for a
+ * directory.
+ */
+static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
+{
+    const char *comma = strrchr(host_leaf, ',');
+    const char *dot;
+    char *out;
+
+    if (comma && strlen(comma + 1) == 3) {
+        char *end;
+        long t = strtol(comma + 1, &end, 16);
+
+        if (end == comma + 4 && t >= 0 && t < 0x1000) {
+            *type = is_dir ? 0 : (uint32_t)t;
+            return g_strndup(host_leaf, (size_t)(comma - host_leaf));
+        }
+    }
+
+    out = g_strdup(host_leaf);
+    for (char *q = out; *q; q++) {
+        if (*q == '.') {
+            *q = '/';                   /* RISC OS cannot hold a dot here */
+        }
+    }
+    if (is_dir) {
+        *type = 0;
+        return out;
+    }
+    dot = strrchr(host_leaf, '.');
+    *type = (dot && dot != host_leaf) ? type_for_ext(dot + 1) : 0xFFF;
+    return out;
+}
+
+/* The RISC OS load/exec pair for a typed, dated file (PRM 2-542): the
+ * type and the top byte of the 5-byte instant in load, the rest in exec.
+ * Computed here so the module never has to know what a load address is —
+ * its own version special-cased &FFF to all-ones, which is why every
+ * file in a *Ex listing was untyped and undated. */
+static void load_exec_for(uint32_t type, uint64_t cs,
+                          uint32_t *load, uint32_t *exec)
+{
+    *load = 0xFFF00000u | ((type & 0xFFFu) << 8) | (uint32_t)((cs >> 32) & 0xFF);
+    *exec = (uint32_t)cs;
+}
+
+static int riscos_type_for(const char *name, const GStatBuf *st)
+{
+    uint32_t type;
+    char *leaf = guest_leaf_of(name, S_ISDIR(st->st_mode), &type);
+
+    g_free(leaf);
+    return (int)type;
 }
 
 static uint32_t attrs_for(const GStatBuf *st)
@@ -654,7 +852,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         char *path = arg_text(base, arglen);
         char *hp;
         GStatBuf st;
-        uint8_t resp[20];
+        uint8_t resp[28];
 
         if (!path) {
             rc = VMCH_RC_BADPATH;
@@ -669,15 +867,18 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
         } else {
             uint32_t size = (uint32_t)st.st_size;
-            uint32_t type = S_ISDIR(st.st_mode) ? 0
-                           : (uint32_t)riscos_type_for(path, &st);
+            uint32_t type = (uint32_t)riscos_type_for(hp, &st);
             uint64_t cs = date_cs_for(&st);
+            uint32_t load, exec;
 
+            load_exec_for(type, cs, &load, &exec);
             stl_le_p(resp + 0, size);
             stl_le_p(resp + 4, type);
             stl_le_p(resp + 8, attrs_for(&st));
             stl_le_p(resp + 12, (uint32_t)cs);
             stl_le_p(resp + 16, (uint32_t)(cs >> 32));
+            stl_le_p(resp + 20, load);
+            stl_le_p(resp + 24, exec);
             block_write(base + VMCH_HDR_SIZE, resp, sizeof(resp));
             st32(base + VMCH_HDR_ARGLEN, sizeof(resp));
         }
@@ -715,29 +916,48 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         } else {
             while ((name = g_dir_read_name(dir)) != NULL) {
                 char *one = g_build_filename(hp, name, NULL);
-                GStatBuf st;
+                GStatBuf st = { 0 };
                 uint32_t type = 0xFFF, size = 0, attrs = 3;
+                bool isdir = false;
+                char *leaf;
 
                 if (g_stat(one, &st) == 0) {
-                    type = S_ISDIR(st.st_mode) ? 0
-                          : (uint32_t)riscos_type_for(name, &st);
+                    isdir = S_ISDIR(st.st_mode);
                     size = (uint32_t)st.st_size;
                     attrs = attrs_for(&st);
                 }
                 g_free(one);
-                if (strlen(name) >= VMCH_MAX_NAME) {
+                /* The guest is shown the mapped name, not the host one:
+                 * `notes,ffb` is `notes` of type &FFB, `readme.txt` is
+                 * `readme/txt`.  Listing the raw name was why a file
+                 * could be catalogued and then not opened. */
+                leaf = guest_leaf_of(name, isdir, &type);
+                if (strlen(leaf) >= VMCH_MAX_NAME) {
+                    g_free(leaf);
                     continue;
                 }
                 if (used + 64 > limit) {
+                    g_free(leaf);
                     rc = VMCH_RC_FULL;      /* more entries than fit */
                     break;
                 }
                 memset(resp + used, 0, 64);
-                memcpy(resp + used, name, strlen(name));
+                memcpy(resp + used, leaf, strlen(leaf));
+                /* Dated here, in the entry: a catalogue that carried only
+                 * the type made every file in a *Ex listing show
+                 * 01-Jan-1900, because the only other source of a date is
+                 * a FILEARGS per name. */
+                {
+                    uint32_t load, exec;
+                    load_exec_for(type, date_cs_for(&st), &load, &exec);
+                    stl_le_p(resp + used + 40, load);
+                    stl_le_p(resp + used + 44, exec);
+                }
                 stl_le_p(resp + used + 48, type);
                 stl_le_p(resp + used + 52, size);
                 stl_le_p(resp + used + 56, attrs);
                 used += 64;
+                g_free(leaf);
             }
             g_dir_close(dir);
             if (used) {

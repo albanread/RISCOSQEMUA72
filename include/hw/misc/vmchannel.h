@@ -130,14 +130,20 @@
  *   +72 u32 attrs (RISC OS-style: bit0 owner-read, 1 write, 2 locked...)
  *   +76 u32 date low, centiseconds since 1900
  *   +80 u32 date high (the instant is 40 bits; 0 = unknown)
- * The module synthesises load/exec from type and the 40-bit date. */
+ *   +84 u32 load     ready-made: 0xFFFtttDD
+ *   +88 u32 exec     ready-made: the low 32 bits of the instant
+ * load/exec are computed here rather than in the module.  The module's
+ * own version special-cased &FFF to all-ones, so every file in a *Ex
+ * listing came back untyped and undated. */
 
 /* CAT response: array of 64-byte entries until arglen is exhausted:
- *   +0  48 bytes: name, NUL padded
+ *   +0  40 bytes: name, NUL padded (the name the guest sees: a ,xxx
+ *                 suffix consumed, a host dot shown as a slash)
+ *   +40 u32 load, +44 u32 exec   ready-made, so a listing is dated
  *   +48 u32 type, +52 u32 size, +56 u32 attrs, +60 u32 pad */
 
 #define VMCH_MAX_OPEN 16
-#define VMCH_MAX_NAME 48
+#define VMCH_MAX_NAME 40
 #define VMCH_MAX_ARG  4032   /* one page: 64-byte header + 4032 */
 
 #define TYPE_VMCHANNEL "vmchannel"

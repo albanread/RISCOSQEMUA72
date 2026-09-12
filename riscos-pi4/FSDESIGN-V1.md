@@ -548,8 +548,17 @@ header:
     Module FFA   Sprite FF9   Font FF6   Obey FEB   Squash FCA
     AIFF FC2   WaveForm FB1   HTML FAF   XML F80   JPEG C85
 
-Ship the generated table compiled in, overridable by a plain text file
-named by a device property (`typemap=`), so extensions are data.
+Ship the generated table compiled in, overridable by a plain text file,
+so extensions are data.  **As built** that file is named by the
+`VMCH_TYPEMAP` environment variable, following `VMCH_TRACE`'s precedent
+and keeping the change to one source file; a `typemap=` device property
+plumbed through `bcm2838-peripherals` like `vmchannel-root` is the tidier
+end state and is a few lines when wanted.
+
+Still to do from this section: the `naming=` write-direction policy of
+§6.3.  Reading is complete — a host file's name and type arrive correctly
+however it is spelled — but a file *created* from RISC OS is still
+written under its guest name with no type encoded.
 
 **Inference must never produce an executable type.**  Several RISC OS
 types mean "run me" when double-clicked — &FFA Module, &FF8 Absolute,
