@@ -1356,10 +1356,10 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         /*
          * FSEntry_File, the reasons that *write* metadata: 1 write
          * catalogue info, 2 write load, 3 write exec, 4 write attributes,
-         * and 7 create with a type.  The path comes inline; R0 is the
-         * reason, R2 load, R3 exec, and R5 attributes — except for reason
-         * 7, where R5 is the end address of the data (PRM 2-541) and is
-         * not an attribute word at all.
+         * 7 create with a type, and 8 create a directory.  The path comes
+         * inline; R0 is the reason, R2 load, R3 exec, and R5 attributes —
+         * except for reason 7, where R5 is the end address of the data
+         * (PRM 2-541) and is not an attribute word at all.
          *
          * Not yet handled: PRM gives 1..4 a *wildcarded* name.  A single
          * named file works; `*SetType foo* FF9` does not expand here.
@@ -1410,6 +1410,24 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             } else {
                 close(fd);
             }
+            break;
+        }
+
+        if (reason == 8) {
+            /* Create directory (PRM 2-560): *CDir, and the Filer's New
+             * directory.  One that already exists is left as it is, which
+             * the PRM allows; a file in the way is an error.  Directories
+             * carry no type or date here, so R2 and R3 need no action. */
+            GStatBuf st;
+
+            if (g_mkdir(hp, 0755) == 0) {
+                break;
+            }
+            if (errno == EEXIST && g_stat(hp, &st) == 0 && S_ISDIR(st.st_mode)) {
+                break;
+            }
+            rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND
+               : (errno == EEXIST) ? VMCH_RC_ACCESS : VMCH_RC_IOERR;
             break;
         }
 
@@ -1579,6 +1597,51 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     rc = VMCH_RC_BADADDR;
                 }
             }
+        }
+        break;
+    }
+
+    case VMCH_CMD_FS_ARGS: {
+        /*
+         * FSEntry_Args reasons the host does.  Only 8 so far, write zeroes
+         * (PRM 2-551): R1 handle, R2 file offset, R3 count.  FileSwitch
+         * calls it on a buffered filing system to grow a file past its end
+         * (s/StreamBits, ZeroFileFromPosition); both numbers are multiples
+         * of the buffer size, and the file offset rides in the request as
+         * it does for PutBytes.
+         */
+        static const uint8_t zeros[65536];
+        uint32_t reason = ld32(base + VMCH_HDR_REGS + 0);
+        int h = (int)ld32(base + VMCH_HDR_REGS + 4) - 1;
+        uint64_t off = ld32(base + VMCH_HDR_REGS + 8);
+        uint32_t count = ld32(base + VMCH_HDR_REGS + 12);
+
+        if (!s->root) {
+            rc = VMCH_RC_NOROOT;
+            break;
+        }
+        if (reason != 8) {
+            rc = VMCH_RC_BADCMD;
+            break;
+        }
+        if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
+            rc = VMCH_RC_ACCESS;
+            break;
+        }
+        while (count != 0) {
+            size_t n = MIN(count, sizeof(zeros));
+            ssize_t w = pwrite(s->fds[h], zeros, n, (off_t)off);
+
+            if (w < 0) {
+                rc = VMCH_RC_IOERR;
+                break;
+            }
+            if ((size_t)w != n) {
+                rc = VMCH_RC_FULL;
+                break;
+            }
+            off += n;
+            count -= (uint32_t)n;
         }
         break;
     }

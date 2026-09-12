@@ -80,6 +80,7 @@ struct vmreq {
  * scratch[] starts at +20, which is where R0..R7 live, so REQW(n) is Rn. */
 #define C_FS_GETBYTES 0x101
 #define C_FS_PUTBYTES 0x102
+#define C_FS_ARGS     0x103
 #define C_FS_FILE     0x105
 #define C_FS_FUNC     0x106
 #define C_RENAME      10
@@ -826,8 +827,30 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
     case 7:                            /* EnsureSize: no-op */
     case 10:                           /* ImageStampIs: image FS only */
         return NULL;
-    default:                           /* incl. 8 WriteZeroes (buffered
-                                        * only) and 11 IOCtl */
+    case 8:                            /* WriteZeroes: how FileSwitch grows
+                                        * a buffered file past its end.
+                                        * R2 offset, R3 count, both buffer
+                                        * multiples; the host writes them */
+        req->cmd = C_FS_ARGS;
+        req->handle = 0;
+        req->arglen = 0;
+        REQW(0) = 8;
+        REQW(1) = h;
+        REQW(2) = (uint32_t)r->r[2];
+        REQW(3) = (uint32_t)r->r[3];
+        {
+            uint32_t rc = vmch_go(ws);
+            uint32_t end = (uint32_t)r->r[2] + (uint32_t)r->r[3];
+
+            if (rc != RC_OK) {
+                return rc_to_error(rc);
+            }
+            if (end > hext[idx]) {
+                hext[idx] = end;
+            }
+        }
+        return NULL;
+    default:                           /* 11 IOCtl */
         return &err_unsupported;
     }
 }
@@ -903,6 +926,17 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     case 0xFF:                         /* load  */
     case 0:                            /* save  */
         return &err_retired;
+
+    case 10:                           /* read block size (OS_File 20):
+                                        * the buffer size is as natural a
+                                        * block as the host offers */
+        r->r[2] = HOSTFS_BUFSIZE;
+        return NULL;
+
+    case 8:                            /* create directory: the host makes
+                                        * it, and leaves one that exists */
+        rc = file_on_host(ws, r, name);
+        return (rc == RC_OK) ? NULL : rc_to_error(rc);
 
     case 7:                            /* create empty, of the type in R2 */
         rc = file_on_host(ws, r, name);
