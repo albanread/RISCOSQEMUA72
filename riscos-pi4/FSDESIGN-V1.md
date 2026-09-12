@@ -246,12 +246,42 @@ Honest limits, recorded so nobody rediscovers them:
     every one of these addresses, including `0x493aa000` which the same
     run had just transferred.  It samples whatever task is current.
 
-  So the open question is narrow and specific: why, at the instant the
-  module rings the doorbell on BASIC's behalf, an ARM debug walk resolves
-  `0x8f04` and refuses `0x9000` — while the guest itself can use both.
-  That is a question about how RISC OS maps a task's application slot,
-  not about QEMU's file code, and it wants an answer from someone who
-  knows the memory model rather than another experiment.
+  **Answered.**  RISC OS maps application space lazily, and the debug
+  walk was telling the truth the whole time.  The proof is one BASIC
+  line — touch every page of the buffer, then transfer, in a single
+  execution by the client itself:
+
+      FOR I%=0 TO 262143 STEP 4096:B%?I%=42:NEXT:B%?262143=42:SYS "OS_GBPB",4,X%,B%,262144 TO ,,,N%
+
+  | Touched | Result |
+  | --- | --- |
+  | nothing | 252 bytes, fails at `va=0x9000` |
+  | every 4096th byte | **258300 bytes**, fails at `va=0x48000` — the one page `STEP 4096` misses, since the last touch is offset 258048 and the buffer runs into that page |
+  | every page, last byte included | **`R3=0x40000`, `rc=0`** — the whole 256 KiB, one doorbell, `n=0`, bytes correct |
+
+  The failure address moved exactly as far as the touching did.  A page
+  the client has not faulted in has an invalid L2 entry, and
+  `cpu_translate_for_debug()` correctly reports it absent:
+
+      L1@02008000 = 02022001 type=1 domain=0
+      L2 = 00000000 type=0 domprot=1 ap=0
+      -> L2 translation fault (page not in tables)
+
+  Two earlier theories die here.  It is **not** a protection fault:
+  `fault=6` is `ARMFault_Translation`, and `domain=0` with
+  `dacr_ns=0x1` is *client*, so the domain check could never have fired.
+  And the guest's tables are **not** divergent from the walk's:
+  `ttbr0=0200804a` and the same L1 at `0x02008000` throughout, in both
+  the PAN-privileged walk and the E0 retry.
+
+  **What it means for the design.**  Nothing here can fault a page in,
+  so a transfer into a client buffer the client has not yet touched will
+  legitimately fail, and must say so.  This is also exactly why `*Copy`,
+  `*Type`, the Filer and the DDE all work: FileSwitch copies through its
+  own buffers, which are kernel memory and always resident.  A client
+  that hands its own fresh buffer to a large aligned `OS_GBPB` is the
+  one case that reaches unmapped pages, and it is the case the staging
+  fix below covers.
 
   **A fix that does not need that answer**, and which the measurements
   above show is sound: stage through memory that is known to translate.

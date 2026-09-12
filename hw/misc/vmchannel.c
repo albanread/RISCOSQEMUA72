@@ -23,6 +23,7 @@
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "qemu/error-report.h"
 #include <glib/gstdio.h>
 
@@ -79,6 +80,77 @@ static void block_write(hwaddr a, const void *buf, uint32_t len)
  */
 static void vmch_trace(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 
+/*
+ * Diagnostic: cpu_translate_for_debug() reports failure without saying
+ * which fault.  This walks the ARMv7 short-descriptor tables by hand,
+ * straight out of guest RAM via the TTBR, and prints every level so the
+ * trace names the fault itself: bad L1 type, invalid L2 type, domain,
+ * or AP.  Printed only on a translate failure, for that address.
+ */
+static void vmch_dump_walk(CPUState *cs, uint64_t addr)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+    uint32_t sctlr = env->cp15.sctlr_ns;
+    uint32_t ttbcr = env->cp15.tcr_el[1];
+    uint32_t dacr = env->cp15.dacr_ns;
+    uint32_t ttbr = env->cp15.ttbr0_el[1];
+    uint32_t mode = env->uncached_cpsr & 0x1f;
+    uint32_t l1, l2 = 0;
+    hwaddr l1addr;
+    int domain, domprot;
+
+    vmch_trace("vmch:   walk diag va=%08llx mode=%x sctlr=%08x ttbcr=%08x "
+               "dacr=%08x ttbr0=%08x\n",
+               (unsigned long long)addr, mode, sctlr, ttbcr, dacr, ttbr);
+    if (!(sctlr & 1)) {
+        vmch_trace("vmch:   MMU off — translate cannot fail, "
+                   "inconsistent\n");
+        return;
+    }
+    if ((ttbcr & 7) && addr >= (1ULL << (ttbcr & 7))) {
+        ttbr = env->cp15.ttbr1_el[1];
+        vmch_trace("vmch:   using ttbr1=%08x (TTBCR.N=%u)\n",
+                   ttbr, ttbcr & 7);
+    }
+    l1addr = (ttbr & 0xffffc000u) + ((addr >> 20) << 2);
+    l1 = ld32(l1addr);
+    vmch_trace("vmch:   L1@%08llx = %08x type=%u domain=%u\n",
+               (unsigned long long)l1addr, l1, l1 & 3, (l1 >> 5) & 0xf);
+    switch (l1 & 3) {
+    case 0:
+        vmch_trace("vmch:   -> L1 translation fault (unmapped)\n");
+        return;
+    case 2:
+        domprot = (dacr >> (((l1 >> 5) & 0xf) * 2)) & 3;
+        vmch_trace("vmch:   -> section, domain prot=%u — fault is "
+                   "domain or AP\n", domprot);
+        return;
+    case 3:
+        vmch_trace("vmch:   -> reserved L1 type\n");
+        return;
+    }
+    /* type 1: coarse second-level table, 4k small pages */
+    domain = (l1 >> 5) & 0xf;
+    domprot = (dacr >> (domain * 2)) & 3;
+    l2 = ld32((l1 & 0xfffffc00u) + (((addr >> 12) & 0xff) << 2));
+    vmch_trace("vmch:   L2 = %08x type=%u domprot=%u ap=%u "
+               "(domain=%d)\n",
+               l2, l2 & 3, domprot, ((l2 >> 4) & 3) | ((l2 >> 7) & 4),
+               domain);
+    switch (l2 & 3) {
+    case 0:
+        vmch_trace("vmch:   -> L2 translation fault (page not in tables)\n");
+        break;
+    case 1:
+        vmch_trace("vmch:   -> 64k large page\n");
+        break;
+    default:
+        vmch_trace("vmch:   -> 4k small page\n");
+        break;
+    }
+}
+
 static bool guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
 {
     CPUState *cpu = current_cpu ? current_cpu : first_cpu;
@@ -117,6 +189,7 @@ static bool guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
         if (!cpu_translate_for_debug(cpu, addr, &tres)) {
             vmch_trace("vmch: translate failed at va=%08llx\n",
                     (unsigned long long)addr);
+            vmch_dump_walk(cpu, addr);
             return false;
         }
         plen = n;

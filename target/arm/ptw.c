@@ -1175,7 +1175,17 @@ static bool get_phys_addr_v5(CPUARMState *env, S1Translate *ptw,
     if (type != 2) {
         level = 2;
     }
-    if (domain_prot == 0 || domain_prot == 2) {
+    /*
+     * A debug translation answers "where does this virtual address
+     * live", not "may this access proceed".  The AP check below is
+     * already skipped for it (in_prot_check is 0 on that path), as is
+     * the access-flag check in the long-descriptor walk.  A domain
+     * fault is a protection fault of the same kind, so it is skipped
+     * for the same reason: a debug reader that reports a mapped page as
+     * unmapped because of a protection domain is giving the wrong
+     * answer to the question it was asked.
+     */
+    if (!ptw->in_debug && (domain_prot == 0 || domain_prot == 2)) {
         fi->type = ARMFault_Domain;
         goto do_fault;
     }
@@ -1309,7 +1319,17 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
         level = 2;
     }
     domain_prot = (dacr >> (domain * 2)) & 3;
-    if (domain_prot == 0 || domain_prot == 2) {
+    /*
+     * A debug translation answers "where does this virtual address
+     * live", not "may this access proceed".  The AP check below is
+     * already skipped for it (in_prot_check is 0 on that path), as is
+     * the access-flag check in the long-descriptor walk.  A domain
+     * fault is a protection fault of the same kind, so it is skipped
+     * for the same reason: a debug reader that reports a mapped page as
+     * unmapped because of a protection domain is giving the wrong
+     * answer to the question it was asked.
+     */
+    if (!ptw->in_debug && (domain_prot == 0 || domain_prot == 2)) {
         /* Section or Page domain fault */
         fi->type = ARMFault_Domain;
         goto do_fault;
