@@ -478,6 +478,59 @@ sprite the host answers for over `'DISP'`, and the sprite plots and
 fills accelerated through a `SpriteV` module and a blitter device that
 arrived without waiting for a ROM build of our own.
 
+## The test farm
+
+`riscos-pi4/tools/farm.py` runs four named machines at once - alpha, bravo,
+charlie and delta - so a change can be tried on one while another holds a
+known-good state, and so four builds can run without waiting for each other.
+
+    python riscos-pi4/tools/farm.py create      make or repair all four
+    python riscos-pi4/tools/farm.py up all      start them (headless)
+    python riscos-pi4/tools/farm.py status      who is running, on what port
+    python riscos-pi4/tools/farm.py shot alpha  screendump
+    python riscos-pi4/tools/farm.py hmp alpha "info registers"
+    python riscos-pi4/tools/farm.py down bravo
+    python riscos-pi4/tools/farm.py reset charlie   throw away its disc writes
+
+| machine | QMP | state |
+|---|---|---|
+| alpha | 127.0.0.1:4471 | `F:\RISCOSDEV\qemu-farm\alpha` |
+| bravo | 127.0.0.1:4472 | `...\bravo` |
+| charlie | 127.0.0.1:4473 | `...\charlie` |
+| delta | 127.0.0.1:4474 | `...\delta` |
+
+4461 is left free deliberately, so `run.py` still works by hand while the
+farm is up.
+
+Three things are shared by default and each is a way for two machines to
+corrupt each other's work, so each instance gets its own:
+
+- **The disc.** A qcow2 overlay per machine over the one read-only card
+  image. Writes are private, and a new machine costs about a megabyte
+  rather than two gigabytes - four booted machines came to 9 MB between
+  them, against 8 GB for four copies of the card.
+- **The HostFS share.** This is how a compiler gets binaries into the guest
+  and results back out, so two machines sharing one host directory would
+  overwrite each other's output. Each share holds a `WhoAmI` file naming
+  its machine, which is worth more than it sounds when you are looking at
+  four identical desktops.
+- **The control port.** QMP is how anything drives a machine; one port
+  means one machine.
+
+Headless by default. Four windows is not something anyone wants, and
+driving a window means posting messages at it, which moves the real mouse
+pointer; QMP does screendumps and `input-send-event` perfectly well with no
+display at all. Pass `--display dx11` to watch one.
+
+Names rather than numbers because "charlie is wedged" is a sentence and
+"instance 2 is wedged" is a lookup.
+
+The base image is the DDE development card, so a fresh machine can compile
+without setup. Four at once is about 8 GB of guest RAM.
+
+The farm's state lives in `F:\RISCOSDEV\qemu-farm`, outside both
+repositories: overlays and build output are machine state, not source.
+
 ## Licence
 
 QEMU is GPL-2.0-or-later and this fork inherits that; see `COPYING` and
