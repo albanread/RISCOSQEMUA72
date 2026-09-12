@@ -502,6 +502,33 @@ pacer from sprint 1 stays in charge so the guest's sound loop still
 turns. `AUDIODEV=none riscos-pi4/tools/run-macos.sh` is silence that
 still boots and still runs.
 
+### Turning it on, and why it looked unimplemented
+
+Sound needs two things on the command line, and neither is a default:
+`-audiodev <driver>,id=snd0` for the backend, and
+`-global bcm2835-vchiq.audiodev=snd0` to hand it to the peer. (The
+`-audio driver=...` shorthand does both, since it becomes the default
+backend for any device that did not name one — verified here.)
+
+Without them nothing errors. The service is still accepted, the bulk
+transfers are still gathered and reported complete, and the guest's sound
+loop turns exactly as it should. The only symptom is silence, which is
+indistinguishable from sound never having been built.
+
+That is precisely what happened. `run-app.sh` and `run-macos.sh` passed
+both lines from the day sprint 1 landed; `run.py` and `farm.py` — every
+Windows path, and the whole test farm — passed neither, so sound worked
+on one host and was silent on the other for two days. Both now pass them,
+defaulting to `dsound`, with `--audiodev none` for a quiet farm.
+
+**Proving it without listening.** `-audiodev wav,id=snd0,path=out.wav`
+writes the samples to a file, which is the only evidence worth having
+from a headless run. Measured 12 Sep 2026 over a 91-second boot: peak
+amplitude 16302 of 32767, with signal at 1.0 s and 1.5 s (the boot beeps)
+and 58.5–60.0 s (BASIC `SOUND` notes). A silent capture is a file of
+zeroes at the same size, so the file growing is not the test — the peak
+is.
+
 ### What is left
 
 - **`CONTROL` is acknowledged, not applied.** Volume and output

@@ -610,6 +610,18 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         return false;
     }
 
+    /*
+     * Recording is optional, and failing to get it must not take playback
+     * down with it. A desktop with speakers and no microphone is ordinary,
+     * and there DirectSoundCapture cannot initialise at all -- so the whole
+     * audiodev failed, QEMU exited, and a guest that only ever plays got no
+     * sound because of a device it was never going to use.
+     *
+     * Leave the handle NULL instead and carry on. dsound_init_in already
+     * refuses a capture voice without it ("Attempt to initialize voice
+     * without DirectSoundCapture object"), and the release path already
+     * checks, so NULL is safe everywhere it can reach.
+     */
     hr = CoCreateInstance (
         &CLSID_DirectSoundCapture,
         NULL,
@@ -617,15 +629,16 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         &IID_IDirectSoundCapture,
         (void **) &s->dsound_capture
         );
-    if (FAILED (hr)) {
-        dserror_set(errp, hr, "Could not create DirectSoundCapture instance");
-        return false;
+    if (SUCCEEDED(hr)) {
+        hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
     }
-
-    hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
     if (FAILED(hr)) {
-        dserror_set(errp, hr, "Could not initialize DirectSoundCapture");
-        return false;
+        if (s->dsound_capture) {
+            IDirectSoundCapture_Release(s->dsound_capture);
+            s->dsound_capture = NULL;
+        }
+        warn_report("dsound: no recording device (%lx); playback still works,"
+                    " capture is unavailable", (unsigned long)hr);
     }
 
     hr = IDirectSound_SetCooperativeLevel (

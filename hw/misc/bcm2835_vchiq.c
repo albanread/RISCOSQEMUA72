@@ -177,14 +177,21 @@ static bool vchiq_queue_msg(BCM2835VchiqState *s, uint32_t msgid, uint32_t size)
  *
  * The second is that COMPLETE is the clock. BCMSound counts the bytes we
  * report in it and calls SoundDMA once per buffer's worth, so the rate we
- * send COMPLETE is the rate RISC OS generates sound at. Here that is
- * paced on the virtual clock from the format CONFIG asked for; sprint 3
- * moves it onto the audio backend, whose own consumption is the host's
- * real sound card and cannot drift against it.
+ * send COMPLETE is the rate RISC OS generates sound at. When there is an
+ * audiodev that pacing comes from the backend itself, whose consumption
+ * is the host's real sound card, so the guest cannot drift against it;
+ * without one it falls back to the virtual clock from the format CONFIG
+ * asked for, so the guest's sound loop still turns.
  *
- * This sprint plays nothing. It takes the bulk transfers and reports them
- * complete without reading a byte, which is enough to prove the guest's
- * whole sound path comes up and keeps turning.
+ * The path is complete and audible: the service is accepted, the bulk
+ * transfers are gathered out of the guest's scattered pages, and the
+ * samples reach the backend. Measured on 12 Sep 2026 by capturing to a
+ * wav backend -- boot beeps and BASIC SOUND notes both arrive, peak
+ * amplitude 16302 of 32767.
+ *
+ * What it needs is an audiodev on the command line. Without one this
+ * plays to nothing, which is indistinguishable from sound being
+ * unimplemented, so realize() says so.
  */
 
 /*
@@ -1537,8 +1544,11 @@ static void bcm2835_vchiq_realize(DeviceState *dev, Error **errp)
      */
     if (!audio_be_check(&s->audio_be, NULL)) {
         s->audio_be = NULL;
-        warn_report("bcm2835-vchiq: no audio backend; RISC OS will play "
-                    "to nothing");
+        warn_report("bcm2835-vchiq: no audiodev configured, so RISC OS "
+                    "will play to nothing. Pass -audio driver=dsound on "
+                    "Windows, coreaudio on macOS, or wav,path=FILE to "
+                    "capture it. Everything else still works, and silence "
+                    "looks exactly like sound being unimplemented.");
     }
 
     /* The fallback clock. One deadline, fired under the BQL, the same

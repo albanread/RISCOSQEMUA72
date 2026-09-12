@@ -68,6 +68,11 @@ def command_line(args, overlay):
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",
         "-device", "usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3",
+        # Sound needs both halves: a backend, and the vchiq peer told to
+        # use it. Without them the guest's sound loop still turns and you
+        # simply hear nothing, which reads as sound being unimplemented.
+        "-audiodev", f"{args.audiodev},id=snd0",
+        "-global", "bcm2835-vchiq.audiodev=snd0",
         "-display", "dx11",
         "-serial", "null",
         "-qmp", "tcp:127.0.0.1:4461,server,nowait",
@@ -178,6 +183,10 @@ def main():
     ap.add_argument("--save", metavar="NAME",
                     help="save machine + disc state under this name once "
                          "the desktop is up, then keep running")
+    ap.add_argument("--audiodev", default="dsound",
+                    help="host audio driver for the guest's sound: dsound "
+                         "(default) on Windows, coreaudio on macOS, "
+                         "wav,path=FILE to capture it, none for silence")
     ap.add_argument("--qemu", default=QEMU)
     ap.add_argument("--qemu-img", default=QEMU_IMG)
     ap.add_argument("--kernel", default=KERNEL)

@@ -208,7 +208,7 @@ def create(args):
 # ---------------------------------------------------------------------- up
 
 
-def command_line(name, port, display):
+def command_line(name, port, display, audiodev):
     p = paths(name)
     return [
         QEMU,
@@ -223,6 +223,11 @@ def command_line(name, port, display):
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",
         "-device", "usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3",
+        # Sound needs both halves: a backend, and the vchiq peer told to
+        # use it. Four machines sharing one sound card is fine -- they
+        # mix -- but --audiodev none is there for a quiet farm.
+        "-audiodev", f"{audiodev},id=snd0",
+        "-global", "bcm2835-vchiq.audiodev=snd0",
         "-display", display,
         "-serial", "null",
         "-qmp", f"tcp:127.0.0.1:{port},server,nowait",
@@ -246,7 +251,7 @@ def up(args):
             print(f"{name:<8} already up on {port}")
             continue
 
-        argv = command_line(name, port, args.display)
+        argv = command_line(name, port, args.display, args.audiodev)
         log = open(p["log"], "ab", buffering=0)
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"{' '.join(argv)}\n".encode())
@@ -407,6 +412,9 @@ def main():
     p_up.add_argument("which", nargs="?", default="all")
     p_up.add_argument("--display", default="none",
                       help="none (default) or dx11 to watch one")
+    p_up.add_argument("--audiodev", default="dsound",
+                      help="host audio driver (dsound default on Windows, "
+                           "coreaudio on macOS, none for a quiet farm)")
     p_up.set_defaults(func=up)
 
     for cmd, fn in (("down", down), ("reset", reset), ("shot", shot)):

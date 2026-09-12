@@ -369,12 +369,24 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -device usb-kbd,bus=usb-bus.0,port=1.1 \
     -device usb-tablet,bus=usb-bus.0,port=1.2 \
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 \
+    -audiodev dsound,id=snd0 \
+    -global bcm2835-vchiq.audiodev=snd0 \
     -global bcm2838-peripherals.vmchannel-root=$HOME/riscos-share \
     -display dx11 \
     -qmp tcp:127.0.0.1:4455,server,nowait
 ```
 
 Things worth knowing about that line:
+
+- **Sound needs both audio lines, and fails quietly without them.** The
+  backend (`dsound` on Windows, `coreaudio` on macOS) and the `-global`
+  that hands it to the VCHIQ peer. Leave them out and everything still
+  works — the service is accepted, the transfers are read and reported
+  complete, the guest's sound loop turns — you simply hear nothing, which
+  is indistinguishable from sound being unimplemented. The device says so
+  at start-up if you are watching stderr. `-audiodev wav,id=snd0,path=x.wav`
+  captures it to a file instead, which is how to prove it from a headless
+  run.
 
 - `--base CMOS` starts from the distribution's settings; without it, use
   `--filesystem 192` to boot from SDFS and expect a 640×256 desktop, since
