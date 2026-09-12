@@ -21,6 +21,7 @@
 #                  device present but file commands off.  A share also
 #                  puts the HostFS module in the ROM (rom.zsh)
 #   RISCOS_MODULES further modules for the ROM (rom.zsh)
+#   RISCOS_BOOT    "hostfs" boots from the share instead of the card
 #
 # Anything after the options is passed on as further QEMU arguments.
 #
@@ -37,11 +38,12 @@ done
 # The same ROM the developer's launch boots: HostFS in it with a share
 source "$HERE/rom.zsh"
 rom_to_boot "$IMAGES"
+cmos_to_boot "$IMAGES"
 
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off
     -kernel "$ROM"
-    -device loader,file="$IMAGES/cmos.bin",addr=0x510000,force-raw=on
+    -device loader,file="$CMOS",addr=0x510000,force-raw=on
     -netdev user,id=n0
     -device usb-hub,bus=usb-bus.0,port=1
     -device usb-kbd,bus=usb-bus.0,port=1.1

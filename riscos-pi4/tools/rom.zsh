@@ -1,7 +1,16 @@
-# rom.zsh — which ROM image a launcher boots.  Sourced by run-macos.sh and
-# run-app.sh, so the developer's machine and the user's start the same way.
+# rom.zsh — which ROM image and CMOS a launcher boots.  Sourced by
+# run-macos.sh and run-app.sh, so the developer's machine and the user's
+# start the same way.
 #
 #   rom_to_boot <images dir>     sets ROM to the image for -kernel
+#   cmos_to_boot <images dir>    sets CMOS to the blob for the loader
+#
+#   RISCOS_BOOT           "hostfs" boots from the share (FSDESIGN-V1.md §13
+#                         B1): the CMOS gets FileSystem HostFS, written by
+#                         mkcmos.py to cmos-hostfs.bin beside cmos.bin and
+#                         remade when cmos.bin changes.  Unset boots as
+#                         cmos.bin says.  A card stays attached either way,
+#                         and reachable as SDFS::0.
 #
 #   RISCOS_MODULES        space-separated module files spliced into the ROM
 #                         before boot (BOOTDESIGN.md §3; order = init order).
@@ -74,4 +83,36 @@ rom_to_boot() {
     else
         print "rom: cached ${ROM:t} (${#mods} module(s))"
     fi
+}
+
+cmos_to_boot() {
+    local images="$1" here="$_ROM_ZSH_DIR" out
+
+    CMOS="$images/cmos.bin"
+    case "${RISCOS_BOOT:-}" in
+    "")
+        return 0
+        ;;
+    hostfs)
+        [[ -n "${RISCOS_HOSTFS:-}" ]] || {
+            print -u2 "RISCOS_BOOT=hostfs: set RISCOS_HOSTFS to the share to boot"
+            return 1
+        }
+        out="$images/cmos-hostfs.bin"
+        if [[ ! -e "$out" || "$CMOS" -nt "$out" ]]; then
+            # 220 is HostFS's filing system number (hostfs/dde/s.head)
+            python3 "$here/mkcmos.py" --symbols "$here/cmos-symbols-530.json" \
+                --base "$CMOS" --filesystem 220 -o "$out" 2>/dev/null || {
+                print -u2 "cmos: mkcmos.py failed"
+                return 1
+            }
+            print "cmos: FileSystem HostFS -> ${out:t}"
+        fi
+        CMOS="$out"
+        ;;
+    *)
+        print -u2 "RISCOS_BOOT: '$RISCOS_BOOT' is not a boot source (hostfs, or unset)"
+        return 1
+        ;;
+    esac
 }

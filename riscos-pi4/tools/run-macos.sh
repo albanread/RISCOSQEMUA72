@@ -29,6 +29,8 @@
 #                  before boot; a share (RISCOS_HOSTFS) also splices the
 #                  HostFS module.  See rom.zsh.  With neither, the stock
 #                  RISCOS.IMG is booted untouched.
+#   RISCOS_BOOT    "hostfs" boots from the share instead of the card: the
+#                  CMOS says FileSystem HostFS (rom.zsh)
 #
 # Anything after the options is passed on to QEMU.
 #
@@ -48,11 +50,12 @@ done
 # ROM module splicing (BOOTDESIGN.md §3), and HostFS with a share
 source "$HERE/rom.zsh"
 rom_to_boot "$IMAGES"
+cmos_to_boot "$IMAGES"
 
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off
     -kernel "$ROM"
-    -device loader,file="$IMAGES/cmos.bin",addr=0x510000,force-raw=on
+    -device loader,file="$CMOS",addr=0x510000,force-raw=on
     -netdev user,id=n0
     -device usb-hub,bus=usb-bus.0,port=1
     -device usb-kbd,bus=usb-bus.0,port=1.1
