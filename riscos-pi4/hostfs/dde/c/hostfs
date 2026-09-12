@@ -144,6 +144,18 @@ static _kernel_oserror err_oldhost = { 0x1E7,
  * whatever prepared the buffer, and the offset points straight at it —
  * "+258300" says the last page was missed, which a bare "not mapped"
  * would have left to a diagnostic build to discover. */
+static _kernel_oserror err_func_buf;
+
+/* "unsupported operation" with no number turned one missing reason code
+ * into an afternoon of reading FileSwitch; say which. */
+static _kernel_oserror *unsupported_func(uint32_t reason)
+{
+    err_func_buf.errnum = 0x1E8;
+    sprintf(err_func_buf.errmess,
+            "HostFS: FSEntry_Func %u is not supported", (unsigned int)reason);
+    return &err_func_buf;
+}
+
 static _kernel_oserror err_retired = { 0x1EA,
     "HostFS: whole-file entry called despite dontuseload/dontusesave" };
 static _kernel_oserror err_badaddr_buf;
@@ -833,6 +845,47 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         return NULL;
     }
 
+    case 23: {                         /* CanonicaliseSpecialAndDisc */
+        /*
+         * PRM2 2-578.  Two phases: with R3/R4 zero, report the lengths
+         * the canonical forms need; with buffers, fill them.  HostFS has
+         * one disc and no special fields, so whatever the user typed, the
+         * canonical answer is no special field and the disc "HostFS".
+         * The buffers are FileSwitch's own, allocated from the lengths
+         * phase one returned, so they are sized and valid.
+         */
+        static const char disc[] = "HostFS";
+        uint32_t dlen = sizeof(disc) - 1;
+        char *dbuf = (char *)r->r[4];
+        uint32_t dsize = (uint32_t)r->r[6];
+        uint32_t k;
+
+        r->r[1] = 0;                    /* no special field ... */
+        r->r[3] = 0;                    /* ... so nothing overflows */
+        if (dbuf == NULL) {             /* phase 1: lengths, excluding NUL */
+            r->r[2] = 1;                /* non-zero: there is a disc name */
+            r->r[4] = (int)dlen;
+            return NULL;
+        }
+        for (k = 0; k < dlen && k + 1 < dsize; k++) {
+            dbuf[k] = disc[k];
+        }
+        if (dsize != 0) {
+            dbuf[k] = 0;
+        }
+        r->r[2] = (int)dbuf;
+        r->r[4] = (int)((dlen + 1 > dsize) ? (dlen + 1 - dsize) : 0);
+        return NULL;
+    }
+
+    case 24:                           /* ResolveWildcard */
+        /* PRM2 2-580: "If the filing system can not do a more efficient
+         * job than FileSwitch would ... return with R4 = -1".  We cannot:
+         * FileSwitch walks Func 14 and matches with RISC OS's own rules,
+         * which is exactly what should happen. */
+        r->r[4] = -1;
+        return NULL;
+
     case 30:                           /* read free space: *Free */
         req->cmd = C_FS_FUNC;
         req->handle = 0;
@@ -858,11 +911,18 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         r->r[2] = 0;
         return NULL;
 
-    case 14:                           /* read names: FileSwitch can get
-                                        * names from the info form */
-        return &err_unsupported;
+    case 14:                           /* names only           GBPB 9  */
+    case 15:                           /* names + info         GBPB 10 */
+    case 19: {                         /* + SIN and datestamp  GBPB 11 */
+        /*
+         * One directory, three record layouts (PRM2 2-572, 2-574, 2-576).
+         * All three are needed: Func 24 returning R4 = -1 hands wildcards
+         * to FileSwitch, which resolves them with Func 14 — so 14 answering
+         * "unsupported", as it used to, made every wildcarded *Cat fail the
+         * moment info-word bit 23 was set.  19 is what OS_GBPB 11 reaches.
+         */
+        uint32_t reason = (uint32_t)r->r[0];
 
-    case 15: {                         /* read names + info */
         off = (uint32_t)r->r[4];
         want = (uint32_t)r->r[3];
         buf = (uint8_t *)r->r[2];
@@ -906,41 +966,66 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
             e->name[39] = 0;
         }
 
-        /* fill the caller's buffer from the continuation offset */
+        /* fill the caller's buffer from the continuation offset, never
+         * overflowing it and counting only records written whole */
         done = 0;
         while (off < n && done < want) {
             struct catent *e = &catents[off];
+
             namelen = 0;
             while (e->name[namelen]) {
                 namelen++;
             }
-            entlen = 20 + ((namelen + 1 + 3) & ~3u);
+            if (reason == 14) {
+                entlen = namelen + 1;                   /* packed, no align */
+            } else if (reason == 15) {
+                entlen = 20 + ((namelen + 1 + 3) & ~3u);
+            } else {
+                entlen = (29 + namelen + 1 + 3) & ~3u;  /* whole record aligned */
+            }
             if (entlen > buflen) {
                 break;
             }
-            if (e->type == 0) {
-                load = exec = 0;        /* directories carry neither */
-                e->len = 0;
-                e->attr = 3;
+
+            if (reason == 14) {
+                for (uint32_t k = 0; k <= namelen; k++) {
+                    buf[k] = (uint8_t)e->name[k];
+                }
             } else {
-                load = e->load;
-                exec = e->exec;
-            }
-            {
+                uint32_t nameat = (reason == 15) ? 20u : 29u;
                 uint32_t *w = (uint32_t *)buf;
+
+                if (e->type == 0) {
+                    load = exec = 0;    /* directories carry neither */
+                    e->len = 0;
+                    e->attr = 3;
+                } else {
+                    load = e->load;
+                    exec = e->exec;
+                }
                 w[0] = load;
                 w[1] = exec;
                 w[2] = e->len;
                 w[3] = e->attr;
-                w[4] = (e->type == 0) ? 2 : 1;   /* object type: dir / file
-                                                  * (the filetype rides
-                                                  * load in w[0]) — not the
-                                                  * filetype, or *Cat and
-                                                  * the Filer read files as
-                                                  * directories (DWR/) */
-            }
-            for (uint32_t k = 0; k < ((namelen + 1 + 3) & ~3u); k++) {
-                buf[20 + k] = k <= namelen ? e->name[k] : 0;
+                w[4] = (e->type == 0) ? 2 : 1;   /* object type, not the
+                                                  * filetype — which rides
+                                                  * in load — or files read
+                                                  * as directories (DWR/) */
+                if (reason == 19) {
+                    w[5] = 0;                   /* SIN: internal, unused */
+                    /* the 5-byte instant, little-endian: exec holds its
+                     * low 32 bits and load's low byte the top 8 — built
+                     * bytewise so no 64-bit arithmetic is needed */
+                    buf[24] = (uint8_t)exec;
+                    buf[25] = (uint8_t)(exec >> 8);
+                    buf[26] = (uint8_t)(exec >> 16);
+                    buf[27] = (uint8_t)(exec >> 24);
+                    buf[28] = (uint8_t)load;
+                }
+                for (uint32_t k = nameat; k < entlen; k++) {
+                    uint32_t c = k - nameat;
+                    buf[k] = (c <= namelen) ? (uint8_t)e->name[c] : 0;
+                }
             }
             buf += entlen;
             buflen -= entlen;
@@ -953,7 +1038,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     }
 
     default:
-        return &err_unsupported;
+        return unsupported_func((uint32_t)r->r[0]);
     }
 }
 
@@ -983,8 +1068,14 @@ static void *hostfs_pw;
  * returned garbage, because only the whole-file path was exercised. */
 #define INFO_DONTUSESAVE   0x00080000u
 #define INFO_DONTUSELOAD   0x00100000u
+/* LowFSI fsinfo_multifsextensions (bit 23).  s/FSControl only dispatches
+ * ReadFreeSpace, StampImage, UsedSpaceMap, ObjectAtOffset and the defect
+ * calls to a filing system with this bit set; without it OS_FSControl 49
+ * answers "Filing system does not support this operation" without ever
+ * calling us.  It also commits us to Func 23 and Func 24, below. */
+#define INFO_MULTIFS       0x00800000u
 #define INFO_WORD (OUR_FS_NUMBER | (16u << 8) | INFO_FSFILE9_NOLEN \
-                   | INFO_DONTUSELOAD | INFO_DONTUSESAVE)
+                   | INFO_DONTUSELOAD | INFO_DONTUSESAVE | INFO_MULTIFS)
 
 _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
 {
