@@ -136,8 +136,20 @@ static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" }
 static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
 static _kernel_oserror err_oldhost = { 0x1E7,
     "HostFS: this module needs a vmchannel v1 host" };
-static _kernel_oserror err_badaddr = { 0x1E9,
-    "HostFS: transfer buffer is not mapped" };
+/* Built per-call so the offset of the first unreachable byte is in the
+ * message.  A short transfer is nearly always a partial-coverage bug in
+ * whatever prepared the buffer, and the offset points straight at it —
+ * "+258300" says the last page was missed, which a bare "not mapped"
+ * would have left to a diagnostic build to discover. */
+static _kernel_oserror err_badaddr_buf;
+
+static _kernel_oserror *badaddr_at(uint32_t off)
+{
+    err_badaddr_buf.errnum = 0x1E9;
+    sprintf(err_badaddr_buf.errmess,
+            "HostFS: transfer buffer not mapped at +%u", (unsigned int)off);
+    return &err_badaddr_buf;
+}
 
 static _kernel_oserror *rc_to_error(uint32_t rc)
 {
@@ -257,8 +269,48 @@ struct pbrec {
  * at logical address mem.  Chunks never cross a 4KB page, so each
  * translated address stays valid for the whole chunk.  Returns bytes
  * moved; the per-handle pointer is maintained by the caller. */
-static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
-                     int is_write)
+/*
+ * The host reads the guest's translation tables as they stand and cannot
+ * fault a page in.  RISC OS maps application space lazily, so a buffer
+ * the client has only just claimed is present as far as the client has
+ * touched it and no further — measured: an untouched 256 KiB DIM
+ * translates for 252 bytes, to the end of its first page, and no more.
+ *
+ * Touch it from here, one byte per page, in guest code.  That is the
+ * same access any other filing system makes when it writes the caller's
+ * buffer, and it goes through the guest's own abort handler, which is
+ * what maps the page.  A byte is read rather than written so the buffer
+ * is not disturbed if the transfer then fails.
+ *
+ * Safe only because this is the GBPB path.  PRM2 warns for FSEntry_Func
+ * 9, 10 and 11 that "the buffer pointed to by R2 will not have been
+ * validated with OS_ValidateAddress, because FileSwitch doesn't know how
+ * big the buffer has to be" — and carries no such warning for
+ * GetBytes/PutBytes, where the count is in R3 and FileSwitch does know.
+ * So a wild pointer should not reach here, only an in-slot page the
+ * client has not yet faulted in.  If one ever does, this aborts, and the
+ * fix is an OS_ValidateAddress check before the loop with the BadWrt
+ * error the PRM names.  Those Func entries must validate for themselves
+ * when they are written.
+ */
+static void touch_pages(uint32_t mem, uint32_t n)
+{
+    volatile const uint8_t *p = (volatile const uint8_t *)mem;
+    uint32_t i;
+    uint8_t sink = 0;
+
+    if (n == 0) {
+        return;
+    }
+    for (i = 0; i < n; i += 0x1000u) {
+        sink = (uint8_t)(sink | p[i]);
+    }
+    sink = (uint8_t)(sink | p[n - 1]);   /* the final partial page */
+    (void)sink;
+}
+
+static uint32_t xfer_once(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
+                          int is_write)
 {
     /* One round trip, whatever the size or alignment.  `mem` goes on the
      * wire as the guest's own logical address and the host walks the MMU
@@ -289,6 +341,22 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
         }
         return 0;
     }
+}
+
+static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
+                     int is_write)
+{
+    uint32_t moved = xfer_once(h, ptr, mem, n, is_write);
+
+    if (moved != n) {
+        /* Short: the tail of the buffer is not mapped yet.  Fault it in
+         * and go again.  One retry is enough — after touching, every
+         * page of the buffer is present — and the common case never
+         * gets here, so the fast path stays at one doorbell. */
+        touch_pages(mem, n);
+        moved = xfer_once(h, ptr, mem, n, is_write);
+    }
+    return moved;
 }
 
 
@@ -454,7 +522,7 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
      * once produced "0 bytes not transferred" over a buffer holding 252
      * good bytes and 261892 stale ones. */
     if (moved != n) {
-        return &err_badaddr;
+        return badaddr_at(moved);
     }
     return NULL;
 }
@@ -486,7 +554,7 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
         hext[idx] = hptr[idx];
     }
     if (moved != n) {           /* see fsentry_get_handler */
-        return &err_badaddr;
+        return badaddr_at(moved);
     }
     return NULL;
 }

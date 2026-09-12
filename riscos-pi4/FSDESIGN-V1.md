@@ -283,7 +283,34 @@ Honest limits, recorded so nobody rediscovers them:
   one case that reaches unmapped pages, and it is the case the staging
   fix below covers.
 
-  **A fix that does not need that answer**, and which the measurements
+  **Fixed, and the failure is now a never-event.**  The host cannot fault
+  a page in, but the guest can: `xfer()` tries the single doorbell, and
+  on a short count touches one byte per page of the caller's buffer — in
+  guest code, through the abort handler that maps application space — and
+  retries once.  Measured on a fresh untouched 256 KiB `DIM`: first
+  attempt 252 bytes, retry the full `0x40000`, `rc=0`, bytes correct.  Two
+  doorbells in the recovering case, one in the common case, because the
+  touch happens only on failure.
+
+  This is safe **because it is the GBPB path**.  PRM2 warns for
+  `FSEntry_Func` 9, 10 and 11 that *"the buffer pointed to by R2 will not
+  have been validated with OS_ValidateAddress, because FileSwitch doesn't
+  know how big the buffer has to be"*, and states the obligation
+  generally: *"It is the filing system's responsibility to validate any
+  buffer that it uses, and to return an error if the memory required is
+  not valid... look up the token BadWrt."*  No such warning appears for
+  GetBytes/PutBytes, where FileSwitch has the count in R3 — so a wild
+  pointer should not reach the touch loop, only an in-slot page that has
+  not been faulted in.  **Those Func entries must validate for themselves
+  when sprint 5 writes them**, with `OS_ValidateAddress` and the `BadWrt`
+  token.
+
+  Where the error does survive, it names the offset of the first
+  unreachable byte — `not mapped at +258300` points straight at a
+  partial-coverage bug in whatever prepared the buffer, which a bare
+  "not mapped" would leave to a diagnostic build to find.
+
+  **The staging alternative**, and which the measurements
   above show is sound: stage through memory that is known to translate.
   Dynamic-area addresses translate — that is where `0x493aa000` lives and
   it carries 256 KiB in one call — and the module can claim a block of
