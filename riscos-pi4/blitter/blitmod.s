@@ -72,7 +72,36 @@
     .equ    XOS_WriteC,            0x20000
     .equ    XOS_Module,            0x2001E
     .equ    ModClaim,              6
+    .equ    ModFree,               7
     .equ    Service_ModeChange,    0x46
+
+@ ---- the workspace: one struct claimed from the RMA, reached through
+@ the private word -- the -zM shape the DDE gives C modules, written in
+@ assembly.  Nothing in the module image is ever written after the
+@ build, so the image can live in read-only ROM.  The RMA is not
+@ guaranteed zeroed, so init zeroes the struct and then sets the one
+@ word that starts non-zero (the mode-constants cache is stale until
+@ first use).
+    .equ    WS_BLITLOG,     0       @ device logical address, 0 if absent
+    .equ    WS_OBS,         4       @ FillRectangle count
+    .equ    WS_VDUVALS,     8       @ 4 words: line, log2bpp, xwind, ywind
+    .equ    WS_HEXBUF,      24      @ 16 bytes
+    .equ    WS_SB_AREA,     40
+    .equ    WS_SB_HOST,     44
+    .equ    WS_SB_GUEST,    48
+    .equ    WS_SV_MAX,      52      @ 12 words, in *SprStats print order
+    .equ    WS_SV_COUNTS,   56      @ 6 words
+    .equ    WS_SV_N52,      80
+    .equ    WS_SV_EASY,     84
+    .equ    WS_SV_PASSED,   88
+    .equ    WS_SV_ACCAREA,  92
+    .equ    WS_SV_PASSAREA, 96
+    .equ    WS_SV_ACCOFF,   100
+    .equ    WS_SV_LASTSPR,  104     @ 2 words
+    .equ    WS_SV_LASTAREA, 112
+    .equ    WS_SV_VDUVALS,  116     @ 6 mode constants, 6 window vars
+    .equ    WS_SV_MODESTALE,164
+    .equ    WS_END,         168
 
     .equ    BENCH_W,      512             @ pixels, one word each
     .equ    BENCH_H,      512
@@ -99,7 +128,7 @@ base:
 title:
     .asciz  "GVFill"
 help:
-    .asciz  "GVFill\t1.01 (12 Sep 2026) Host-blitter fill and sprite plot, 8/16/32bpp"
+    .asciz  "GVFill\t1.02 (12 Sep 2026) ROM-safe: fill and sprite plot, 8/16/32bpp"
     .balign 4
 modflags:
     .word   1                       @ 32-bit compatible
@@ -152,38 +181,87 @@ cmd_help:
     .balign 4
 
 @ ---------------------------------------------------------------- init
-@ The device page has to be mapped before it can be touched: RISC OS
-@ builds its logical map from what the HAL asks for, so an address in
-@ the peripheral window that nothing claimed simply aborts.
+@ Claims the workspace dynamic area first: its number and base live in
+@ the private word's target, and the vectors are claimed with the
+@ private word itself so every handler arrives with r12 pointing at it.
+@ r10 and r11 carry the private word and the workspace through the SWIs
+@ (SWIs preserve r4 - r11; r12 they may not).
 init:
-    STMFD   sp!, {r1-r4, lr}
+    STMFD   sp!, {r1-r4, r9-r11, lr}
+    MOV     r10, r12                @ r10 = the private word
+
+    @ The workspace, from the RMA: the -zM shape.  ModClaim does not
+    @ promise zeroes, and one word wants to start at 1, so clear the
+    @ struct and set that word by hand.
+    @ The size goes in R3 and the block comes back in R2 -- ModHand's
+    @ RMAClaim_Chunk rounds R3 up for the heap, and a size left in the
+    @ wrong register claims a garbage-sized block whose neighbours our
+    @ zero loop then flattens.  Found the hard way: the flatten took out
+    @ our own literal pool.
+    MOV     r0, #ModClaim
+    MOV     r1, #0
+    LDR     r3, =WS_END
+    SWI     XOS_Module
+    MOVVS   r9, r0                  @ the SWI's own error block
+    BVS     init_noarea
+
+    MOV     r11, r2                 @ r11 = the workspace (exit: R2)
+    MOV     r0, #0
+    ADD     r1, r11, #WS_END
+.Lws_zero:
+    STR     r0, [r11], #4
+    CMP     r11, r1
+    BLO     .Lws_zero
+    MOV     r0, #1
+    STR     r0, [r2, #WS_SV_MODESTALE]  @ nothing cached yet
+    MOV     r11, r2
+    STR     r11, [r10]              @ the private word holds the base
+
+    @ The device page has to be mapped before it can be touched: RISC OS
+    @ builds its logical map from what the HAL asks for, so an address in
+    @ the peripheral window that nothing claimed simply aborts.
     MOV     r0, #MapIOPermanent
     LDR     r1, =BLIT_PHYS
     MOV     r2, #0x1000
     SWI     XOS_Memory
-    BVS     init_fail
-    ADR     r1, blit_log
-    STR     r3, [r1]                @ logical address of the device
+    MOVVS   r9, r0
+    BVS     init_undo
+    STR     r3, [r11, #WS_BLITLOG]
     LDR     r2, [r3]
     LDR     r4, =BLIT_MAGIC
     TEQ     r2, r4
-    BNE     init_nodev
+    ADRNE   r9, err_nodev
+    BNE     init_undo
+
     MOV     r0, #GraphicsV
     ADR     r1, gv_handler
-    MOV     r2, #0
+    MOV     r2, r10
     SWI     XOS_Claim
-    BVS     init_fail
+    MOVVS   r9, r0
+    BVS     init_undo
     MOV     r0, #SpriteV
     ADR     r1, sv_veneer
-    MOV     r2, #0
+    MOV     r2, r10
     SWI     XOS_Claim
-    BVS     init_fail
+    BVS     init_undo1
+
     MSR     CPSR_f, #0              @ V clear: no error
-    LDMFD   sp!, {r1-r4, pc}
-init_nodev:
-    ADR     r0, err_nodev
-init_fail:
-    LDMFD   sp!, {r1-r4, lr}
+    LDMFD   sp!, {r1-r4, r9-r11, pc}
+
+init_undo1:                         @ GraphicsV was claimed: release it
+    MOV     r0, #GraphicsV
+    ADR     r1, gv_handler
+    MOV     r2, r10
+    SWI     XOS_Release
+init_undo:                          @ workspace claimed: give it back
+    MOV     r0, #ModFree
+    MOV     r2, r11
+    SWI     XOS_Module
+    MOV     r0, #0
+    STR     r0, [r10]               @ the private word: nothing left
+init_noarea:
+    MOV     r0, r9
+    LDMFD   sp!, {r1-r4, r9-r11, lr}
     MSR     CPSR_f, #(1 << 28)      @ V set
     MOV     pc, lr
 
@@ -196,16 +274,26 @@ sv_veneer:
     B       sv_handler
 
 final:
-    STMFD   sp!, {r0-r2, lr}
+    STMFD   sp!, {r0-r4, r12, lr}
+    MOV     r4, r12                 @ the private word
+    LDR     r12, [r12]              @ the workspace
+    CMP     r12, #0
+    BEQ     fin_none                @ init never finished: nothing held
     MOV     r0, #SpriteV
     ADR     r1, sv_veneer
-    MOV     r2, #0
+    MOV     r2, r4                  @ the same value the claim used
     SWI     XOS_Release
     MOV     r0, #GraphicsV
     ADR     r1, gv_handler
-    MOV     r2, #0
+    MOV     r2, r4
     SWI     XOS_Release
-    LDMFD   sp!, {r0-r2, lr}
+    MOV     r0, #ModFree
+    MOV     r2, r12
+    SWI     XOS_Module
+    MOV     r0, #0
+    STR     r0, [r4]
+fin_none:
+    LDMFD   sp!, {r0-r4, r12, lr}
     MSR     CPSR_f, #0
     MOV     pc, lr
 
@@ -218,6 +306,7 @@ final:
 @ operation, the only way to learn which arrives is to look.
 gv_handler:
     STMFD   sp!, {r0-r3, r5-r11, lr}    @ not r4: the answer goes there
+    LDR     r12, [r12]                  @ workspace, via the private word
     AND     r5, r4, #0xFF
     TEQ     r5, #GraphicsV_Render
     BNE     gv_pass
@@ -248,10 +337,10 @@ gv_chk:
     @ Screen geometry.  These are mode constants, not per-plot state,
     @ so reading them here is safe even mid-plot.
     ADR     r0, vduvars
-    ADR     r1, vduvals
+    ADD     r1, r12, #WS_VDUVALS
     SWI     XOS_ReadVduVariables
     BVS     gv_pass
-    ADR     r6, vduvals
+    ADD     r6, r12, #WS_VDUVALS
     LDR     r5, [r6, #0]            @ LineLength
     LDR     r7, [r6, #4]            @ Log2BPP
     LDR     r11, [r6, #12]          @ YWindLimit = yres - 1
@@ -274,8 +363,7 @@ gv_chk:
     MUL     r10, r5, r11
     MLA     r11, r8, r0, r10        @ r11 = byte offset of the top left
 
-    ADR     r0, blit_log
-    LDR     r0, [r0]
+    LDR     r0, [r12, #WS_BLITLOG]
     TEQ     r0, #0
     BEQ     gv_pass
 
@@ -309,10 +397,9 @@ gv_patlen:
     TEQ     r1, #0
     BNE     gv_pass                 @ refused: let the kernel do it
 
-    ADR     r0, obs_count
-    LDR     r1, [r0]
+    LDR     r1, [r12, #WS_OBS]
     ADD     r1, r1, #1
-    STR     r1, [r0]
+    STR     r1, [r12, #WS_OBS]
 
     MOV     r4, #GraphicsV_Complete
 gv_pass:
@@ -321,12 +408,13 @@ gv_pass:
 @ ----------------------------------------------------------- *BlitStats
 cmd_blitstats:
     STMFD   sp!, {r0-r8, lr}
-    ADR     r6, obs_count
+    LDR     r12, [r12]
+    ADD     r6, r12, #WS_OBS
     MOV     r7, #1                  @ rectangles accelerated
     MOV     r8, #0
 st_loop:
     LDR     r0, [r6], #4
-    ADR     r1, hexbuf
+    ADD     r1, r12, #WS_HEXBUF
     MOV     r2, #12
     SWI     XOS_ConvertHex8
     BVS     st_out
@@ -343,21 +431,18 @@ st_out:
     MSR     CPSR_f, #0
     LDMFD   sp!, {r0-r8, pc}
 
-obs_count:
-    .word   0
-
-
 @ ------------------------------------------------------------ *BlitFill
 @ Paints 200x100 pixels at the top-left of the screen.
 cmd_blitfill:
     STMFD   sp!, {r0-r11, lr}
+    LDR     r12, [r12]
 
     ADR     r0, vduvars
-    ADR     r1, vduvals
+    ADD     r1, r12, #WS_VDUVALS
     SWI     XOS_ReadVduVariables
     BVS     cmd_out
 
-    ADR     r4, vduvals
+    ADD     r4, r12, #WS_VDUVALS
     LDR     r5, [r4, #0]            @ r5 = LineLength (pitch)
     LDR     r6, [r4, #4]            @ r6 = Log2BPP
 
@@ -367,8 +452,7 @@ cmd_blitfill:
     MOV     r7, #1
     MOV     r7, r7, LSL r6          @ r7 = bytes per pixel
 
-    ADR     r1, blit_log
-    LDR     r1, [r1]                @ r1 = device, logical
+    LDR     r1, [r12, #WS_BLITLOG]  @ r1 = device, logical
 
     MOV     r0, #OP_FILL
     STR     r0, [r1, #BLIT_OP]
@@ -396,7 +480,7 @@ cmd_blitfill:
     STR     r0, [r1, #BLIT_GO]      @ any value: run it
 
     LDR     r0, [r1, #BLIT_GO]      @ status of that blit
-    ADR     r1, hexbuf
+    ADD     r1, r12, #WS_HEXBUF
     MOV     r2, #12
     SWI     XOS_ConvertHex8
     BVS     cmd_out
@@ -429,12 +513,6 @@ vduvars:
     .word   11                      @ XWindLimit
     .word   12                      @ YWindLimit
     .word   -1
-vduvals:
-    .word   0, 0, 0, 0
-blit_log:
-    .word   0
-hexbuf:
-    .space  16
     .balign 4
 
 @ --------------------------------------------------- SpriteV observer
@@ -449,14 +527,14 @@ hexbuf:
 @ with.
 sv_handler:
     STMFD   sp!, {r0-r11, lr}
+    LDR     r12, [r12]              @ workspace, via the private word
     AND     r10, r0, #0xFF
     TEQ     r10, #52                @ PutSpriteScaled: the only one that pays
     BNE     sv_count
 
-    ADR     r11, sv_n52
-    LDR     r8, [r11]
+    LDR     r8, [r12, #WS_SV_N52]
     ADD     r8, r8, #1
-    STR     r8, [r11]
+    STR     r8, [r12, #WS_SV_N52]
 
     @ The case worth taking: the sprite pointed at rather than named,
     @ unmasked, already the screen's depth, whole words edge to edge,
@@ -492,22 +570,21 @@ sv_scaled_ok:
     @ window and origin are set per redraw rectangle, so the Wimp
     @ changes them between one plot and the next.  Read the constants
     @ only when the mode has changed under us.
-    ADR     r8, sv_modestale
-    LDR     r9, [r8]
+    LDR     r9, [r12, #WS_SV_MODESTALE]
     TEQ     r9, #0
     BEQ     sv_haveconst
     MOV     r9, #0
-    STR     r9, [r8]
+    STR     r9, [r12, #WS_SV_MODESTALE]
     ADR     r0, sv_constvars
-    ADR     r1, sv_vduvals
+    ADD     r1, r12, #WS_SV_VDUVALS
     SWI     XOS_ReadVduVariables
     BVS     sv_pass
 sv_haveconst:
     ADR     r0, sv_winvars
-    ADR     r1, sv_vduvals + 24     @ after the six mode constants
+    ADD     r1, r12, #(WS_SV_VDUVALS + 24)  @ after the six mode constants
     SWI     XOS_ReadVduVariables
     BVS     sv_pass
-    ADR     r1, sv_vduvals
+    ADD     r1, r12, #WS_SV_VDUVALS
     LDR     r8, [r1, #12]           @ Log2BPP
     LDR     r9, [r1, #20]           @ NColour
     @ The sprite must be in the screen's own pixel format, not merely
@@ -568,28 +645,21 @@ sv_nopal:
     SUB     r9, r8, r4
     SUB     r9, r9, r7              @ top edge, top origin
 
-    ADR     r10, sv_accoff
-    LDR     r10, [r10]
+    LDR     r10, [r12, #WS_SV_ACCOFF]
     TEQ     r10, #0
-    BNE     sv_pass                 @ *SprBench turns it off to compare
-
-    @ Keep the biggest sprite seen, not the last: *SprBench replots it,
+    BNE     sv_pass                 @ *SprBench turns it off to compare    @ Keep the biggest sprite seen, not the last: *SprBench replots it,
     @ and the last one is usually a 128x128 wallpaper tile whose plot
     @ rounds to nothing either way.
     MUL     r10, r7, r5
-    ADR     r11, sv_lastarea
-    LDR     r11, [r11]
+    LDR     r11, [r12, #WS_SV_LASTAREA]
     CMP     r10, r11
     BLS     .Lsv_nokeep
-    ADR     r11, sv_lastarea
-    STR     r10, [r11]
-    ADR     r10, sv_lastspr
-    STR     r2, [r10]
-    STR     r1, [r10, #4]
+    STR     r10, [r12, #WS_SV_LASTAREA]
+    STR     r2, [r12, #WS_SV_LASTSPR]
+    STR     r1, [r12, #WS_SV_LASTSPR + 4]
 .Lsv_nokeep:
 
-    ADR     r10, blit_log
-    LDR     r10, [r10]
+    LDR     r10, [r12, #WS_BLITLOG]
     TEQ     r10, #0
     BEQ     sv_pass
 
@@ -610,15 +680,15 @@ sv_nopal:
     STR     r9, [r10, #BLIT_DSTY]
     STR     r6, [r10, #BLIT_BPP]    @ bytes per pixel, from the screen
 
-    LDR     r11, [r1, #20]          @ GWLCol
-    STR     r11, [r10, #BLIT_CLIPX0]
-    LDR     r11, [r1, #28]          @ GWRCol
+    LDR     r11, [r1, #24]          @ GWLCol (six mode constants first:
+    STR     r11, [r10, #BLIT_CLIPX0] @ the window vars start at +24)
+    LDR     r11, [r1, #32]          @ GWRCol
     STR     r11, [r10, #BLIT_CLIPX1]
     SUB     r8, r7, #1              @ yres - 1
-    LDR     r11, [r1, #32]          @ GWTRow
+    LDR     r11, [r1, #36]          @ GWTRow
     SUB     r11, r8, r11
     STR     r11, [r10, #BLIT_CLIPY0]
-    LDR     r11, [r1, #24]          @ GWBRow
+    LDR     r11, [r1, #28]          @ GWBRow
     SUB     r11, r8, r11
     STR     r11, [r10, #BLIT_CLIPY1]
 
@@ -627,15 +697,13 @@ sv_nopal:
     TEQ     r11, #0
     BNE     sv_pass                 @ refused: leave it to SpriteExtend
 
-    ADR     r8, sv_easyn
-    LDR     r9, [r8]
+    LDR     r9, [r12, #WS_SV_EASY]
     ADD     r9, r9, #1
-    STR     r9, [r8]
+    STR     r9, [r12, #WS_SV_EASY]
     MUL     r9, r7, r5              @ pixels actually taken on
-    ADR     r8, sv_accarea
-    LDR     r10, [r8]
+    LDR     r10, [r12, #WS_SV_ACCAREA]
     ADD     r10, r10, r9
-    STR     r10, [r8]
+    STR     r10, [r12, #WS_SV_ACCAREA]
 
     @ Claim.  CallVector pushed the caller's return address before
     @ walking the chain, so passing on is MOV pc, lr and intercepting is
@@ -645,10 +713,9 @@ sv_nopal:
     LDMFD   sp!, {pc}
 
 sv_pass:
-    ADR     r8, sv_passed
-    LDR     r9, [r8]
+    LDR     r9, [r12, #WS_SV_PASSED]
     ADD     r9, r9, #1
-    STR     r9, [r8]
+    STR     r9, [r12, #WS_SV_PASSED]
     @ Area of what we turned away, so the split that matters -- pixels,
     @ not calls -- says whether the next case is worth writing.  Only
     @ range C, where r2 points at the sprite rather than naming it.
@@ -662,17 +729,15 @@ sv_pass:
     @ Words to pixels at the cached depth, so the taken and passed
     @ areas stay in the same units below 32bpp; before the first take
     @ the cache is zero and the 32bpp convention is assumed.
-    ADR     r11, sv_vduvals
-    LDR     r11, [r11, #12]         @ Log2BPP
+    LDR     r11, [r12, #(WS_SV_VDUVALS + 12)]  @ cached Log2BPP
     CMP     r11, #3
     MOVLO   r11, #5
     RSB     r11, r11, #5            @ 2, 1 or 0 for 8, 16, 32bpp
     MOV     r9, r9, LSL r11
     MUL     r9, r10, r9
-    ADR     r8, sv_passarea
-    LDR     r10, [r8]
+    LDR     r10, [r12, #WS_SV_PASSAREA]
     ADD     r10, r10, r9
-    STR     r10, [r8]
+    STR     r10, [r12, #WS_SV_PASSAREA]
 
 sv_count:
     LDR     r10, [sp]               @ r0 as it came in
@@ -688,7 +753,7 @@ sv_find:
     BLO     sv_find
     B       sv_out
 sv_hit:
-    ADR     r6, sv_counts
+    ADD     r6, r12, #WS_SV_COUNTS
     LDR     r8, [r6, r7, LSL #2]
     ADD     r8, r8, #1
     STR     r8, [r6, r7, LSL #2]
@@ -701,11 +766,11 @@ sv_out:
 sv_service:
     TEQ     r1, #Service_ModeChange
     MOVNE   pc, lr
-    STMFD   sp!, {r0, r2}
-    ADR     r0, sv_modestale
+    STMFD   sp!, {r0, r2, r12}
+    LDR     r12, [r12]
     MOV     r2, #1
-    STR     r2, [r0]
-    LDMFD   sp!, {r0, r2}
+    STR     r2, [r12, #WS_SV_MODESTALE]
+    LDMFD   sp!, {r0, r2, r12}
     MOV     pc, lr
 
 sv_constvars:
@@ -724,35 +789,8 @@ sv_winvars:
     .word   0x88                    @ OrgX
     .word   0x89                    @ OrgY
     .word   -1
-sv_vduvals:
-    .space  4 * 12
-sv_modestale:
-    .word   1                       @ nothing cached yet
 sv_reasons:
     .word   28, 34, 48, 49, 50, 52
-sv_maxarea:
-    .word   0
-sv_counts:
-    .space  4 * 6
-sv_n52:
-    .word   0
-sv_easyn:
-    .word   0
-sv_passed:
-    .word   0
-sv_accarea:
-    .word   0
-sv_passarea:
-    .word   0
-sv_accoff:
-    .word   0
-sv_lastspr:
-    .word   0
-    .word   0
-sv_lastarea:
-    .word   0
-sv_hexbuf:
-    .space  16
     .balign 4
 
 @ ------------------------------------------------------------ *SprBench
@@ -768,8 +806,8 @@ sv_hexbuf:
 @ its buffer out from under the pointer.
 cmd_sprbench:
     STMFD   sp!, {r0-r9, lr}
-    ADR     r6, sb_area
-    LDR     r7, [r6]
+    LDR     r12, [r12]
+    LDR     r7, [r12, #WS_SB_AREA]
     TEQ     r7, #0
     BNE     sb_ready
 
@@ -777,8 +815,7 @@ cmd_sprbench:
     LDR     r3, =BENCH_AREA
     SWI     XOS_Module
     BVS     sb_out
-    ADR     r6, sb_area
-    STR     r2, [r6]
+    STR     r2, [r12, #WS_SB_AREA]
 
     LDR     r0, =BENCH_AREA
     STR     r0, [r2, #0]            @ saEnd
@@ -817,15 +854,13 @@ sb_ready:
     SWI     XOS_WriteC              @ that would clip all of this away
 
     @ Pass one: the host.
-    ADR     r6, sv_accoff
     MOV     r0, #0
-    STR     r0, [r6]
+    STR     r0, [r12, #WS_SV_ACCOFF]
     SWI     XOS_ReadMonotonicTime
     MOV     r9, r0
     LDR     r8, =BENCH_PLOTS
 .Lsb_l1:
-    ADR     r6, sb_area
-    LDR     r1, [r6]
+    LDR     r1, [r12, #WS_SB_AREA]
     ADD     r2, r1, #16
     LDR     r0, =512 + 52
     MOV     r3, #0
@@ -838,19 +873,16 @@ sb_ready:
     BNE     .Lsb_l1
     SWI     XOS_ReadMonotonicTime
     SUB     r0, r0, r9
-    ADR     r6, sb_host
-    STR     r0, [r6]
+    STR     r0, [r12, #WS_SB_HOST]
 
     @ Pass two: SpriteExtend, exactly as before any of this existed.
-    ADR     r6, sv_accoff
     MOV     r0, #1
-    STR     r0, [r6]
+    STR     r0, [r12, #WS_SV_ACCOFF]
     SWI     XOS_ReadMonotonicTime
     MOV     r9, r0
     LDR     r8, =BENCH_PLOTS
 .Lsb_l2:
-    ADR     r6, sb_area
-    LDR     r1, [r6]
+    LDR     r1, [r12, #WS_SB_AREA]
     ADD     r2, r1, #16
     LDR     r0, =512 + 52
     MOV     r3, #0
@@ -863,18 +895,16 @@ sb_ready:
     BNE     .Lsb_l2
     SWI     XOS_ReadMonotonicTime
     SUB     r0, r0, r9
-    ADR     r6, sb_guest
-    STR     r0, [r6]
+    STR     r0, [r12, #WS_SB_GUEST]
 
-    ADR     r6, sv_accoff
     MOV     r0, #0
-    STR     r0, [r6]
+    STR     r0, [r12, #WS_SV_ACCOFF]
 
-    ADR     r6, sb_host             @ centiseconds: host, then guest
+    ADD     r6, r12, #WS_SB_HOST    @ centiseconds: host, then guest
     MOV     r8, #2
 .Lsb_print:
     LDR     r0, [r6], #4
-    ADR     r1, sv_hexbuf
+    ADD     r1, r12, #WS_HEXBUF
     MOV     r2, #12
     SWI     XOS_ConvertHex8
     SWI     XOS_Write0
@@ -886,21 +916,15 @@ sb_out:
     MSR     CPSR_f, #0
     LDMFD   sp!, {r0-r9, pc}
 
-sb_area:
-    .word   0
-sb_host:
-    .word   0
-sb_guest:
-    .word   0
-
 cmd_sprstats:
     STMFD   sp!, {r0-r8, lr}
-    ADR     r6, sv_maxarea
+    LDR     r12, [r12]
+    ADD     r6, r12, #WS_SV_MAX
     MOV     r7, #12                 @ ..., accelerated, passed, and both areas
     MOV     r8, #0
 sp_loop:
     LDR     r0, [r6], #4
-    ADR     r1, sv_hexbuf
+    ADD     r1, r12, #WS_HEXBUF
     MOV     r2, #12
     SWI     XOS_ConvertHex8
     BVS     sp_out

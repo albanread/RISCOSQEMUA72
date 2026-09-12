@@ -114,13 +114,30 @@ provides for exactly that purpose.  Anything added should use
 
 ## Running
 
-Put `GVFill,ffa` in the HostFS root and load it.  The `,ffa` matters:
-`*RMLoad` checks the filetype is &FFA, and the doorbell maps a `,xxx`
-suffix to the type while leaving it in the name.
+Two ways in, and the module works identically from either:
 
-```
-*RMLoad hostfs:$.GVFill,ffa
-```
+- **Soft-loaded** — put `GVFill,ffa` in the HostFS root and load it.
+  The `,ffa` matters: `*RMLoad` checks the filetype is &FFA, and the
+  doorbell maps a `,xxx` suffix to the type while leaving it in the
+  name.
+
+  ```
+  *RMLoad hostfs:$.GVFill,ffa
+  ```
+
+- **Spliced into the ROM** (`tools/mkrom.py`, BOOTDESIGN §3) — the
+  module initialises from the ROM chain at boot with nothing on any
+  disc.  Its writable state lives in a 168-byte struct claimed from
+  the RMA at init (the `-zM` shape, in assembly: nothing in the module
+  image is ever written, which is what makes read-only ROM safe), and
+  the private word carries the struct's address to every entry point.
+  Verified end to end on Windows: a stock ROM plus this module boots
+  to the desktop and serves window-furniture fills with no `*RMLoad`
+  anywhere.  One trap worth its own sentence: **`OS_Module 6` takes
+  the claim size in R3, not R2** — the block still comes back in R2,
+  and a size left in the wrong register claims a garbage-sized block
+  whose neighbours the workspace zeroing then flattens.  Our own
+  literal pool went that way once.
 
 `*RMKill GVFill` takes it back out of the path instantly, which is the
 first thing to try if anything on screen looks wrong.
