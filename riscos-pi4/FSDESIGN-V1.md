@@ -874,6 +874,7 @@ Measured on the Mac Pi 4 machine, TCG, soft-loaded module:
 | R1 From ROM | HostFS 2.00: workspace at the private word; no cmhg, no stubs; header, veneers and constants in objasm | spliced ROM, nothing soft-loaded: `*Modules` at &FC4BCDA8, `*Ex` types and dates, 256 KiB round trip `cmp`-identical |
 | D1 Icon and Filer | HostFSFiler 2.00 on RAMFSFiler's pattern, also from ROM; Free_Register and Func 35 | cold boot: icon present; click opens the share with real icons; double-click opens Text; Free window shows the host volume |
 | D2 A disc in the Filer | Func/File 8 create directory, Args 8 write zeroes, File 10 block size | by mouse: new directory, drag-copy both ways, Info, rename, delete — each checked on the host |
+| B1 Boot off it | Func 10 runs `&.!Boot`; `RISCOS_BOOT=hostfs`; names: Latin-1/UTF-8, typed names round trip, directories take no type | no card attached: clean desktop from the share in 13.5–14.3 s, as the SD boot; 2,668 doorbells |
 
 ### The acceptance rule for everything below
 
@@ -1027,27 +1028,54 @@ Free window. What it took: `FSEntry_File 8` (create directory) and
 its end) were both "unsupported", and are now done by the host;
 `FSEntry_File 10` answers the block size.
 
-### B1 — boot off it
+### B1 — boot off it: done
 
-`BOOTDESIGN.md` has the design.
+Done 13 Sep. A stock ROM spliced with HostFS and HostFSFiler, CMOS
+`FileSystem HostFS`, no SD card attached, and a share holding a copy of
+the DDE card's tree: the machine reaches a clean desktop — the Raspberry Pi
+backdrop and the pinboard's !NetSurf and !StrongED, all from the share —
+13.5–14.3 s after launch, which is what the SD boot takes. In the running
+system `Boot$Dir` is `HostFS::HostFS.$.!Boot`, `Wimp$ScrapDir` is on the
+share, and the boot's own modules (Fat32fs, GDraw, SpecialFX, NetTime...)
+are loaded from it.
 
-- **An index for typed names first.** A `,xxx`-suffixed file misses the
-  fast-path stat and costs a directory scan on every lookup; a boot is
-  thousands of lookups. This must be in before a boot is attempted.
-- CMOS pre-seeded for `FileSystem HostFS` and `Boot` (`mkcmos.py`).
-- `FSEntry_Func 10` performs the boot action — run `&.!Boot` per the boot
-  option — instead of returning.
-- The working card's tree unpacked to plain host files through the mapping
-  that already exists, and booted.
+How to do it:
 
-*Acceptance:* a cold boot from a host directory reaches the desktop with
-no card attached.
+1. **Make the share.** In a machine with the card attached and the share
+   as its HostFS root, for each of `!Boot`, `Apps`, `Documents`,
+   `Utilities`, `Printing`, `Public`, `Diversions`:
+   `*Copy SDFS::0.$.<dir> HostFS:$.<dir> ~CFR~V`. That was 5,229 files and
+   320 MB in 65 s. Take `PreDesk.BootDDE` out of the copy: it points at the
+   card's DDE and fails without it.
+2. **Boot it.** `RISCOS_BOOT=hostfs RISCOS_HOSTFS=<share> tools/run-macos.sh`
+   (or through `instance.sh`); without a card image, nothing else is booted.
+
+What it took, besides Func 10 (`Run &.!Boot`, as FileCore does for boot
+option 2; Func 27 reports 2 when there is a `!Boot`):
+
+- **The kernel's path, confirmed in source.** `Kernel/s/NewReset` calls
+  `OS_FSControl 15` unless Shift or `NoBoot` says otherwise; FileSwitch
+  (`FSCtrl2`, BootupFSEntry) passes that to the current filing system's
+  `FSEntry_Func 10`; the current filing system is the configured one.
+- **Three name bugs, all found by copying a real disc.** Acorn Latin-1 names
+  went to the host raw, and macOS refuses non-UTF-8 (the card spells "Beginners
+  Guide Wimp" with hard spaces); a typed file whose type has an extension was
+  created `name.ext` and read back as `name/ext`, so every `*Copy` of a JPEG
+  failed; and `*Copy`'s write of a directory's catalogue information renamed
+  every directory `name,ffd`. §6 has the rules as they now stand.
+- **The index for typed names was not needed first.** The plan put it ahead
+  of any boot attempt. Measured instead: the whole boot is 2,668 doorbells
+  (1,894 catalogue reads, 722 of them misses; 315 reads; 203 opens and
+  closes; 32 listings), and it takes the same wall-clock as the SD boot, so
+  whatever the scans cost is lost in the emulated CPU's time. It moves to B2,
+  to be justified by measurement if at all.
 
 ### B2 — persistence and measurement
 
 Persistent CMOS, so `*Configure` survives power-off; the SD-versus-HostFS
 boot comparison of `BOOTDESIGN.md` §5.5, as MMIO accesses against
-filing-system calls and wall-clock.
+filing-system calls and wall-clock; and the typed-name index, only if that
+comparison finds the scans costing something.
 
 ### Edges, folded in where they start to matter
 
