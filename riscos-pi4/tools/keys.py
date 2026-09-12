@@ -24,8 +24,18 @@ import time
 FARM = r"F:\RISCOSDEV\qemu-farm"
 PORTS = {"alpha": 4471, "bravo": 4472, "charlie": 4473, "delta": 4474}
 
-HOLD = 0.03          # how long a key stays down
-GAP = 0.03           # and the pause before the next one
+HOLD = 0.06          # how long a key stays down
+GAP = 0.06           # and the pause before the next one
+MODGAP = 0.03        # settle after pressing a modifier, and before releasing
+
+# These are slower than they look like they need to be, and they are slower
+# than they used to be, because 0.03/0.03 loses keystrokes. The guest polls
+# the emulated USB keyboard on its own schedule; when four machines are
+# running, or one is busy, transitions that fall between two polls are never
+# seen. What you get is not a dropped character but a scrambled line - a
+# shift release goes missing and the rest of the word arrives capitalised -
+# so `$.othello,ff8` types as `$>OHELL<FF*` and you go looking for a
+# filing system fault. Twice. Typing a command line is not a benchmark.
 SETTLE = 1.5         # for a window to open and take the caret
 
 # qcode, and whether shift is held. UK layout.
@@ -136,9 +146,13 @@ class Qmp:
             held.append("shift")
         for mod in held:
             self.key(mod, True)
+        if held:
+            time.sleep(MODGAP)
         self.key(qcode, True)
         time.sleep(HOLD)
         self.key(qcode, False)
+        if held:
+            time.sleep(MODGAP)
         for mod in reversed(held):
             self.key(mod, False)
         time.sleep(GAP)
