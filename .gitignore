@@ -23,6 +23,8 @@ GTAGS
 
 # Working files from the RISC OS Pi 4 work
 /*.log
+/metal-debug.txt
+.DS_Store
 /build-macos/
 /build-*/
 

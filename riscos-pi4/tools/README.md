@@ -51,6 +51,13 @@ overrides:
     DISPLAY_OPT=cocoa riscos-pi4/tools/run-macos.sh   # QEMU's own display
     DISPLAY_OPT=metal,scaling=nearest,scanlines=on riscos-pi4/tools/run-macos.sh
 
+On an Intel Mac, build the four dependencies Homebrew cannot pour
+there with `build-deps-macos.sh` before configure — MACOS.md §9 says
+why and what it verified. The mailbox regression below needs no
+`ld.lld` on a Mac either: assemble with
+`clang -target armv7a-none-eabi -c` and pull the `.text` bytes out of
+the ELF — the sources are position-contained.
+
 `ticks.py` measures what the guest's 100 Hz ticker is actually worth, by
 counting the system timer's compare-1 expiries over a settled desktop:
 

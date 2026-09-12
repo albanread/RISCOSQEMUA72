@@ -382,3 +382,76 @@ occurrence in three, so a tendency rather than a rate. The cases the
 change is really kept for — Low Power Mode, a machine on battery —
 cannot be measured on this desktop Mac, which is the same sentence the
 Windows half of the helper ends on.
+
+## 9. Intel Macs — the same program, a different dependency road
+
+The port is not Apple-silicon-only: `ui/metal` compiles and runs on an
+Intel Mac — no `#ifdef __arm64__` anywhere in the fork's host code, and
+the QoS helper is platform-portable by construction. What is different
+is getting the dependencies installed. This section is the record of
+the first Intel bring-up (Xeon W-3235, 12 uniform cores, macOS 26.3,
+CLT 26.2 with an old Xcode 15.2 parked in `/Applications`).
+
+### The Homebrew wall, and around it
+
+On this platform brew has no pourable bottles for `pcre2`, `json-c`,
+`glib`, `libslirp` or `capstone`, and it refuses *every* source build
+while an outdated Xcode sits at the default bundle path — even with
+`DEVELOPER_DIR` pointed at the CLT, because brew's Xcode detection
+(`os/mac/xcode.rb`, `prefix`) falls back to `/Applications/Xcode.app`
+whenever `xcode-select` names the Command Line Tools. Updating or
+deleting the user's Xcode is not a build requirement: the CLT alone is
+a complete toolchain (clang 17, the macOS 26 SDK), and everything the
+fork needs builds with it.
+
+`riscos-pi4/tools/build-deps-macos.sh` is the road around: it builds
+the four that brew cannot pour — **pcre2 10.48, glib 2.88.3, libslirp
+4.9.4, capstone 5.0.9**, the same stable pins brew itself uses —
+static, with the CLT compiler, into `../deps-macos-intel` outside the
+repositories (versions overridable, idempotent through stamp files).
+Capstone 5 dropped its meson build, so it is cmake; pcre2 likewise.
+Brew still supplies what it can pour — meson, ninja, pkg-config,
+libpng, pixman, gettext, libffi — and configure takes the prefix from
+`PKG_CONFIG_PATH`. Everything built static means the executable owes
+the prefix nothing at run time: `otool -L` on the result shows only
+system frameworks and brew's libpng and pixman.
+
+```bash
+riscos-pi4/tools/build-deps-macos.sh
+# then the §7 configure with:
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+export PKG_CONFIG_PATH="$PWD/../deps-macos-intel/lib/pkgconfig:/usr/local/opt/libffi/lib/pkgconfig"
+```
+
+### Verified on Intel
+
+- The mailbox channel-0 regression prints `00000080` (built with the
+  CLT, the flat binary extracted from the ELF per the tools README's
+  no-`ld.lld` recipe).
+- RISC OS 5.30 boots from the ROOL card to a live, interactive desktop
+  behind `-display metal`: `pipeline up, fb gen 10, 800x600 bpp 32`,
+  frames advancing steadily at `vsync=30`, host mouse moves and button
+  events counted by the periodic log line. Boots land inside the first
+  minute; the sampled-screendump boot figure has not been measured on
+  this host (no tool for it yet, same as §8).
+- The decode is pixel-faithful: a `METAL_SHOT_EVERY` surface capture
+  and a QMP screendump taken within a second of each other differ in
+  **134 of 480,000 pixels (0.028 %)** — a 12×22 block at dead centre,
+  the pointer sprite mid-twitch between the two captures; every other
+  pixel identical. Same shape as the Windows acceptance (84 of 480,000,
+  the clock). One lesson recorded for the method: the earlier scare —
+  89 % differing — was a periodic capture of one desktop moment against
+  a quit-time screendump of another; the periodic shot is
+  change-triggered (none arrive while the VM is `stop`ped), so take the
+  comparison pair close together in time.
+
+### Threads and cores on this Mac
+
+A Xeon W-3235 has twelve uniform performance cores and no efficiency
+cores, which is the helper's documented no-op case — nothing to prefer,
+nothing to demote. `thread_affinity_policy` *is* available on Intel
+macOS (it is the arm64 Macs that ignore it), so a hybrid-core Intel Mac
+— Alder Lake and later — is the machine where a darwin affinity arm
+would have something to measure; on this one it would be decoration.
+Not built, per the house rule: measurement first.
+
