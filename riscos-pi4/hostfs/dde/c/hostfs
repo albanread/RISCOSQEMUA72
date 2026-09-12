@@ -86,6 +86,9 @@ struct vmreq {
 #define RC_HANDLES   6
 #define RC_NOTDIR    7
 #define RC_ISDIR     8
+#define RC_BADCMD    9
+#define RC_IOERR    10
+#define RC_BADADDR  11   /* a guest address would not translate */
 
 #define O_READ   0x1u
 #define O_WRITE  0x2u
@@ -133,6 +136,8 @@ static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" }
 static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
 static _kernel_oserror err_oldhost = { 0x1E7,
     "HostFS: this module needs a vmchannel v1 host" };
+static _kernel_oserror err_badaddr = { 0x1E9,
+    "HostFS: transfer buffer is not mapped" };
 
 static _kernel_oserror *rc_to_error(uint32_t rc)
 {
@@ -270,10 +275,20 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
     REQW(2) = mem;
     REQW(3) = n;
     REQW(4) = ptr;
-    if (vmch_go() != RC_OK) {
+    {
+        uint32_t rc = vmch_go();
+
+        if (rc == RC_OK) {
+            return n;
+        }
+        /* On a partly-mapped buffer the host reports in R3 how far the
+         * translation got.  Hand that back so the caller can tell a
+         * short transfer from nothing at all. */
+        if (rc == RC_BADADDR) {
+            return REQW(3);
+        }
         return 0;
     }
-    return n;
 }
 
 
@@ -430,10 +445,17 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
     }
     moved = xfer(h, ptr, mem, n, 0);
     hptr[idx] = ptr + moved;
-    /* Buffered GetBytes has no exit registers (PRM 2-544), and a short
-     * read is normal: the count is a multiple of the buffer size, so the
-     * final block runs past the extent.  Not an error. */
-    (void)moved;
+    /* Buffered GetBytes has no exit registers (PRM 2-544), so the only
+     * way to report a failure is to return an error — and it must be
+     * reported.  Reading past the end of the file is NOT this case: the
+     * host zero-fills the tail and still delivers the full count, so a
+     * short `moved` means the guest buffer would not translate, and the
+     * bytes the caller can see are not the file's.  Saying nothing here
+     * once produced "0 bytes not transferred" over a buffer holding 252
+     * good bytes and 261892 stale ones. */
+    if (moved != n) {
+        return &err_badaddr;
+    }
     return NULL;
 }
 
@@ -463,7 +485,9 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
     if (hptr[idx] > hext[idx]) {
         hext[idx] = hptr[idx];
     }
-    (void)moved;                /* buffered PutBytes returns nothing */
+    if (moved != n) {           /* see fsentry_get_handler */
+        return &err_badaddr;
+    }
     return NULL;
 }
 
