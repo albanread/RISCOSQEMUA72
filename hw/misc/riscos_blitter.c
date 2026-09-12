@@ -175,6 +175,7 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
     hwaddr mapped;
     uint64_t span;
     int64_t lo;
+    bool solid;
 
     if (s->patlen == 0 || s->patlen > sizeof(pat)) {
         return BLIT_RC_BADGEOM;
@@ -189,14 +190,16 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
     memcpy(pat, s->pattern, sizeof(pat));
 
     /*
-     * The pattern is built out once and then written repeatedly.  For a
-     * solid colour every repeat is identical, so where the run starts
-     * within the pattern does not matter; a positional pattern is not
-     * something this interface can express, and should not try.
+     * A pattern of one repeated byte is the common case -- white and
+     * grey window backgrounds -- and a memset beats a row memcpy on
+     * every host, as well as skipping the row build entirely.
      */
-    row = blit_scratch(s, s->width);
-    for (uint32_t off = 0; off < s->width; off += s->patlen) {
-        memcpy(row + off, pat, MIN(s->patlen, s->width - off));
+    solid = true;
+    for (uint32_t i = 1; i < s->patlen; i++) {
+        if (pat[i] != pat[0]) {
+            solid = false;
+            break;
+        }
     }
 
     /*
@@ -212,8 +215,22 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
     blit_span(s, s->dstride, &lo, &span);
     host = blit_map(dest + lo, span, &mapped);
     if (host) {
+        uint8_t *rowpat = NULL;         /* built on first unsolid row */
+
         for (uint32_t y = 0; y < s->height; y++) {
-            memcpy(host + ((int64_t)y * s->dstride - lo), row, s->width);
+            uint8_t *to = host + ((int64_t)y * s->dstride - lo);
+
+            if (solid) {
+                memset(to, pat[0], s->width);
+                continue;
+            }
+            if (!rowpat) {
+                rowpat = blit_scratch(s, s->width);
+                for (uint32_t off = 0; off < s->width; off += s->patlen) {
+                    memcpy(rowpat + off, pat, MIN(s->patlen, s->width - off));
+                }
+            }
+            memcpy(to, rowpat, s->width);
         }
         blit_unmap(host, mapped);
     } else if (blit_contiguous(s, s->dstride)) {
@@ -222,8 +239,12 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
         chunk = MIN(total, 1u << 20);
         chunk -= chunk % s->patlen;
         row = blit_scratch(s, chunk);
-        for (uint32_t off = 0; off < chunk; off += s->patlen) {
-            memcpy(row + off, pat, s->patlen);
+        if (solid) {
+            memset(row, pat[0], chunk);
+        } else {
+            for (uint32_t off = 0; off < chunk; off += s->patlen) {
+                memcpy(row + off, pat, s->patlen);
+            }
         }
         while (total) {
             uint32_t n = MIN(total, chunk);
@@ -234,6 +255,14 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
             total -= n;
         }
     } else {
+        row = blit_scratch(s, s->width);
+        if (solid) {
+            memset(row, pat[0], s->width);
+        } else {
+            for (uint32_t off = 0; off < s->width; off += s->patlen) {
+                memcpy(row + off, pat, MIN(s->patlen, s->width - off));
+            }
+        }
         for (uint32_t y = 0; y < s->height; y++) {
             dma_memory_write(&address_space_memory, dest, row, s->width,
                              MEMTXATTRS_UNSPECIFIED);
@@ -250,6 +279,10 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
 {
     uint64_t dest = s->dest, src = s->src;
     uint8_t *row;
+    int64_t slo, dlo;
+    uint64_t sspan, dspan;
+    uint8_t *shost = NULL, *dhost = NULL;
+    hwaddr smapped = 0, dmapped = 0;
 
     if (s->flags & BLIT_F_FB) {
         bool have_fb;
@@ -260,10 +293,73 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
     }
 
     /*
-     * Rows go through a bounce buffer, so a row overlapping itself is
-     * safe whichever way it moves.  Overlap *between* rows is the
-     * caller's to get right by the sign of the strides, exactly as it
-     * would be when driving the DMA controller.
+     * The fill maps its span and writes with plain stores; a copy wants
+     * the same, because per-row dma costs a dispatch at each end.  Map
+     * both spans and host-copy, with the two shapes kept distinct:
+     *
+     *   disjoint (a copy between two banks -- BANKS.md's front-to-back
+     *   copy is exactly this) is direct stores, one memcpy when the
+     *   rectangle is contiguous;
+     *
+     *   overlapping (a window moved within the same framebuffer) goes
+     *   per row through the scratch row, so a row overlapping itself is
+     *   safe whichever way it moves -- the same bounce semantics the
+     *   dma path has, with overlap between rows the caller's to get
+     *   right by the sign of the strides.  A contiguous overlapping
+     *   rectangle is one linear move, which memmove already is.
+     *
+     * Falls back to the dma paths when either end is not plain RAM or
+     * would only map in pieces.
+     */
+    blit_span(s, s->sstride, &slo, &sspan);
+    blit_span(s, s->dstride, &dlo, &dspan);
+    shost = blit_map(src + slo, sspan, &smapped);
+    if (shost) {
+        dhost = blit_map(dest + dlo, dspan, &dmapped);
+        if (dhost) {
+            bool disjoint = src + slo + sspan <= dest + dlo
+                         || dest + dlo + dspan <= src + slo;
+            uint8_t *sp = shost - slo;      /* rebased: row origins */
+            uint8_t *dp = dhost - dlo;
+            bool contiguous = (int64_t)s->dstride == (int64_t)s->width
+                              && (int64_t)s->sstride == (int64_t)s->width;
+
+            if (contiguous) {
+                uint64_t total = (uint64_t)s->width * s->height;
+
+                if (disjoint) {
+                    memcpy(dp, sp, total);
+                } else {
+                    memmove(dp, sp, total);
+                }
+            } else {
+                row = blit_scratch(s, s->width);
+                for (uint32_t y = 0; y < s->height; y++) {
+                    const uint8_t *from = sp + (int64_t)y * s->sstride;
+                    uint8_t *to = dp + (int64_t)y * s->dstride;
+
+                    if (disjoint) {
+                        memcpy(to, from, s->width);
+                    } else {
+                        memcpy(row, from, s->width);
+                        memcpy(to, row, s->width);
+                    }
+                }
+            }
+            blit_unmap(dhost, dmapped);
+            blit_unmap(shost, smapped);
+            s->n_copy++;
+            s->bytes += (uint64_t)s->width * s->height;
+            return BLIT_RC_OK;
+        }
+        blit_unmap(shost, smapped);
+    }
+
+    /*
+     * Not mappable: rows go through a bounce buffer, so a row
+     * overlapping itself is safe whichever way it moves.  Overlap
+     * *between* rows is the caller's to get right by the sign of the
+     * strides, exactly as it would be when driving the DMA controller.
      */
     if ((int64_t)s->dstride == (int64_t)s->width &&
         (int64_t)s->sstride == (int64_t)s->width) {
@@ -475,8 +571,9 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
     BCM2835FBConfig cfg;
     Object *obj = blit_fb(s);
     BlitSrcWin win = { .cpu = current_cpu ? current_cpu : first_cpu };
-    uint8_t *row, *fbhost = NULL;
-    hwaddr fbmapped = 0;
+    uint8_t *row, *fbhost = NULL, *srchost = NULL;
+    hwaddr fbmapped = 0, srcmapped = 0;
+    int64_t srcli = 0;
     uint32_t pitch, fbsize, bpp = s->bpp;
     uint32_t rc = BLIT_RC_OK;
     uint32_t tab[256];
@@ -560,6 +657,30 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
             fbhost = blit_map(cfg.base + first, span, &fbmapped);
         }
 
+        /*
+         * A physical source is the same shape as the destination: rows
+         * one stride apart, one span.  Map it once and copy rows with
+         * plain loads instead of a dispatch per row.  Bottom-up only
+         * reverses the row order, not the addresses, so one span serves
+         * either direction.  The virtual source keeps the page-run
+         * walker, and the packed/table source is not reached yet.
+         */
+        if (!(s->flags & (BLIT_F_SRC_VIRT | BLIT_F_TABLE))) {
+            int64_t sfirst = (int64_t)skip_y * s->sstride
+                             + (int64_t)skip_x * bpp;
+            int64_t slast = (int64_t)(skip_y + h - 1) * s->sstride
+                            + (int64_t)skip_x * bpp;
+
+            srcli = MIN(sfirst, slast);
+            srchost = blit_map(s->src + srcli,
+                               (uint64_t)(MAX(sfirst, slast) - srcli)
+                               + (uint64_t)w * bpp, &srcmapped);
+            if (srchost) {
+                srchost -= srcli;       /* rebased: row addressing is
+                                         * relative to s->src */
+            }
+        }
+
         for (uint32_t j = 0; j < h; j++) {
             uint32_t sy = skip_y + j;
             uint64_t src, dest;
@@ -585,6 +706,9 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
                     rc = BLIT_RC_FAULT;
                     break;
                 }
+            } else if (srchost) {
+                memcpy(row, srchost + (int64_t)sy * s->sstride
+                                + (int64_t)skip_x * bpp, w * bpp);
             } else {
                 dma_memory_read(&address_space_memory, src, row, w * bpp,
                                 MEMTXATTRS_UNSPECIFIED);
@@ -624,6 +748,9 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
         }
 
         blit_src_drop(&win);
+        if (srchost) {
+            blit_unmap(srchost + srcli, srcmapped);
+        }
         if (fbhost) {
             blit_unmap(fbhost, fbmapped);
         }

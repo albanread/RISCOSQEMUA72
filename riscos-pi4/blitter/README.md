@@ -23,11 +23,11 @@ than named, 32bpp into a 32bpp screen, whole words edge to edge, and
 not actually scaling.  Nothing in a desktop session scales: every scale
 block sampled has equal multiplier and divisor, so this is a copy.
 
-Masked sprites are taken too.  At two bits per pixel and above the mask
-is one bit per pixel, least significant first, rows padded to whole
-words, a set bit meaning the pixel is plotted.  **The mask is used only
-when bit 3 of the plot action asks for it** — below 8 RISC OS plots
-solid even on a masked sprite.
+Masked sprites are **not** taken.  The mask merge was implemented,
+loaded, and drew the desktop wrong — windows in the wrong place, content
+showing through where it should have been covered — and was backed out
+whole.  Masked plots are declined until the plot-action semantics are
+understood; see below.
 
 Packed sources (1/2/4/8bpp through a wide colour table) are implemented
 host-side but not currently reached; see below.
@@ -100,3 +100,27 @@ suffix to the type while leaving it in the name.
 
 `*RMKill GVFill` takes it back out of the path instantly, which is the
 first thing to try if anything on screen looks wrong.
+
+## Host-side shape (the Mac review)
+
+Three device changes, made on the Mac after reviewing the hot paths:
+
+- **Copy maps both spans** like the fill always did: disjoint ends
+  (between banks) copy directly, one memcpy when the rectangle is
+  contiguous — which is BANKS.md's front-to-back copy — and overlapping
+  ends (a window moved within the same framebuffer) go per row through
+  the scratch, or one memmove when contiguous.  Falls back to the dma
+  paths when either end will not map.
+- **A physical sprite source is mapped once** over its row span instead
+  of a dma dispatch per row, the same treatment the destination already
+  had; the virtual source keeps the page-run walker.
+- **A one-byte pattern is a memset**, and white and grey window
+  backgrounds are exactly that; the row build is skipped entirely.
+
+Verified on the Mac end to end: `GVFill,ffa` delivered through
+`HostFS:` from the Mac share, `*BlitFill` painting a colour-exact
+200x100 rectangle (sampled from an `screendump`), and `*SprBench`
+reading ~61us a plot against ~490us for SpriteExtend on an M-series
+host.  The timing was read off the guest's screen (the spool route had
+its own adventure), so the exact figure wants a rerun on the Windows
+rig alongside the zero-differing-pixels check.
