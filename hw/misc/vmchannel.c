@@ -640,9 +640,27 @@ static uint32_t attrs_for(const GStatBuf *st)
 
 static uint64_t date_cs_for(const GStatBuf *st)
 {
-    /* centiseconds since 1900, the RISC OS 5-byte instant: must stay
-     * 64-bit, the value is ~3.9e11 for 2026 dates */
-    return (uint64_t)(st->st_mtime + 2208988800ULL) * 100;
+    /*
+     * Centiseconds since 1900, the RISC OS 5-byte instant: must stay
+     * 64-bit, the value is ~3.9e11 for 2026 dates.
+     *
+     * RISC OS keeps local time in a filestamp — there is no zone in the
+     * stamp for the desktop to apply — so the host's UTC offset is added
+     * here.  Without it every file read an hour early under BST, which is
+     * wrong in a way that is easy to miss and annoying to debug later.
+     * g_date_time rather than tm_gmtoff, which the Windows build of this
+     * device does not have; the offset is in microseconds and includes
+     * whatever DST was in force on that date, not today's.
+     */
+    gint64 secs = (gint64)st->st_mtime;
+    GDateTime *dt = g_date_time_new_from_unix_local(secs);
+    gint64 off = 0;
+
+    if (dt) {
+        off = g_date_time_get_utc_offset(dt) / G_TIME_SPAN_SECOND;
+        g_date_time_unref(dt);
+    }
+    return (uint64_t)(secs + off + 2208988800LL) * 100;
 }
 
 /* Development trace to a file: stderr proved unreliable under the
