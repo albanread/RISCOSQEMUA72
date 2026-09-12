@@ -119,6 +119,7 @@ struct vmreq {
  * are all this module needs) */
 #define XOS_Write0          0x20002
 #define XOS_NewLine         0x20003
+#define XOS_CLI             0x20005
 #define XOS_Module          0x2001E
 #define XOS_FSControl       0x20029
 #define XOS_Memory          0x20068
@@ -981,6 +982,20 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     }
 }
 
+/* The share's boot option, as FileCore keeps one per disc: 2 (*Run
+ * &.!Boot) when there is a $.!Boot, and 0 when there is not.  There is no
+ * disc record to hold another value, so *Opt 4 changes nothing. */
+static uint32_t boot_option(struct hostws *ws)
+{
+    uint32_t size, type, attr, cs_lo, cs_hi, load, exec;
+
+    if (info_of(ws, "$.!Boot", &size, &type, &attr, &cs_lo, &cs_hi,
+                &load, &exec) != RC_OK) {
+        return 0;
+    }
+    return 2;
+}
+
 _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
 {
     struct hostws *ws = WS_OF(pw);
@@ -1024,9 +1039,21 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         return NULL;
 
     case 10:                           /* boot filing system */
-        /* PRM2 2-573: perform the boot action.  Nothing to do while HostFS
-         * is not the boot filing system; BOOTDESIGN.md is where this
-         * becomes "*Run &.!Boot" per the boot option. */
+        /*
+         * PRM2 2-573: perform the boot action.  The kernel asks for it at
+         * the end of start-up (OS_FSControl 15) when HostFS is the
+         * configured filing system and the machine is set to boot.  Do what
+         * FileCore does for boot option 2 (FileCore/s/FileCore60,
+         * DoOsFunBootup): "RUN &.!BOOT".  FileSwitch's URD defaults to $,
+         * so that is the share's own !Boot.  A share with no !Boot boots
+         * nothing, quietly, as option 0 would.
+         */
+        if (boot_option(ws) == 2) {
+            _kernel_swi_regs cli;
+
+            cli.r[0] = (int)"Run &.!Boot";
+            return swix(XOS_CLI, &cli, &cli);
+        }
         return NULL;
 
     case 11: {                         /* read disc name and boot option:
@@ -1125,9 +1152,10 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     case 32:                           /* StampImage: no-op */
         return NULL;
 
-    case 27:                           /* ReadBootOption: 0 (SimpleFS
-                                        * says never error this) */
-        r->r[2] = 0;
+    case 27:                           /* ReadBootOption: 2 (Run) when
+                                        * the share has a !Boot, else 0.
+                                        * Never an error (SimpleFS) */
+        r->r[2] = (int)boot_option(ws);
         return NULL;
 
     case 14:                           /* names only           GBPB 9  */
