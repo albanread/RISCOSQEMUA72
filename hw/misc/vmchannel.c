@@ -316,6 +316,101 @@ static bool win32_reserved(const char *name, size_t len)
 }
 
 /*
+ * Names cross between two character sets.  RISC OS filenames are 8-bit
+ * Acorn Latin-1; host names are UTF-8, and macOS refuses a name that is not
+ * (mkdir fails with EILSEQ), as glib on Windows cannot convert one.  So
+ * every guest name is translated on the way in and every host name on the
+ * way out, as well as the two filename conventions every RISC OS filing
+ * system on a foreign disc keeps:
+ *
+ *   RISC OS  host
+ *   /        .     a dot is a separator in RISC OS
+ *   &A0      space a RISC OS name cannot hold a space, so a hard space
+ *                  stands in for one ("Beginners Guide Wimp" on the DDE
+ *                  card is spelled with them)
+ *   &80-&9F  the Acorn additions: € Ŵ ŵ Ŷ ŷ … ™ ‰ • ‘ ’ ‹ › “ ” „ – — − Œ œ
+ *                  † ‡ ﬁ ﬂ (Fonts/Encodings/Latin1); the five ornaments and
+ *                  two unassigned codes keep their C1 code points, so they
+ *                  still round trip
+ *   &A1-&FF  U+00A1-U+00FF, which is ISO 8859-1
+ *
+ * A host name holding what Latin-1 cannot — CJK, emoji — is shown with '_'
+ * in its place.  It can still be opened: lookups compare the guest's name
+ * with each host name mapped the same way, so the mapping need not be
+ * reversible, only consistent.  Host names are compared in NFC, the form a
+ * Mac may or may not have used when it created them.
+ */
+static const gunichar acorn_latin1_80[32] = {
+    0x20AC, 0x0174, 0x0175, 0x0083, 0x0084, 0x0176, 0x0177, 0x0087,
+    0x0088, 0x0089, 0x008A, 0x008B, 0x2026, 0x2122, 0x2030, 0x2022,
+    0x2018, 0x2019, 0x2039, 0x203A, 0x201C, 0x201D, 0x201E, 0x2013,
+    0x2014, 0x2212, 0x0152, 0x0153, 0x2020, 0x2021, 0xFB01, 0xFB02,
+};
+
+/* A RISC OS leafname, as the host spells it. */
+static char *host_name_of(const char *guest)
+{
+    GString *out = g_string_sized_new(strlen(guest) + 8);
+
+    for (const unsigned char *p = (const unsigned char *)guest; *p; p++) {
+        if (*p == '/') {
+            g_string_append_c(out, '.');
+        } else if (*p == 0xA0) {
+            g_string_append_c(out, ' ');
+        } else if (*p < 0x80) {
+            g_string_append_c(out, (char)*p);
+        } else {
+            g_string_append_unichar(out, *p < 0xA0 ? acorn_latin1_80[*p - 0x80]
+                                                   : (gunichar)*p);
+        }
+    }
+    return g_string_free(out, FALSE);
+}
+
+/* The first n bytes of a host leafname, as RISC OS spells them. */
+static char *guest_name_of(const char *host, size_t n)
+{
+    g_autofree char *raw = g_strndup(host, n);
+    g_autofree char *nfc = g_utf8_validate(raw, -1, NULL)
+                           ? g_utf8_normalize(raw, -1, G_NORMALIZE_NFC) : NULL;
+    const char *p = nfc ? nfc : raw;
+    GString *out = g_string_sized_new(n);
+
+    while (*p) {
+        gunichar u;
+        unsigned char b = '_';
+
+        if (!nfc) {                     /* not UTF-8 at all: byte by byte */
+            u = (unsigned char)*p++;
+            if (u >= 0x80) {
+                u = 0xFFFD;
+            }
+        } else {
+            u = g_utf8_get_char(p);
+            p = g_utf8_next_char(p);
+        }
+        if (u == '.') {
+            b = '/';
+        } else if (u == ' ' || u == 0xA0) {
+            b = 0xA0;
+        } else if (u > ' ' && u < 0x7F) {
+            b = (unsigned char)u;
+        } else if (u >= 0xA1 && u <= 0xFF) {
+            b = (unsigned char)u;
+        } else {
+            for (int k = 0; k < 32; k++) {
+                if (acorn_latin1_80[k] == u) {
+                    b = (unsigned char)(0x80 + k);
+                    break;
+                }
+            }
+        }
+        g_string_append_c(out, (char)b);
+    }
+    return g_string_free(out, FALSE);
+}
+
+/*
  * Translate the guest's RISC OS path into a host path under root and
  * validate it.  Returns a newly allocated host path, or NULL with *rc
  * set.  The guest path must start with '$' and consist of plain
@@ -340,18 +435,13 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir,
  */
 static char *resolve_leaf(const char *dir, const char *want)
 {
-    char *naive = g_strdup(want);
+    char *naive = host_name_of(want);
     char *cand;
     GStatBuf st;
     GDir *d;
     const char *name;
     char *found = NULL;
 
-    for (char *q = naive; *q; q++) {
-        if (*q == '/') {
-            *q = '.';
-        }
-    }
     cand = g_build_filename(dir, naive, NULL);
     if (g_stat(cand, &st) == 0) {
         g_free(naive);
@@ -667,27 +757,16 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
 
         if (end == comma + 4 && t >= 0 && t < 0x1000) {
             *type = is_dir ? 0 : (uint32_t)t;
-            out = g_strndup(host_leaf, (size_t)(comma - host_leaf));
             /* The suffix is consumed, but what is left can still hold a
              * dot — `readme.txt,ff9` — and a dot is still unrepresentable.
-             * Returning here without translating it listed the file as
-             * "readme.txt", visible and unopenable: the sprint-3 bug again,
-             * for every typed name with a dot in it. */
-            for (char *q = out; *q; q++) {
-                if (*q == '.') {
-                    *q = '/';
-                }
-            }
-            return out;
+             * Returning it untranslated listed the file as "readme.txt",
+             * visible and unopenable: the sprint-3 bug again, for every
+             * typed name with a dot in it. */
+            return guest_name_of(host_leaf, (size_t)(comma - host_leaf));
         }
     }
 
-    out = g_strdup(host_leaf);
-    for (char *q = out; *q; q++) {
-        if (*q == '.') {
-            *q = '/';                   /* RISC OS cannot hold a dot here */
-        }
-    }
+    out = guest_name_of(host_leaf, strlen(host_leaf));
     if (is_dir) {
         *type = 0;
         return out;
@@ -697,14 +776,30 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
     return out;
 }
 
+/* A host leafname without its `,xxx` type suffix, if it has one. */
+static char *host_base_of(const char *host_leaf)
+{
+    const char *comma = strrchr(host_leaf, ',');
+
+    if (comma && strlen(comma + 1) == 3 && g_ascii_isxdigit(comma[1])
+        && g_ascii_isxdigit(comma[2]) && g_ascii_isxdigit(comma[3])) {
+        return g_strndup(host_leaf, (size_t)(comma - host_leaf));
+    }
+    return g_strdup(host_leaf);
+}
+
 /*
- * The host filename for a guest leafname of a given type — the reverse of
- * guest_leaf_of(), and the `naming=smart` policy of FSDESIGN-V1 Sec 6.3.
+ * The host filename for a file of a given type, from its host-form base name
+ * (no type suffix; host_base_of() makes one) — the `naming=smart` policy of
+ * FSDESIGN-V1 Sec 6.3.  Every caller has a host path already, which is why
+ * this takes the host's spelling rather than the guest's.
  *
- *   "hello/c",  &FFF  ->  hello.c     the slash was a dot all along
- *   "notes",    &FFF  ->  notes       Text is the default: nothing to say
- *   "logo",     &FF9  ->  logo,ff9    no extension for Sprite in the table
- *   "shot",     &B60  ->  shot.png    the table has one, so use it
+ *   "hello/c",  &FFF  ->  hello.c       the slash was a dot all along
+ *   "notes",    &FFF  ->  notes         Text is the default: nothing to say
+ *   "shot/png", &B60  ->  shot.png      the extension already says PNG
+ *   "shot",     &B60  ->  shot,b60      nothing says PNG, so the suffix does
+ *   "logo",     &FF9  ->  logo,ff9
+ *   "data/png", &FFF  ->  data.png,fff  the extension says the wrong thing
  *
  * A type is only encoded when it has to be.  Text gets no decoration at
  * all, because most files are text and a share full of ",fff" would be
@@ -712,39 +807,27 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
  * extension is left to speak for itself, so a file copied in as
  * `hello.c` copies out as `hello.c` rather than `hello.c,fff`.
  */
-static char *host_leaf_for(const char *guest_leaf, uint32_t type)
+static char *host_leaf_for(const char *host_base, uint32_t type)
 {
-    char *base = g_strdup(guest_leaf);
-    const char *ext;
-    char *dot;
+    const char *dot = strrchr(host_base, '.');
+    uint32_t implied = (dot && dot != host_base) ? type_for_ext(dot + 1)
+                                                 : 0xFFF;
 
-    for (char *q = base; *q; q++) {
-        if (*q == '/') {
-            *q = '.';
-        }
+    /*
+     * The name is only decorated when its own spelling would say otherwise,
+     * and then only with `,xxx`: whatever this returns must read back, via
+     * guest_leaf_of(), as the same name with the same type.
+     *
+     * It used to append the table's extension instead, so a RISC OS file
+     * "SDIM0019" of type JPEG was created as SDIM0019.jpg — which reads back
+     * as "SDIM0019/jpg".  *Copy creates a file and then opens it by the name
+     * it asked for, so every copied file with a type in the table failed
+     * with "file not found".
+     */
+    if (type == 0 || type == implied) {
+        return g_strdup(host_base);     /* a directory, or already says it */
     }
-    if (type == 0xFFF || type == 0) {
-        return base;                    /* Text, or a directory */
-    }
-
-    /* Already spelled with the right extension?  Leave it alone. */
-    dot = strrchr(base, '.');
-    if (dot && dot != base && type_for_ext(dot + 1) == type) {
-        return base;
-    }
-
-    typemap_load();
-    ext = g_hash_table_lookup(typemap_rev, GUINT_TO_POINTER(type + 1));
-    if (ext) {
-        char *out = g_strdup_printf("%s.%s", base, ext);
-        g_free(base);
-        return out;
-    }
-    {
-        char *out = g_strdup_printf("%s,%03x", base, type);
-        g_free(base);
-        return out;
-    }
+    return g_strdup_printf("%s,%03x", host_base, type);
 }
 
 /* The type a RISC OS load word carries, or 0xFFFFFFFF if the word is a
@@ -1215,7 +1298,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                         uint32_t type = (uint32_t)riscos_type_for(hp1, &st);
                         g_autofree char *dir = g_path_get_dirname(hp2);
                         g_autofree char *leaf = g_path_get_basename(hp2);
-                        g_autofree char *want = host_leaf_for(leaf, type);
+                        g_autofree char *base = host_base_of(leaf);
+                        g_autofree char *want = host_leaf_for(base, type);
 
                         if (strcmp(want, leaf) != 0) {
                             char *typed = g_build_filename(dir, want, NULL);
@@ -1400,7 +1484,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                  * renaming a moment later. */
                 g_autofree char *dir = g_path_get_dirname(hp);
                 g_autofree char *leaf = g_path_get_basename(hp);
-                g_autofree char *want = host_leaf_for(leaf, type);
+                g_autofree char *base = host_base_of(leaf);
+                g_autofree char *want = host_leaf_for(base, type);
                 g_free(hp);
                 hp = g_build_filename(dir, want, NULL);
             }
@@ -1437,6 +1522,20 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
             if (g_stat(hp, &st) != 0) {
                 rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+                break;
+            }
+
+            /*
+             * A directory holds none of it.  Its host name carries no type,
+             * its mtime is the host's to keep, and RISC OS's "locked" on a
+             * directory forbids deleting it, not adding to it — which is
+             * what taking away write permission would do instead.  This used
+             * to fall through: *Copy writes the source directory's load and
+             * exec onto the new one (&FFFFFDxx, type Data), and every copied
+             * directory was renamed "name,ffd".  RISC OS still saw the right
+             * names, so only the host side showed it.
+             */
+            if (S_ISDIR(st.st_mode)) {
                 break;
             }
 
@@ -1481,9 +1580,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 if (reason != 3 && type != 0xFFFFFFFFu) {
                     g_autofree char *dir = g_path_get_dirname(hp);
                     g_autofree char *leaf = g_path_get_basename(hp);
-                    uint32_t had;
-                    g_autofree char *shown = guest_leaf_of(leaf, false, &had);
-                    g_autofree char *want = host_leaf_for(shown, type);
+                    g_autofree char *base = host_base_of(leaf);
+                    g_autofree char *want = host_leaf_for(base, type);
 
                     if (strcmp(want, leaf) != 0) {
                         g_autofree char *dest = g_build_filename(dir, want,
