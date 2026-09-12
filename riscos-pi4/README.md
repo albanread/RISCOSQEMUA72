@@ -104,9 +104,11 @@ networked desktop is **20.8 seconds** on an M4 against about 27 on the
 i7-12700, and the centisecond ticker measures 100.0 a second with a worst
 gap of 12.5 ms on the POSIX branch of `system/hrtimer.c` against 11.6 ms
 from the Windows waitable timer — so that thread's precision did not have
-to be reproduced. `riscos-pi4/MACOS.md` is that record, with the rest of
-the numbers; its §9 is the Intel Mac bring-up — the same program, no
-arm64-only code anywhere, only a different dependency road.
+to be reproduced. [`riscos-pi4/MACOS.md`](MACOS.md) is that record, with
+the rest of the numbers; its [§9 — the Intel Mac
+bring-up](MACOS.md#9-intel-macs--the-same-program-a-different-dependency-road)
+— the same program, no arm64-only code anywhere, only a different
+dependency road.
 
 The screen is 800×600 by default because the firmware channel answers
 `GET_EDID_BLOCK` with a synthetic monitor of that size and the image's own
@@ -289,8 +291,8 @@ already models completely.
 
 ## Building on macOS
 
-Apple clang and Homebrew; `riscos-pi4/MACOS.md` has the whole of it,
-including what `-display metal` takes and what is not done yet.
+Apple clang and Homebrew; [`riscos-pi4/MACOS.md`](MACOS.md) has the whole
+of it, including what `-display metal` takes and what is not done yet.
 
 ```bash
 brew install meson ninja pkgconf glib pixman capstone libslirp libpng
@@ -309,10 +311,11 @@ otherwise, and the Objective-C wants the system compiler and the system
 SDK to agree.
 
 On an Intel Mac, macOS 26 leaves Homebrew with no pourable bottles for
-pcre2, glib, libslirp or capstone. `riscos-pi4/tools/build-deps-macos.sh`
+pcre2, glib, libslirp or capstone — the [special Intel Mac
+instructions](MACOS.md#9-intel-macs--the-same-program-a-different-dependency-road)
+(MACOS.md §9) are the road around: `riscos-pi4/tools/build-deps-macos.sh`
 builds those static with the Command Line Tools into `deps-macos-intel`
-beside the repos and pours everything brew still can; MACOS.md §9 is the
-record.
+beside the repos, and everything brew can still pour, it pours.
 
 ## Building on Windows
 
