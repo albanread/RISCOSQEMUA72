@@ -522,6 +522,27 @@ This is the whole fix for "visible but unreachable", it is lossless and
 bidirectional, and it is the spelling RISC OS users already expect from
 DOS discs and CD-ROMs.  No new convention is invented.
 
+### 6.1.1 Character sets (built 13 Sep)
+
+RISC OS names are 8-bit Acorn Latin-1; host names are UTF-8, and macOS
+refuses anything else — a name with a raw &A0 in it cannot be created at
+all.  Found by copying the DDE card, which spells "Beginners Guide Wimp"
+with hard spaces.  Every name is now translated both ways:
+
+| RISC OS | host | |
+| --- | --- | --- |
+| `/` | `.` | §6.1 |
+| &A0 hard space | space | a RISC OS name cannot hold a space; every foreign-disc filing system makes this swap |
+| &80–&9F | € Ŵ ŵ Ŷ ŷ … ™ ‰ • ‘ ’ ‹ › “ ” „ – — − Œ œ † ‡ ﬁ ﬂ | Acorn's additions (`Fonts/Encodings/Latin1`); the five ornaments and two unassigned codes keep their C1 code points, so all 32 still round trip |
+| &A1–&FF | U+00A1–U+00FF | ISO 8859-1 |
+
+Host names are compared in NFC. A host name holding what Latin-1 cannot
+(CJK, emoji) shows `_` in its place and still opens, because lookups
+compare the guest's name with each host name mapped the same way: the
+mapping has to be consistent, not reversible. Not yet mapped: host names
+using characters RISC OS gives meaning to (`# * : $ & @ ^ % \ | "`); they
+list, but may not open by name.
+
 ### 6.2 Type inference, on the way in
 
 Host filename to (guest leafname, filetype), first match wins:
@@ -557,11 +578,27 @@ end state and is a few lines when wanted.
 
 **The write direction is built** (sprint 4), as `naming=smart` — the
 only policy implemented; `suffix` and `literal` are not.  A type is
-encoded only when it has to be: Text gets no decoration, a name already
-carrying the right extension is left alone, a type with a table extension
-gets that extension, and anything else gets `,xxx`.  The reverse table is
-one-to-many, so the *first* typemap entry for a type is the one written —
-reorder the file to change it.
+encoded only when the name's own spelling would say otherwise, and then
+only with `,xxx`:
+
+    "hello/c",  &FFF  ->  hello.c       the extension already says Text
+    "notes",    &FFF  ->  notes         no extension: Text by default
+    "shot/png", &B60  ->  shot.png      the extension already says PNG
+    "shot",     &B60  ->  shot,b60      nothing says PNG, so the suffix does
+    "data/png", &FFF  ->  data.png,fff  the extension says the wrong thing
+
+The rule is that whatever is written reads back, through §6.2, as the same
+name with the same type.  Until 13 Sep a type with an extension in the
+table *gained* that extension — "shot" of type PNG was written `shot.png`
+— which reads back as "shot/png": `*Copy` creates a file and then opens it
+by the name it asked for, so copying any such file failed with "file not
+found". Found copying the DDE card's Documents.
+
+Directories take no type, date or attribute changes (13 Sep): their host
+name carries no type, their mtime is the host's, and RISC OS "locked" on a
+directory does not mean it may not be added to. `*Copy` writes the source
+directory's catalogue information onto the one it creates, and the old
+code renamed every copied directory `name,ffd`.
 
 Verified: a module built on SDFS, copied out, lands as `HostFSv6,ffa`,
 copies back in as a Module and `*RMLoad`s with no `*SetType` — which
