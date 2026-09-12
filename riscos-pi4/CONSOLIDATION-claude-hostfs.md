@@ -4,6 +4,30 @@ For whoever consolidates the diverged work. This says what the session
 produced, where it is, what is measured and what is not — and, plainly,
 what it got wrong, so none of that is merged as fact.
 
+## Update, 13 Sep — HostFS runs from ROM, has an icon, and boots
+
+Everything below this section was written on 12 Sep and stays as the record
+of that day. Since then, on `riscos-pi4` (`bb79635c18` onwards):
+
+- **HostFS 2.00 runs from ROM**, verified with nothing soft-loaded, and
+  HostFSFiler 2.00 puts its icon on the icon bar, also from ROM. A machine
+  boots from a share with no card (`RISCOS_BOOT=hostfs`), and keeps its CMOS
+  there. `FSDESIGN-V1.md` §13 has each sprint with its evidence.
+- **The first splice's abort was not a HostFS static.** Its PC is the
+  store in Link's relocation routine and its fault address the first entry
+  of the module's relocation table: a cmhg module linked with `C:o.stubs`
+  relocates itself and patches the stubs inside its own image at init, so
+  it cannot run from ROM whatever its variables do. The fix was dropping
+  cmhg and the stubs — objasm header and veneers, cc body without the C
+  library, `link -rmf` of the two, `decaof -r` as the check.
+- **So `zcode/romloader`'s `f5abc37686` should not be merged**: it keeps
+  cmhg and the stubs, and would abort the same way. The HostFS files on
+  `riscos-pi4` supersede it.
+- **The same applies to any other C module headed for ROM**, which is
+  worth knowing before the blitter's C parts, or anything else, are tried.
+- The "not ROM-safe" statements below are now out of date; the "not
+  measured" list is otherwise still accurate for what it describes.
+
 ## Where the work is
 
 | Where | What |
