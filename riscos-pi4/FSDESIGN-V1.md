@@ -424,6 +424,30 @@ header:
 Ship the generated table compiled in, overridable by a plain text file
 named by a device property (`typemap=`), so extensions are data.
 
+**Inference must never produce an executable type.**  Several RISC OS
+types mean "run me" when double-clicked — &FFA Module, &FF8 Absolute,
+&FFC Utility, &FEB Obey, &FFB BASIC, &FFE Command.  A guess at an
+extension is not grounds for telling the desktop that an arbitrary host
+file is code.  Only rule 1 (an explicit `,xxx` suffix) or rule 2 (a
+sidecar entry) may yield one of those types: both are deliberate acts by
+something that already knew.  A table entry that maps an extension to an
+executable type is a bug, and the generator should refuse to emit one.
+
+`.mod` is the case that makes the point.  To RISC OS a "module" is a
+relocatable module, &FFA.  To everyone else `.mod` is an Amiga
+ProTracker song — and also a Fortran module, a Linux kernel object, a
+3D mesh.  Map it to &FFA and double-clicking a tracker tune hands
+arbitrary bytes to `RMLoad`, which is a crash at best.  Nor is there a
+safe alternative to map it *to*: ROOL's list has no "Tracker" type at
+all, and `Amiga` (&FE2), `Music` (&AF1), `MIDI` (&FD4) and `GenSound`
+(&F96) are all something else.
+
+So `.mod` is simply not in the table; it falls to rule 4 and arrives as
+Data.  Nothing is lost, because a real RISC OS module never needed the
+rule: modules are `!RunImage`, or `Modules.Foo`, or carry `,ffa` — and
+rules 1 and 5 already handle all three.  The same reasoning keeps `.bin`,
+`.abs`, `.com` and `.exe` out of the table.
+
 ### 6.3 Type persistence, on the way out
 
 Inference is a guess; a file given a type by RISC OS must keep it.  Take
