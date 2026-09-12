@@ -65,6 +65,8 @@ struct vmreq {
 #define C_FS_GETBYTES 0x101
 #define C_FS_PUTBYTES 0x102
 #define C_FS_FILE     0x105
+#define C_FS_FUNC     0x106
+#define C_RENAME      10
 
 #define C_PING     0
 #define C_OPEN     1
@@ -183,6 +185,22 @@ static uint32_t vmch_arglen(void)
 }
 
 /* path: NUL-terminated RISC OS path into the arg area */
+static void put_two_paths(const char *a, const char *b)
+{
+    char *arg = (char *)req->data;
+    uint32_t i = 0, j;
+
+    for (j = 0; (unsigned char)a[j] >= 32 && i < VMCH_MAX_ARG - 2; j++) {
+        arg[i++] = a[j];
+    }
+    arg[i++] = '\n';                  /* the device splits on this */
+    for (j = 0; (unsigned char)b[j] >= 32 && i < VMCH_MAX_ARG - 1; j++) {
+        arg[i++] = b[j];
+    }
+    arg[i] = 0;
+    req->arglen = i;
+}
+
 static void put_path(const char *path)
 {
     char *arg = (char *)req->data;
@@ -770,11 +788,38 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     case 0: case 1:                    /* *Dir / *Lib: FileSwitch stores
                                         * the prefix; nothing to do */
         return NULL;
-    case 8: {                          /* read disc name and boot option:
+    case 8:                            /* rename: R1 old, R2 new */
+        /*
+         * PRM2 2-561: FSEntry_Func 8 is Rename.  This case used to be the
+         * disc-name call (which is Func 11), so *Rename wrote
+         * "<6>HostFS<2>" over the caller's new-pathname string and renamed
+         * nothing; FileSwitch then reported "Bad rename".  Its comment
+         * cited "PRM2 FSEntry_Func 8", which is the page for Rename.
+         */
+        req->cmd = C_RENAME;
+        req->handle = 0;
+        put_two_paths((const char *)r->r[1], (const char *)r->r[2]);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        /* PRM2 2-568, on exit: "R1 = 0 if rename performed (≠0
+         * otherwise)", and a non-zero R1 makes FileSwitch report "Bad
+         * rename".  R1 still held the old pathname pointer, so every rename
+         * that succeeded on the host was reported to the user as failed. */
+        r->r[1] = 0;
+        return NULL;
+
+    case 10:                           /* boot filing system */
+        /* PRM2 2-573: perform the boot action.  Nothing to do while HostFS
+         * is not the boot filing system; BOOTDESIGN.md is where this
+         * becomes "*Run &.!Boot" per the boot option. */
+        return NULL;
+
+    case 11: {                         /* read disc name and boot option:
                                         * <len><name><opt> at r2 (PRM2
-                                        * FSEntry_Func 8).  FileSwitch
-                                        * asks this when canonicalising
-                                        * "HostFS:" style paths. */
+                                        * 2-576).  R2 is not validated by
+                                        * FileSwitch for this reason. */
         static const char disc[] = "HostFS";
         uint8_t *b = (uint8_t *)r->r[2];
         uint32_t k = 0;
@@ -787,6 +832,21 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         b[k] = 2;                       /* boot option 2 (Run), cosmetic */
         return NULL;
     }
+
+    case 30:                           /* read free space: *Free */
+        req->cmd = C_FS_FUNC;
+        req->handle = 0;
+        REQW(0) = 30;
+        put_path((const char *)r->r[1]);
+        rc = vmch_go();
+        if (rc != RC_OK) {
+            return rc_to_error(rc);
+        }
+        r->r[0] = (int)REQW(0);         /* free space */
+        r->r[1] = (int)REQW(1);         /* biggest object creatable */
+        r->r[2] = (int)REQW(2);         /* disc size */
+        return NULL;
+
     case 16:                           /* shutdown */
     case 17:                           /* print banner */
     case 28:                           /* WriteBootOption: no-op */

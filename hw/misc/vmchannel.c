@@ -27,6 +27,9 @@
 #include "qemu/error-report.h"
 #include <glib/gstdio.h>
 #include <utime.h>
+#ifndef _WIN32
+#include <sys/statvfs.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Guest RAM access: physical, little-endian, through the system AS   */
@@ -360,6 +363,28 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         *rc = VMCH_RC_NOROOT;
         return NULL;
     }
+
+    /*
+     * Once FSEntry_Func 11 answers with a disc name, FileSwitch puts that
+     * name into every canonical path: ":HostFS.$.oldname", not
+     * "$.oldname".  Doc/SimpleFS says so — paths arrive with "disc name
+     * ... and path from $" — but it only starts happening when the disc
+     * name call works, so fixing Func 11 broke every path until this
+     * accepted the prefix.  There is one disc, so the name is skipped; with
+     * several shares it is what would choose between them.  A RISC OS disc
+     * name cannot contain a dot, so the first dot ends it.
+     */
+    if (len > 0 && guest[0] == ':') {
+        const char *dot = strchr(guest, '.');
+
+        if (!dot) {
+            *rc = VMCH_RC_BADPATH;
+            return NULL;
+        }
+        guest = dot + 1;
+        len = strlen(guest);
+    }
+
     if (len < 1 || guest[0] != '$' || len > VMCH_MAX_ARG) {
         *rc = VMCH_RC_BADPATH;
         return NULL;
@@ -1146,8 +1171,26 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             if (hp1) {
                 hp2 = host_path(s, split + 1, &rc);
                 if (hp2) {
+                    GStatBuf st;
+
+                    /* The type rides the host name, so a rename has to
+                     * carry it across: renaming `logo,ff9` (which RISC OS
+                     * calls "logo") to "icon" must land as `icon,ff9`, not
+                     * as an untyped `icon`. */
+                    if (g_stat(hp1, &st) == 0) {
+                        uint32_t type = (uint32_t)riscos_type_for(hp1, &st);
+                        g_autofree char *dir = g_path_get_dirname(hp2);
+                        g_autofree char *leaf = g_path_get_basename(hp2);
+                        g_autofree char *want = host_leaf_for(leaf, type);
+
+                        if (strcmp(want, leaf) != 0) {
+                            char *typed = g_build_filename(dir, want, NULL);
+                            g_free(hp2);
+                            hp2 = typed;
+                        }
+                    }
                     rc = g_rename(hp1, hp2) == 0 ? VMCH_RC_OK
-                                                       : VMCH_RC_ACCESS;
+                                                 : VMCH_RC_ACCESS;
                     g_free(hp2);
                 }
                 g_free(hp1);
@@ -1201,6 +1244,62 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         stl_le_p(resp + 4, (uint32_t)(cs >> 32));
         block_write(base + VMCH_HDR_SIZE, resp, sizeof(resp));
         st32(base + VMCH_HDR_ARGLEN, sizeof(resp));
+        break;
+    }
+
+    case VMCH_CMD_FS_FUNC: {
+        /*
+         * FSEntry_Func reasons the host can answer better than the module.
+         * For now only 30, read free space (PRM 2-584): R0 free, R1
+         * biggest object creatable, R2 disc size — for the volume holding
+         * the share.  *Free calls it, and so does something in !Boot, so a
+         * booting HostFS needs a plausible answer rather than an error.
+         *
+         * Func 30 is 32-bit.  A modern volume overflows it, so the values
+         * saturate at 4 GiB rather than wrapping to a small number, which
+         * would make a full disc look nearly empty or the reverse.  The
+         * 64-bit reasons (35, 36) are the answer if anything needs more.
+         */
+        uint32_t reason = ld32(base + VMCH_HDR_REGS + 0);
+        uint64_t free_b = 0, total_b = 0;
+
+        if (!s->root) {
+            rc = VMCH_RC_NOROOT;
+            break;
+        }
+        if (reason != 30) {
+            rc = VMCH_RC_BADCMD;
+            break;
+        }
+#ifndef _WIN32
+        {
+            struct statvfs sv;
+
+            if (statvfs(s->root, &sv) != 0) {
+                rc = VMCH_RC_IOERR;
+                break;
+            }
+            free_b = (uint64_t)sv.f_bavail * sv.f_frsize;
+            total_b = (uint64_t)sv.f_blocks * sv.f_frsize;
+        }
+#else
+        {
+            ULARGE_INTEGER avail, total, freeb;
+
+            if (!GetDiskFreeSpaceExA(s->root, &avail, &total, &freeb)) {
+                rc = VMCH_RC_IOERR;
+                break;
+            }
+            free_b = avail.QuadPart;
+            total_b = total.QuadPart;
+        }
+#endif
+        st32(base + VMCH_HDR_REGS + 0, free_b > 0xFFFFFFFFull
+                                        ? 0xFFFFFFFFu : (uint32_t)free_b);
+        st32(base + VMCH_HDR_REGS + 4, free_b > 0xFFFFFFFFull
+                                        ? 0xFFFFFFFFu : (uint32_t)free_b);
+        st32(base + VMCH_HDR_REGS + 8, total_b > 0xFFFFFFFFull
+                                        ? 0xFFFFFFFFu : (uint32_t)total_b);
         break;
     }
 
