@@ -1,0 +1,299 @@
+; s.head — the HostFS module header, every entry the kernel and FileSwitch
+; call, and the read-only data c.hostfs must not address absolutely.
+;
+; Assembled with ObjAsm and linked by Link -rmf with c.hostfs, and with
+; nothing else: no C:o.stubs, no cmhg.  Both of those write into the module
+; image while it initialises — Link's self-relocation code (__RelocCode,
+; which cmhg imports), and SharedCLibrary patching the stub vectors — and a
+; module on the ROM chain runs in place, out of read-only memory.  Link only
+; appends the relocation code to a module that imports it, and this one
+; does not.  That is sound only while the image holds no absolute address,
+; which is why the FS information block and the error blocks live here:
+; every word below is an offset within this AREA, so none of them is a
+; relocation.  Check with `decaof -r o.hostfs o.head` after a change.
+;
+; The private word is this module's own.  cmhg's veneers begin
+; LDR r12, [r12] and take the C runtime's relocation offsets from the block
+; it points to; here it holds HostFS's workspace (struct hostws in c.hostfs)
+; and nothing else reads it.
+
+        AREA    |!!!Module$$Header|, CODE, READONLY
+
+        IMPORT  hostfs_init
+        IMPORT  hostfs_final
+        IMPORT  hostfs_commands
+        IMPORT  fsentry_open_handler
+        IMPORT  fsentry_get_handler
+        IMPORT  fsentry_put_handler
+        IMPORT  fsentry_args_handler
+        IMPORT  fsentry_close_handler
+        IMPORT  fsentry_file_handler
+        IMPORT  fsentry_func_handler
+
+        EXPORT  swix
+        EXPORT  hostfs_register
+        EXPORT  hostfs_error
+
+V_bit           *       1 :SHL: 28
+XOS_FSControl   *       &20029
+XOS_CallASWIR12 *       &20071
+
+Module_Base
+        DCD     0                               ; start: not an application
+        DCD     Init - Module_Base
+        DCD     Final - Module_Base
+        DCD     0                               ; service call handler: none
+        DCD     Title - Module_Base
+        DCD     Help - Module_Base
+        DCD     Commands - Module_Base
+        DCD     0                               ; SWI chunk: none
+        DCD     0                               ; SWI handler
+        DCD     0                               ; SWI decoding table
+        DCD     0                               ; SWI decoding code
+        DCD     0                               ; Messages file
+        DCD     Flags - Module_Base
+
+Flags   DCD     1                               ; bit 0: 32-bit compatible
+
+Title   =       "HostFS", 0
+Help    =       "HostFS", 9, 9, "2.00 (12 Sep 2026)", 0
+        ALIGN
+
+; *Command table (PRM 1-205).  Information word: byte 0 minimum parameters,
+; byte 1 GSTrans map, byte 2 maximum parameters, byte 3 flags.
+; hostfs_commands() is told which command by its position in this table.
+Commands
+        =       "HostFSPing", 0
+        ALIGN
+        DCD     Cmd_Ping - Module_Base
+        DCD     0
+        DCD     Ping_Syntax - Module_Base
+        DCD     Ping_Help - Module_Base
+
+        =       "HostFSStatus", 0
+        ALIGN
+        DCD     Cmd_Status - Module_Base
+        DCD     0
+        DCD     Status_Syntax - Module_Base
+        DCD     Status_Help - Module_Base
+
+        =       0
+
+Ping_Help
+        =       "*HostFSPing rings the vmchannel doorbell and expects an echo", 13, 0
+Ping_Syntax
+        =       "Syntax:", 9, "*HostFSPing", 0
+Status_Help
+        =       "*HostFSStatus prints the workspace, the doorbell state and "
+        =       "FileSwitch registration probes", 13, 0
+Status_Syntax
+        =       "Syntax:", 9, "*HostFSStatus", 0
+        ALIGN
+
+; ---------------------------------------------------------------------------
+; Initialisation (PRM 1-208).  In: R10 -> environment string, R11 = I/O base
+; or instantiation number, R12 -> private word.  Out: R7-R11 and SP
+; preserved; V set and R0 -> error block to refuse.
+; ---------------------------------------------------------------------------
+Init
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r0, r10
+        MOV     r1, r11
+        MOV     r2, r12
+        BL      hostfs_init
+        B       ReturnR0AsError
+
+; Finalisation.  In: R10 = fatality, R11 = instantiation, R12 -> private word.
+Final
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r0, r10
+        MOV     r1, r11
+        MOV     r2, r12
+        BL      hostfs_final
+        B       ReturnR0AsError
+
+; *Commands.  In: R0 -> command tail, R1 = number of parameters,
+; R12 -> private word.
+Cmd_Ping
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r2, #0
+        B       Cmd_Common
+Cmd_Status
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r2, #1
+Cmd_Common
+        MOV     r3, r12
+        BL      hostfs_commands
+        ; fall through
+
+; R0 = 0, or -> an error block: clear V for the one, set it for the other.
+ReturnR0AsError
+        CMP     r0, #0                          ; no error: Z set, V clear
+        MOVNE   r1, #0
+        CMPNE   r1, #&80000000                  ; error: 0 - &80000000 sets V
+        LDMFD   sp!, {r4-r11, pc}
+
+; ---------------------------------------------------------------------------
+; The seven FileSwitch entries (PRM 2-532).  In: SVC mode, R12 = the word
+; given to OS_FSControl 12 in R3 — the private word pointer — and R0-R7 as
+; the call defines.  The caller's R0-R9 are pushed as a block the handler
+; reads and rewrites (a _kernel_swi_regs); R10 and R11 come back untouched.
+; Out: V set and R0 -> error on failure; N, Z and C as they arrived, as
+; cmhg's generic veneers leave them.
+; ---------------------------------------------------------------------------
+        MACRO
+$label  FSEntry $handler
+$label  STMFD   sp!, {r0-r11, lr}
+        MRS     r4, CPSR                        ; r4 survives the call
+        MOV     r0, sp                          ; -> R0-R9 as pushed
+        MOV     r1, r12
+        BL      $handler
+        B       FSEntryReturn
+        MEND
+
+FS_Open         FSEntry fsentry_open_handler
+FS_GetBytes     FSEntry fsentry_get_handler
+FS_PutBytes     FSEntry fsentry_put_handler
+FS_Args         FSEntry fsentry_args_handler
+FS_Close        FSEntry fsentry_close_handler
+FS_File         FSEntry fsentry_file_handler
+FS_Func         FSEntry fsentry_func_handler
+
+FSEntryReturn
+        BIC     r4, r4, #V_bit
+        CMP     r0, #0
+        STRNE   r0, [sp]                        ; the caller's R0 becomes the error
+        ORRNE   r4, r4, #V_bit
+        MSR     CPSR_f, r4
+        LDMFD   sp!, {r0-r11, pc}
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *hostfs_register(void *pw)
+;
+; OS_FSControl 12 (AddFS) with this module's information block.  R1 is the
+; module base, found with ADR where the code is running; R2 is the block's
+; offset from it, and every word in the block is an offset too — so the
+; registration is the same whether the image is in the RMA or in ROM.
+; FileSwitch hands R3 back to the entries in R12.
+; ---------------------------------------------------------------------------
+hostfs_register
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r3, r0
+        MOV     r0, #12
+        ADRL    r1, Module_Base
+        LDR     r2, =FSInfo - Module_Base       ; a constant: both in this AREA
+        SWI     XOS_FSControl
+        MOVVC   r0, #0
+        LDMFD   sp!, {r4-r11, pc}
+        LTORG
+
+; Filing system information word (PRM 2-532, LowFSI):
+;   220        filing system number (not yet allocated by ROOL)
+;   16 << 8    maximum open files
+;   bit 26     fsinfo_fsfilereadinfonolen: File 9 is supported
+;   bit 23     fsinfo_multifsextensions: FSControl dispatches ReadFreeSpace
+;              and StampImage only to a filing system with this set; it also
+;              commits HostFS to Func 23 and Func 24
+;   bit 20     fsinfo_dontuseload: FileSwitch does *Load with Open, GetBytes,
+;   bit 19     fsinfo_dontusesave: Close, and *Save likewise — one data path,
+;              not a whole-file one beside the streams that can disagree
+FSInfoWord      *       220 :OR: (16 :SHL: 8) :OR: (1 :SHL: 26) :OR: (1 :SHL: 23) :OR: (1 :SHL: 20) :OR: (1 :SHL: 19)
+
+FSInfo
+        DCD     FSName - Module_Base
+        DCD     0                               ; startup text: none
+        DCD     FS_Open - Module_Base
+        DCD     FS_GetBytes - Module_Base
+        DCD     FS_PutBytes - Module_Base
+        DCD     FS_Args - Module_Base
+        DCD     FS_Close - Module_Base
+        DCD     FS_File - Module_Base
+        DCD     FSInfoWord
+        DCD     FS_Func - Module_Base
+        DCD     0                               ; GBPB: FileSwitch synthesises
+        DCD     0                               ; extra information word
+
+FSName  =       "HostFS", 0
+        ALIGN
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
+;                       _kernel_swi_regs *out)
+;
+; Any SWI, always as its X form, with R0-R9 from `in` and back into `out`;
+; returns 0, or the error pointer when V comes back set.  The SWI number is
+; known only at run time, which is what OS_CallASWIR12 is for
+; (Kernel/s/Kernel: "better for C veneers").  A SWI from SVC mode overwrites
+; LR_svc, which the STMFD has already saved.
+; ---------------------------------------------------------------------------
+swix
+        STMFD   sp!, {r4-r11, lr}
+        STR     r2, [sp, #-4]!                  ; `out`, for after the call
+        ORR     r12, r0, #&20000
+        LDMIA   r1, {r0-r9}
+        SWI     XOS_CallASWIR12
+        LDR     r12, [sp], #4
+        STMIA   r12, {r0-r9}
+        MOVVC   r0, #0
+        LDMFD   sp!, {r4-r11, pc}
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *hostfs_error(int which)
+;
+; The constant error blocks, by number (ERR_* in c.hostfs, same order).
+; Returned blocks are never written, and ROM is readable.
+; ---------------------------------------------------------------------------
+hostfs_error
+        ADR     r1, ErrorTable
+        LDR     r0, [r1, r0, LSL #2]
+        ADD     r0, r1, r0
+        MOV     pc, lr
+
+ErrorTable
+        DCD     Err_NotFound - ErrorTable       ; 0  ERR_NOTFOUND
+        DCD     Err_Access - ErrorTable         ; 1  ERR_ACCESS
+        DCD     Err_BadPath - ErrorTable        ; 2  ERR_BADPATH
+        DCD     Err_Full - ErrorTable           ; 3  ERR_FULL
+        DCD     Err_NoDev - ErrorTable          ; 4  ERR_NODEV
+        DCD     Err_NoMap - ErrorTable          ; 5  ERR_NOMAP
+        DCD     Err_BadMagic - ErrorTable       ; 6  ERR_BADMAGIC
+        DCD     Err_NoFS - ErrorTable           ; 7  ERR_NOFS
+        DCD     Err_Unsupported - ErrorTable    ; 8  ERR_UNSUPPORTED
+        DCD     Err_OldHost - ErrorTable        ; 9  ERR_OLDHOST
+        DCD     Err_Retired - ErrorTable        ; 10 ERR_RETIRED
+
+Err_NotFound    DCD     &1D6
+        =       "HostFS: file not found", 0
+        ALIGN
+Err_Access      DCD     &BD
+        =       "HostFS: access denied", 0
+        ALIGN
+Err_BadPath     DCD     &1E4
+        =       "HostFS: bad path", 0
+        ALIGN
+Err_Full        DCD     &101
+        =       "HostFS: directory too big", 0
+        ALIGN
+Err_NoDev       DCD     &1E4
+        =       "HostFS: no doorbell device", 0
+        ALIGN
+Err_NoMap       DCD     &1E5
+        =       "HostFS: OS_Memory 13 failed", 0
+        ALIGN
+Err_BadMagic    DCD     &1E6
+        =       "HostFS: magic wrong", 0
+        ALIGN
+Err_NoFS        DCD     &1E4
+        =       "HostFS: device has no root", 0
+        ALIGN
+Err_Unsupported DCD     &1E8
+        =       "HostFS: unsupported operation", 0
+        ALIGN
+Err_OldHost     DCD     &1E7
+        =       "HostFS: this module needs a vmchannel v1 host", 0
+        ALIGN
+Err_Retired     DCD     &1EA
+        =       "HostFS: whole-file entry called despite dontuseload/dontusesave", 0
+        ALIGN
+
+        END

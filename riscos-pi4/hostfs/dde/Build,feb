@@ -1,10 +1,17 @@
-| Build — compile and link the HostFS module with the DDE.
-| Produces <Obey$Dir>.HostFS,ffa.  Obey halts at the first failing
-| command, so any error below is the one to read.  The o directory is
-| expected to exist already.
+| Build — assemble, compile and link the HostFS module with the DDE.
+| Produces <Obey$Dir>.HostFS,ffa: one module that runs from ROM as well as
+| from the RMA.  Obey halts at the first failing command, so any error
+| below is the one to read.  The o directory must exist already.
+|
+| No cmhg and no C:o.stubs.  cmhg's header imports __RelocCode, and the
+| stubs patch their vectors in place: both write into the module image at
+| initialisation, which from ROM is a data abort (see c.hostfs, s.head).
+| o.relocs is decaof's list of relocations: it must hold only PC-relative
+| ones, since an absolute address would be wrong wherever the module lands.
 Set HostFS$Dir <Obey$Dir>
 Dir <Obey$Dir>
-cc -c -zM -zps1 -ffah -IC: -o o.hostfs c.hostfs
-cmhg cmhg.HostFS -o o.head
-link -rmf -o HostFS,ffa o.head o.hostfs C:o.stubs
+objasm -o o.head s.head
+cc -c -zps1 -ffah -o o.hostfs c.hostfs
+link -rmf -o HostFS,ffa o.head o.hostfs
+decaof -r o.head o.hostfs { > o.relocs }
 Echo Built <HostFS$Dir>.HostFS,ffa

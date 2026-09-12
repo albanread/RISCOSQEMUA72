@@ -1,21 +1,37 @@
-/* hostfs.c — the HostFS module body, DDE build (riscos-pi4/FSDESIGN.md).
+/* hostfs.c — the HostFS module body (riscos-pi4/FSDESIGN-V1.md).
  *
- * A filing system over the vmchannel doorbell at 0xFD400000: every
- * operation becomes one request block built in this module's statics,
- * poked into the doorbell, and answered in place by the device.
+ * A filing system over the vmchannel doorbell.  Each FileSwitch call puts
+ * its registers into one request block, rings the doorbell, and takes the
+ * registers back: the host does the work, including reaching the caller's
+ * buffers by walking the guest's page tables.
  *
- * This is the Acorn C/C++ port of the roscc body in ../hostfs.c.  cmhg
- * provides the module header, lifecycle veneers and statics relocation;
- * the seven generic FS entry veneers are cmhg-generated and call the
- * fsentry_*_handler functions here with a live register block.  The FS
- * information block for OS_FSControl 12 is built at RUNTIME (offsets
- * computed from live addresses and the module base from OS_Module 18),
- * exactly as LanManFS's LM_Declare does — see PRM2 page 2-532: "the
- * block need not exist for long, as FileSwitch takes a copy of it".
+ * Built to run from ROM.  A module on the ROM chain executes in place, out
+ * of read-only memory, so this module
+ *
+ *   - keeps every variable in one workspace claimed from the RMA at
+ *     initialisation, whose address lives in the module's private word
+ *     (struct hostws, below);
+ *   - holds no absolute address, so nothing in the image needs relocating
+ *     wherever it lands.  Link appends self-relocation code only to a
+ *     module that imports __RelocCode, and s.head does not; the constant
+ *     data that C would reach through an address — the error blocks, the
+ *     FS information block — is in s.head, reached with ADR;
+ *   - links no C library.  C:o.stubs initialises by patching the stub
+ *     vectors inside the image, and its module entry claims the private
+ *     word for the C runtime.  So there is no printf and no division here,
+ *     and swix() in s.head stands in for _kernel_swi.
+ *
+ * Build,feb assembles s.head with objasm, compiles this with cc, and links
+ * the two with link -rmf.  `decaof -r o.hostfs` must list no relocation
+ * but PC-relative ones.  The same image soft-loads with RMLoad.
  */
 
-#include "kernel.h"
-#include <stdio.h>                       /* also provides NULL */
+#define NULL ((void *)0)
+
+/* The two DDE kernel.h types the code is written against, as that header
+ * defines them, so the handlers still read in PRM register terms. */
+typedef struct { int r[10]; } _kernel_swi_regs;
+typedef struct { int errnum; char errmess[252]; } _kernel_oserror;
 
 typedef unsigned int   uint32_t;
 typedef int            int32_t;
@@ -100,21 +116,130 @@ struct vmreq {
 
 /* XSWI numbers (swis.h pulls in a large generated header; these four
  * are all this module needs) */
+#define XOS_Write0          0x20002
+#define XOS_NewLine         0x20003
 #define XOS_Module          0x2001E
 #define XOS_FSControl       0x20029
 #define XOS_Memory          0x20068
 
+/* in s.head: any SWI, as its X form, through OS_CallASWIR12 */
+_kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
+                      _kernel_swi_regs *out);
+
+/* in s.head: OS_FSControl 12 with the information block there */
+_kernel_oserror *hostfs_register(void *pw);
+
+/* in s.head: the constant error blocks, by number, in its table's order */
+_kernel_oserror *hostfs_error(int which);
+#define ERR_NOTFOUND     0
+#define ERR_ACCESS       1
+#define ERR_BADPATH      2
+#define ERR_FULL         3
+#define ERR_NODEV        4
+#define ERR_NOMAP        5
+#define ERR_BADMAGIC     6
+#define ERR_NOFS         7
+#define ERR_UNSUPPORTED  8
+#define ERR_OLDHOST      9
+#define ERR_RETIRED      10
+
+#define err_notfound     (*hostfs_error(ERR_NOTFOUND))
+#define err_access       (*hostfs_error(ERR_ACCESS))
+#define err_badpath      (*hostfs_error(ERR_BADPATH))
+#define err_full         (*hostfs_error(ERR_FULL))
+#define err_nodev        (*hostfs_error(ERR_NODEV))
+#define err_nomap        (*hostfs_error(ERR_NOMAP))
+#define err_badmagic     (*hostfs_error(ERR_BADMAGIC))
+#define err_nofs         (*hostfs_error(ERR_NOFS))
+#define err_unsupported  (*hostfs_error(ERR_UNSUPPORTED))
+#define err_oldhost      (*hostfs_error(ERR_OLDHOST))
+#define err_retired      (*hostfs_error(ERR_RETIRED))
+
+/* the one disc HostFS has */
+#define DISC_NAME        "HostFS"
+#define DISC_NAME_LEN    6u
+
+/* Called from the veneers in s.head.  The FS entries receive the caller's
+ * R0-R9 as a block they may rewrite, and the private word pointer. */
+_kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw);
+_kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw);
+_kernel_oserror *hostfs_commands(const char *arg_string, int argc,
+                                 int cmd_no, void *pw);
+_kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw);
+
+/* one catalogue entry as cached from CAT */
+struct catent {
+    uint32_t load, exec, len, attr, type;
+    char name[40];
+};
+
+/*
+ * Everything this module writes.
+ *
+ * A module on the ROM chain executes in place and may not write its own
+ * image, so no variable can be a C static: from ROM a store into one is a
+ * data abort at the image offset of the variable.  It all lives here
+ * instead, in one block claimed from the RMA in hostfs_init, whose address
+ * is kept in the module's private word — the word R12 points at on every
+ * entry, which the veneers in s.head hand each handler as `pw`, and which
+ * FSControl_AddFS hands FileSwitch so that the FS entry veneers get it too.
+ *
+ * There is deliberately no file-scope pointer to this block.  That pointer
+ * would itself be a writable static, and assigning it in init is exactly
+ * the store that aborts from ROM.  Every function that needs the workspace
+ * is given it: handlers take it from pw with WS_OF(), helpers receive it as
+ * their first argument.
+ *
+ * The macros keep the old names readable (`req->cmd`) and require a `ws` in
+ * scope, so a function that was not given the workspace fails to compile
+ * rather than quietly touching something else.  `seq` has no macro: struct
+ * vmreq has a member of that name, and the macro would rewrite `req->seq`
+ * too.
+ *
+ * Constant data stays in the image, which ROM leaves readable: string
+ * literals, which cc addresses PC-relative, and in s.head the error
+ * blocks and the FS information block.
+ */
+struct hostws {
+    volatile uint32_t *w_vmch;          /* doorbell, from OS_Memory 13 */
+    struct vmreq *w_req;                /* page-aligned inside w_reqstore */
+    uint32_t w_req_phys;                /* its physical address */
+    uint32_t w_seq;
+    int w_registered;
+    uint32_t w_hptr[VMCH_MAX_OPEN];     /* per handle; handles are 1-based */
+    uint32_t w_hext[VMCH_MAX_OPEN];
+    uint32_t w_hload[VMCH_MAX_OPEN];
+    uint32_t w_hexec[VMCH_MAX_OPEN];
+    _kernel_oserror w_err_func;         /* the errors formatted at run time */
+    _kernel_oserror w_err_badaddr;
+    struct catent w_catents[128];
+    /* The request block must be one whole page, and Norcroft has no
+     * aligned attribute: over-allocate and line the block up in init. */
+    uint8_t w_reqstore[sizeof(struct vmreq) + 4096];
+};
+
+#define WS_OF(pw)        (*(struct hostws **)(pw))
+
+#define vmch             (ws->w_vmch)
+#define req              (ws->w_req)
+#define req_phys         (ws->w_req_phys)
+#define registered       (ws->w_registered)
+#define hptr             (ws->w_hptr)
+#define hext             (ws->w_hext)
+#define hload            (ws->w_hload)
+#define hexec            (ws->w_hexec)
+#define err_func_buf     (ws->w_err_func)
+#define err_badaddr_buf  (ws->w_err_badaddr)
+#define catents          (ws->w_catents)
+#define reqstore         (ws->w_reqstore)
+
 #define vmch_reg(idx) (vmch[idx])
-
-/* The doorbell masks the request address down to 16 bytes.  Norcroft
- * has no aligned attribute, so over-allocate and line it up in init. */
-/* the doorbell's logical window, from OS_Memory 13 in init */
-static volatile uint32_t *vmch;
-
-static uint8_t reqstore[sizeof(struct vmreq) + 4096];   /* room to page-align */
-static struct vmreq *req;
-static uint32_t req_phys;          /* the block's physical address, for the doorbell */
-static uint32_t seq;
 
 /* Per-handle state, for FSEntry_Args: the doorbell is stateless (each
  * op carries its own seek), so ptr/ext/load/exec live here instead.
@@ -123,48 +248,79 @@ static uint32_t seq;
  * maximum — the doorbell, not the copy, is what a transfer costs. */
 #define HOSTFS_BUFSIZE 1024u
 
-static uint32_t hptr[VMCH_MAX_OPEN];
-static uint32_t hext[VMCH_MAX_OPEN];
-static uint32_t hload[VMCH_MAX_OPEN];
-static uint32_t hexec[VMCH_MAX_OPEN];
 
-static _kernel_oserror err_notfound    = { 0x1D6, "HostFS: file not found" };
-static _kernel_oserror err_access      = { 0xBD,  "HostFS: access denied" };
-static _kernel_oserror err_badpath     = { 0x1E4, "HostFS: bad path" };
-static _kernel_oserror err_full        = { 0x101, "HostFS: directory too big" };
-static _kernel_oserror err_nodev       = { 0x1E4, "HostFS: no doorbell device" };
-static _kernel_oserror err_nomap    = { 0x1E5, "HostFS: OS_Memory 13 failed" };
-static _kernel_oserror err_badmagic = { 0x1E6, "HostFS: magic wrong" };
-static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" };
-static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
-static _kernel_oserror err_oldhost = { 0x1E7,
-    "HostFS: this module needs a vmchannel v1 host" };
 /* Built per-call so the offset of the first unreachable byte is in the
  * message.  A short transfer is nearly always a partial-coverage bug in
  * whatever prepared the buffer, and the offset points straight at it —
  * "+258300" says the last page was missed, which a bare "not mapped"
  * would have left to a diagnostic build to discover. */
-static _kernel_oserror err_func_buf;
 
 /* "unsupported operation" with no number turned one missing reason code
  * into an afternoon of reading FileSwitch; say which. */
-static _kernel_oserror *unsupported_func(uint32_t reason)
+/* string building, in place of sprintf: each returns the new end */
+static char *str_copy(char *d, const char *src)
 {
+    while ((*d = *src++) != 0) {
+        d++;
+    }
+    return d;
+}
+
+/* One decimal digit of n at place value p, by subtraction: cc compiles
+ * division to a call into the C library, which this module does not link. */
+static char *dec_digit(char *d, uint32_t *n, uint32_t p, int *started)
+{
+    char c = '0';
+
+    while (*n >= p) {
+        *n -= p;
+        c++;
+    }
+    if (c != '0' || *started || p == 1u) {
+        *d++ = c;
+        *started = 1;
+    }
+    return d;
+}
+
+static char *str_dec(char *d, uint32_t n)
+{
+    int started = 0;
+
+    d = dec_digit(d, &n, 1000000000u, &started);
+    d = dec_digit(d, &n, 100000000u, &started);
+    d = dec_digit(d, &n, 10000000u, &started);
+    d = dec_digit(d, &n, 1000000u, &started);
+    d = dec_digit(d, &n, 100000u, &started);
+    d = dec_digit(d, &n, 10000u, &started);
+    d = dec_digit(d, &n, 1000u, &started);
+    d = dec_digit(d, &n, 100u, &started);
+    d = dec_digit(d, &n, 10u, &started);
+    d = dec_digit(d, &n, 1u, &started);
+    *d = 0;
+    return d;
+}
+
+static _kernel_oserror *unsupported_func(struct hostws *ws, uint32_t reason)
+{
+    char *p;
+
     err_func_buf.errnum = 0x1E8;
-    sprintf(err_func_buf.errmess,
-            "HostFS: FSEntry_Func %u is not supported", (unsigned int)reason);
+    p = str_copy(err_func_buf.errmess, "HostFS: FSEntry_Func ");
+    p = str_dec(p, reason);
+    (void)str_copy(p, " is not supported");
     return &err_func_buf;
 }
 
-static _kernel_oserror err_retired = { 0x1EA,
-    "HostFS: whole-file entry called despite dontuseload/dontusesave" };
-static _kernel_oserror err_badaddr_buf;
 
-static _kernel_oserror *badaddr_at(uint32_t off)
+static _kernel_oserror *badaddr_at(struct hostws *ws, uint32_t off)
 {
+    char *p;
+
     err_badaddr_buf.errnum = 0x1E9;
-    sprintf(err_badaddr_buf.errmess,
-            "HostFS: transfer buffer not mapped at +%u", (unsigned int)off);
+    p = str_copy(err_badaddr_buf.errmess,
+                 "HostFS: transfer buffer not mapped at +");
+    (void)str_dec(p, off);
     return &err_badaddr_buf;
 }
 
@@ -183,21 +339,21 @@ static _kernel_oserror *rc_to_error(uint32_t rc)
 
 /* ---- the transport -------------------------------------------------- */
 
-static uint32_t vmch_go(void)
+static uint32_t vmch_go(struct hostws *ws)
 {
-    req->seq = ++seq;
+    req->seq = ++ws->w_seq;
     req->rc = 0xFFFFFFFFu;             /* poison: an unanswered request stays visible */
     vmch_reg(VMCH_CMD / 4) = req_phys; /* the device DMAs physical, not logical */
     return req->rc;
 }
 
-static uint32_t vmch_arglen(void)
+static uint32_t vmch_arglen(struct hostws *ws)
 {
     return req->arglen;
 }
 
 /* path: NUL-terminated RISC OS path into the arg area */
-static void put_two_paths(const char *a, const char *b)
+static void put_two_paths(struct hostws *ws, const char *a, const char *b)
 {
     char *arg = (char *)req->data;
     uint32_t i = 0, j;
@@ -213,7 +369,7 @@ static void put_two_paths(const char *a, const char *b)
     req->arglen = i;
 }
 
-static void put_path(const char *path)
+static void put_path(struct hostws *ws, const char *path)
 {
     char *arg = (char *)req->data;
     uint32_t i = 0;
@@ -226,17 +382,12 @@ static void put_path(const char *path)
     req->arglen = i;
 }
 
-/* one catalogue entry as cached from CAT */
-struct catent {
-    uint32_t load, exec, len, attr, type;
-    char name[40];
-};
-static struct catent catents[128];
 
 /* FILEARGS response: size, type, attr, cs_lo, cs_hi, load, exec.
  * load and exec are computed host-side; nothing in this module
  * knows how a load address is put together any more. */
-static uint32_t info_of(const char *path, uint32_t *size, uint32_t *type,
+static uint32_t info_of(struct hostws *ws, const char *path,
+                        uint32_t *size, uint32_t *type,
                         uint32_t *attr, uint32_t *cs_lo, uint32_t *cs_hi,
                         uint32_t *load, uint32_t *exec)
 {
@@ -245,8 +396,8 @@ static uint32_t info_of(const char *path, uint32_t *size, uint32_t *type,
 
     req->cmd = C_FILEARGS;
     req->handle = 0;
-    put_path(path);
-    rc = vmch_go();
+    put_path(ws, path);
+    rc = vmch_go(ws);
     if (rc != RC_OK) {
         return rc;
     }
@@ -274,7 +425,8 @@ static uint32_t objtype_of(uint32_t rc, uint32_t type)
  * path inline.  The host decides what they mean — including that setting
  * a type renames the file — so this passes them through and nothing
  * more. */
-static uint32_t file_on_host(_kernel_swi_regs *r, const char *name)
+static uint32_t file_on_host(struct hostws *ws, _kernel_swi_regs *r,
+                             const char *name)
 {
     req->cmd = C_FS_FILE;
     req->handle = 0;
@@ -282,16 +434,16 @@ static uint32_t file_on_host(_kernel_swi_regs *r, const char *name)
     REQW(2) = (uint32_t)r->r[2];
     REQW(3) = (uint32_t)r->r[3];
     REQW(5) = (uint32_t)r->r[5];
-    put_path(name);
-    return vmch_go();
+    put_path(ws, name);
+    return vmch_go(ws);
 }
 
-static uint32_t vmch_req_close(uint32_t h)
+static uint32_t vmch_req_close(struct hostws *ws, uint32_t h)
 {
     req->cmd = C_CLOSE;
     req->handle = h;
     req->arglen = 0;
-    return vmch_go();
+    return vmch_go(ws);
 }
 
 /* ---- guest buffer plumbing ------------------------------------------ */
@@ -350,8 +502,8 @@ static void touch_pages(uint32_t mem, uint32_t n)
     (void)sink;
 }
 
-static uint32_t xfer_once(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
-                          int is_write)
+static uint32_t xfer_once(struct hostws *ws, uint32_t h, uint32_t ptr,
+                          uint32_t mem, uint32_t n, int is_write)
 {
     /* One round trip, whatever the size or alignment.  `mem` goes on the
      * wire as the guest's own logical address and the host walks the MMU
@@ -369,7 +521,7 @@ static uint32_t xfer_once(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
     REQW(3) = n;
     REQW(4) = ptr;
     {
-        uint32_t rc = vmch_go();
+        uint32_t rc = vmch_go(ws);
 
         if (rc == RC_OK) {
             return n;
@@ -384,10 +536,10 @@ static uint32_t xfer_once(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
     }
 }
 
-static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
-                     int is_write)
+static uint32_t xfer(struct hostws *ws, uint32_t h, uint32_t ptr,
+                     uint32_t mem, uint32_t n, int is_write)
 {
-    uint32_t moved = xfer_once(h, ptr, mem, n, is_write);
+    uint32_t moved = xfer_once(ws, h, ptr, mem, n, is_write);
 
     if (moved != n) {
         /* Short: the tail of the buffer is not mapped yet.  Fault it in
@@ -395,7 +547,7 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
          * page of the buffer is present — and the common case never
          * gets here, so the fast path stays at one doorbell. */
         touch_pages(mem, n);
-        moved = xfer_once(h, ptr, mem, n, is_write);
+        moved = xfer_once(ws, h, ptr, mem, n, is_write);
     }
     return moved;
 }
@@ -406,7 +558,7 @@ static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
  * but works from any normal context, as the status probe proved.
  * vmch is published only after magic and features validate, so a map
  * onto a wrong page can never be cached. */
-static _kernel_oserror *ensure_vmch(void)
+static _kernel_oserror *ensure_vmch(struct hostws *ws)
 {
     _kernel_swi_regs r;
     _kernel_oserror *e;
@@ -418,7 +570,7 @@ static _kernel_oserror *ensure_vmch(void)
     r.r[0] = 13;                     /* OS_Memory: MapIOPermanent */
     r.r[1] = (int)VMCH_PHYS;
     r.r[2] = (int)VMCH_SIZE;
-    e = _kernel_swi(XOS_Memory, &r, &r);
+    e = swix(XOS_Memory, &r, &r);
     if (e != NULL || r.r[3] == 0) {
         return &err_nomap;
     }
@@ -448,7 +600,7 @@ static _kernel_oserror *ensure_vmch(void)
         pr.r[0] = (1u << 9) | (1u << 13);
         pr.r[1] = (int)&pb;
         pr.r[2] = 1;
-        if (_kernel_swi(XOS_Memory, &pr, &pr) != NULL || pb.phys == 0) {
+        if (swix(XOS_Memory, &pr, &pr) != NULL || pb.phys == 0) {
             return &err_nomap;
         }
         req_phys = pb.phys;
@@ -461,8 +613,10 @@ static _kernel_oserror *ensure_vmch(void)
 
 _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -474,7 +628,6 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     uint32_t rc, h, idx, load, exec;
     uint32_t size = 0, type = 0xFFF, attr = 0, cs_lo = 0, cs_hi = 0;
 
-    (void)pw;
 
     /* FSEntry_Open modes (PRM2 2-542): 0 read, 2 update; 1 is the
      * RISC OS 2 create+update, kept for compatibility.  FileSwitch
@@ -487,8 +640,8 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 
     req->cmd = C_OPEN;
     req->handle = flags;
-    put_path(name);
-    rc = vmch_go();
+    put_path(ws, name);
+    rc = vmch_go(ws);
     if (rc != RC_OK) {
         return rc_to_error(rc);
     }
@@ -498,12 +651,12 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     }
     idx = h - 1;
 
-    rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi, &load, &exec);
+    rc = info_of(ws, name, &size, &type, &attr, &cs_lo, &cs_hi, &load, &exec);
     if (rc == RC_NOTFOUND) {
         size = 0;                       /* newly created file */
         type = 0xFFF;
     } else if (rc != RC_OK) {
-        vmch_req_close(h);
+        vmch_req_close(ws, h);
         return rc_to_error(rc);
     }
 
@@ -532,8 +685,10 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -546,12 +701,11 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
     uint32_t moved;
     int idx = (int)h - 1;
 
-    (void)pw;
 
     if (idx < 0 || idx >= VMCH_MAX_OPEN) {
         return &err_access;
     }
-    moved = xfer(h, ptr, mem, n, 0);
+    moved = xfer(ws, h, ptr, mem, n, 0);
     hptr[idx] = ptr + moved;
     /* Buffered GetBytes has no exit registers (PRM 2-544), so the only
      * way to report a failure is to return an error — and it must be
@@ -562,15 +716,17 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
      * once produced "0 bytes not transferred" over a buffer holding 252
      * good bytes and 261892 stale ones. */
     if (moved != n) {
-        return badaddr_at(moved);
+        return badaddr_at(ws, moved);
     }
     return NULL;
 }
 
 _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -583,26 +739,27 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
     uint32_t moved;
     int idx = (int)h - 1;
 
-    (void)pw;
 
     if (idx < 0 || idx >= VMCH_MAX_OPEN) {
         return &err_access;
     }
-    moved = xfer(h, ptr, mem, n, 1);
+    moved = xfer(ws, h, ptr, mem, n, 1);
     hptr[idx] = ptr + moved;
     if (hptr[idx] > hext[idx]) {
         hext[idx] = hptr[idx];
     }
     if (moved != n) {           /* see fsentry_get_handler */
-        return badaddr_at(moved);
+        return badaddr_at(ws, moved);
     }
     return NULL;
 }
 
 _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -611,7 +768,6 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
     uint32_t h = (uint32_t)r->r[1];
     int idx = (int)h - 1;
 
-    (void)pw;
 
     if (idx < 0 || idx >= VMCH_MAX_OPEN) {
         return &err_access;
@@ -640,7 +796,7 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
         req->handle = h;
         req->arglen = 0;
         REQW(0) = ne;
-        if (vmch_go() != RC_OK) {
+        if (vmch_go(ws) != RC_OK) {
             return &err_access;
         }
         hext[idx] = ne;
@@ -671,17 +827,18 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
     }
 
-    uint32_t rc = vmch_req_close((uint32_t)r->r[1]);
+    uint32_t rc = vmch_req_close(ws, (uint32_t)r->r[1]);
     int idx = (int)r->r[1] - 1;
 
-    (void)pw;
     if (idx >= 0 && idx < VMCH_MAX_OPEN) {
         hptr[idx] = hext[idx] = 0;
     }
@@ -690,8 +847,10 @@ _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -701,12 +860,12 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     const char *name = (const char *)r->r[1];
     uint32_t size, type, attr, cs_lo, cs_hi, rc, load, exec;
 
-    (void)pw;
 
     switch (reason) {
     case 5:                            /* read catalogue info */
     case 9:                            /* ...without length */
-        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi, &load, &exec);
+        rc = info_of(ws, name, &size, &type, &attr, &cs_lo, &cs_hi,
+                     &load, &exec);
         {
             uint32_t obj = objtype_of(rc, type);
 
@@ -739,7 +898,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
         return &err_retired;
 
     case 7:                            /* create empty, of the type in R2 */
-        rc = file_on_host(r, name);
+        rc = file_on_host(ws, r, name);
         if (rc != RC_OK) {
             return rc_to_error(rc);
         }
@@ -752,8 +911,8 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     case 6:                            /* delete */
         req->cmd = C_DELETE;
         req->handle = 0;
-        put_path(name);
-        rc = vmch_go();
+        put_path(ws, name);
+        rc = vmch_go(ws);
         if (rc == RC_NOTFOUND) {
             r->r[0] = 0;
             return NULL;
@@ -773,7 +932,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
          * type it was asked to preserve.  The host now applies them: a
          * type is a rename (the type rides the host filename), a
          * datestamp is utimes(), attributes are chmod(). */
-        rc = file_on_host(r, name);
+        rc = file_on_host(ws, r, name);
         return (rc == RC_OK) ? NULL : rc_to_error(rc);
 
     default:
@@ -783,8 +942,10 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 
 _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -794,7 +955,6 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     uint8_t *buf, *src;
     uint32_t rc;
 
-    (void)pw;
 
     switch (r->r[0]) {
     case 0: case 1:                    /* *Dir / *Lib: FileSwitch stores
@@ -810,8 +970,8 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
          */
         req->cmd = C_RENAME;
         req->handle = 0;
-        put_two_paths((const char *)r->r[1], (const char *)r->r[2]);
-        rc = vmch_go();
+        put_two_paths(ws, (const char *)r->r[1], (const char *)r->r[2]);
+        rc = vmch_go(ws);
         if (rc != RC_OK) {
             return rc_to_error(rc);
         }
@@ -832,11 +992,11 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                                         * <len><name><opt> at r2 (PRM2
                                         * 2-576).  R2 is not validated by
                                         * FileSwitch for this reason. */
-        static const char disc[] = "HostFS";
+        const char *disc = DISC_NAME;
         uint8_t *b = (uint8_t *)r->r[2];
         uint32_t k = 0;
 
-        b[k++] = sizeof(disc) - 1;
+        b[k++] = (uint8_t)DISC_NAME_LEN;
         while (disc[k - 1]) {
             b[k] = disc[k - 1];
             k++;
@@ -854,8 +1014,8 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
          * The buffers are FileSwitch's own, allocated from the lengths
          * phase one returned, so they are sized and valid.
          */
-        static const char disc[] = "HostFS";
-        uint32_t dlen = sizeof(disc) - 1;
+        const char *disc = DISC_NAME;
+        uint32_t dlen = DISC_NAME_LEN;
         char *dbuf = (char *)r->r[4];
         uint32_t dsize = (uint32_t)r->r[6];
         uint32_t k;
@@ -890,8 +1050,8 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         req->cmd = C_FS_FUNC;
         req->handle = 0;
         REQW(0) = 30;
-        put_path((const char *)r->r[1]);
-        rc = vmch_go();
+        put_path(ws, (const char *)r->r[1]);
+        rc = vmch_go(ws);
         if (rc != RC_OK) {
             return rc_to_error(rc);
         }
@@ -931,13 +1091,13 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         /* catalogue the whole directory into the cache */
         req->cmd = C_CAT;
         req->handle = 0;
-        put_path((const char *)r->r[1]);
-        rc = vmch_go();
+        put_path(ws, (const char *)r->r[1]);
+        rc = vmch_go(ws);
         if (rc != RC_OK) {
             return rc_to_error(rc);
         }
-        nbytes = vmch_arglen();
-        n = nbytes / 64;
+        nbytes = vmch_arglen(ws);
+        n = nbytes >> 6;                /* 64-byte entries */
         if (n > 128) {
             n = 128;
         }
@@ -1038,186 +1198,222 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     }
 
     default:
-        return unsupported_func((uint32_t)r->r[0]);
+        return unsupported_func(ws, (uint32_t)r->r[0]);
     }
 }
 
 /* ---- module lifecycle ---------------------------------------------- */
 
-static int registered;
 
-/* the cmhg-generated FS entry veneers, defined in the header object */
-extern void fsentry_open(void);
-extern void fsentry_get(void);
-extern void fsentry_put(void);
-extern void fsentry_args(void);
-extern void fsentry_close(void);
-extern void fsentry_file(void);
-extern void fsentry_func(void);
+/* The filing system information block and its information word are in
+ * s.head, with the reasons for each bit: every word in the block is an
+ * offset from the module base, so it registers the same from ROM or RMA.
+ * hostfs_register() hands it to OS_FSControl 12. */
 
-static const char FilingSystemName[] = "HostFS";
-static void *hostfs_pw;
+/* Give the workspace back and forget it.  Safe to call on a half-built
+ * workspace: nothing in it needs undoing but the claim. */
+static void release_workspace(void *pw)
+{
+    _kernel_swi_regs r;
 
-#define OUR_FS_NUMBER 220
-#define INFO_FSFILE9_NOLEN 0x04000000u  /* LowFSI:121 fsinfo_fsfilereadinfonolen */
-/* LowFSI: fsinfo_dontuseload (bit 20) and fsinfo_dontusesave (bit 19).
- * "FileSwitch does *Load with Open, GBPB, close" — Doc/SimpleFS
- * recommends both for a network-flavour filing system, and they are what
- * makes whole-file and streaming one code path instead of two that can
- * disagree.  They did disagree: *Copy worked while *Type and BGET#
- * returned garbage, because only the whole-file path was exercised. */
-#define INFO_DONTUSESAVE   0x00080000u
-#define INFO_DONTUSELOAD   0x00100000u
-/* LowFSI fsinfo_multifsextensions (bit 23).  s/FSControl only dispatches
- * ReadFreeSpace, StampImage, UsedSpaceMap, ObjectAtOffset and the defect
- * calls to a filing system with this bit set; without it OS_FSControl 49
- * answers "Filing system does not support this operation" without ever
- * calling us.  It also commits us to Func 23 and Func 24, below. */
-#define INFO_MULTIFS       0x00800000u
-#define INFO_WORD (OUR_FS_NUMBER | (16u << 8) | INFO_FSFILE9_NOLEN \
-                   | INFO_DONTUSELOAD | INFO_DONTUSESAVE | INFO_MULTIFS)
+    if (WS_OF(pw) == NULL) {
+        return;
+    }
+    r.r[0] = 7;                          /* OS_Module 7: free, block in R2 */
+    r.r[2] = (int)WS_OF(pw);
+    (void)swix(XOS_Module, &r, &r);
+    WS_OF(pw) = NULL;
+}
 
 _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
 {
     _kernel_swi_regs r;
     _kernel_oserror *e;
-    uint32_t base;
-    unsigned int InfoBlk[12];
+    struct hostws *ws;
+    uint32_t i;
 
     (void)cmd_tail;
     (void)podule_base;
+
+    /* The workspace first: it is where every later write goes.  OS_Module 6
+     * takes the size in R3 and returns the block in R2 (Kernel/s/ModHand,
+     * RMAClaim_Chunk) — a size left in R2 claims whatever R3 held. */
+    r.r[0] = 6;
+    r.r[3] = (int)sizeof(struct hostws);
+    e = swix(XOS_Module, &r, &r);
+    if (e != NULL) {
+        return e;
+    }
+    ws = (struct hostws *)r.r[2];
+    for (i = 0; i < sizeof(struct hostws); i++) {
+        ((uint8_t *)ws)[i] = 0;          /* every initial value is zero */
+    }
+    WS_OF(pw) = ws;
 
     /* page-align the request block: it is exactly one page, so one
      * logical->physical translation covers every byte the device reads */
     req = (struct vmreq *)(((uint32_t)reqstore + 4095u) & ~4095u);
 
-    /* The doorbell is mapped on first use (see ensure_vmch): mapping
-     * from init fails because the IO area is off-limits mid-load. */
+    /* The doorbell is mapped on first use (see ensure_vmch): mapping from
+     * init fails, because the IO area is off-limits mid-load.  From the ROM
+     * chain that laziness is load-bearing — init runs even earlier. */
 
-    /* The FSInfo offsets are computed as live_address - base and
-     * FileSwitch stores base and adds it back (FSCtrl2), so any
-     * self-consistent base works; base 0 makes the offsets plain
-     * absolute addresses.  (OS_Module 18 cannot be used here: the
-     * module is not yet in the chain while its own init runs.) */
-    base = 0;
-
-    /* The filing system information block, built at runtime from live
-     * addresses (PRM2 2-532: FileSwitch copies it immediately) */
-    InfoBlk[0]  = (unsigned int)((unsigned long)FilingSystemName - base);
-    InfoBlk[1]  = 0;                     /* no startup banner */
-    InfoBlk[2]  = (unsigned int)((unsigned long)fsentry_open  - base);
-    InfoBlk[3]  = (unsigned int)((unsigned long)fsentry_get   - base);
-    InfoBlk[4]  = (unsigned int)((unsigned long)fsentry_put   - base);
-    InfoBlk[5]  = (unsigned int)((unsigned long)fsentry_args  - base);
-    InfoBlk[6]  = (unsigned int)((unsigned long)fsentry_close - base);
-    InfoBlk[7]  = (unsigned int)((unsigned long)fsentry_file  - base);
-    InfoBlk[8]  = INFO_WORD;             /* fs 220, 16 streams, File 9 */
-    InfoBlk[9]  = (unsigned int)((unsigned long)fsentry_func  - base);
-    InfoBlk[10] = 0;                     /* gbpb: FileSwitch synthesises */
-    InfoBlk[11] = 0;
-
-    r.r[0] = 12;                         /* FSControl_AddFS */
-    r.r[1] = (int)base;
-    r.r[2] = (int)((unsigned long)InfoBlk - base);
-    r.r[3] = (int)pw;
-    e = _kernel_swi(XOS_FSControl, &r, &r);
+    e = hostfs_register(pw);             /* FileSwitch's R12 for our entries */
     if (e != NULL) {
+        release_workspace(pw);           /* refuse, and leave nothing behind */
         return e;                        /* loud: never register silently */
     }
 
     registered = 1;
-    hostfs_pw = pw;
     return NULL;
 }
 
 _kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
+
     (void)fatal;
     (void)podule_base;
-    (void)pw;
+    if (ws == NULL) {
+        return NULL;
+    }
     if (registered) {
         _kernel_swi_regs r;
         uint32_t h;
 
-        /* hand back any host descriptors the device still holds */
-        for (h = 1; h <= VMCH_MAX_OPEN; h++) {
-            (void)vmch_req_close(h);
+        /* Hand back any host descriptors the device still holds — only if
+         * the doorbell was ever mapped.  Killed unused, vmch is NULL, and
+         * ringing it would write near address zero. */
+        if (vmch != NULL) {
+            for (h = 1; h <= VMCH_MAX_OPEN; h++) {
+                (void)vmch_req_close(ws, h);
+            }
         }
         r.r[0] = 16;                     /* FSControl_RemoveFS, by name */
-        r.r[1] = (int)FilingSystemName;
-        (void)_kernel_swi(XOS_FSControl, &r, &r);
+        r.r[1] = (int)DISC_NAME;
+        (void)swix(XOS_FSControl, &r, &r);
         registered = 0;
     }
+    release_workspace(pw);
     return NULL;
+}
+
+/* ---- *commands ----------------------------------------------------- */
+
+static void out_str(const char *text)
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = (int)text;
+    (void)swix(XOS_Write0, &r, &r);
+}
+
+static void out_nl(void)
+{
+    _kernel_swi_regs r;
+
+    (void)swix(XOS_NewLine, &r, &r);
+}
+
+static void out_hex(uint32_t v)
+{
+    char b[9];
+    int k;
+
+    for (k = 7; k >= 0; k--) {
+        uint32_t d = v & 15u;
+
+        b[k] = (char)(d < 10u ? '0' + d : 'A' + d - 10u);
+        v >>= 4;
+    }
+    b[8] = 0;
+    out_str(b);
+}
+
+static void out_dec(uint32_t v)
+{
+    char b[11];
+
+    (void)str_dec(b, v);
+    out_str(b);
+}
+
+static void out_probe(const char *label, _kernel_oserror *e)
+{
+    out_str(label);
+    if (e != NULL) {
+        out_str(" error ");
+        out_hex((uint32_t)e->errnum);
+        out_str(" ");
+        out_str(e->errmess);
+    }
 }
 
 _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
                                  int cmd_no, void *pw)
 {
+    struct hostws *ws = WS_OF(pw);
     _kernel_swi_regs r;
     _kernel_oserror *e;
 
     (void)arg_string;
     (void)argc;
-    (void)pw;
 
-    /* cmd_no is cmhg's index into the command-keyword-table, in table
-     * order: 0 = HostFSPing, 1 = HostFSStatus.  Keep this switch and
-     * dde/cmhg/HostFS in lockstep if the table is reordered. */
+    /* cmd_no is the command's position in head.s's table: 0 = HostFSPing,
+     * 1 = HostFSStatus.  Keep the two in step. */
     if (cmd_no == 1) {                   /* *HostFSStatus */
-        printf("HostFS vmch=%08X magic=%08X features=%08X registered=%d pw=%08X\r\n",
-               (unsigned int)(unsigned long)vmch,
-               vmch ? vmch_reg(VMCH_MAGIC / 4) : 0xDEAD,
-               vmch ? vmch_reg(VMCH_FEATURES / 4) : 0xDEAD,
-               registered, (unsigned int)pw);
-        r.r[0] = 13;                     /* re-run the mapping probe */
-        r.r[1] = (int)VMCH_PHYS;
-        r.r[2] = (int)VMCH_SIZE;
-        e = _kernel_swi(XOS_Memory, &r, &r);
-        printf("OS_Memory 13: e=%d R3=%08X\r\n", e != NULL, r.r[3]);
-        r.r[0] = 18;                     /* OS_Module 18: LookupName (not
-                                          * 0 = Run, which enters this
-                                          * resident module as an app and
-                                          * aborts) */
+        uint32_t mbase = 0, msize = 0, w = (uint32_t)(unsigned long)ws;
+
+        r.r[0] = 18;                     /* OS_Module 18: LookupName */
         r.r[1] = (int)"HostFS";
-        e = _kernel_swi(XOS_Module, &r, &r);
-        printf("OS_Module 18: e=%d R1(num)=%08X R3(base)=%08X R4(pw)=%08X\r\n",
-               e != NULL, r.r[1], r.r[3], r.r[4]);
-        /* Where the static data really lives.  A module that is to run
-         * from ROM must not write its own image, so these must be outside
-         * [base, base+size) — which -zM promises and this checks.  The
-         * module's size word is at base-4. */
+        e = swix(XOS_Module, &r, &r);
         if (e == NULL) {
-            uint32_t mbase = (uint32_t)r.r[3];
-            uint32_t msize = *(uint32_t *)(mbase - 4);
-            uint32_t a = (uint32_t)(unsigned long)reqstore;
-            uint32_t c = (uint32_t)(unsigned long)catents;
-            printf("image %08X..%08X  reqstore=%08X %s  catents=%08X %s  req=%08X\r\n",
-                   mbase, mbase + msize,
-                   a, (a >= mbase && a < mbase + msize) ? "IN-IMAGE" : "outside",
-                   c, (c >= mbase && c < mbase + msize) ? "IN-IMAGE" : "outside",
-                   (unsigned int)(unsigned long)req);
+            mbase = (uint32_t)r.r[3];
+            msize = *(uint32_t *)(mbase - 4);   /* the size word before it */
         }
+        out_probe("OS_Module 18:", e);
+        out_str(" image ");
+        out_hex(mbase);
+        out_str("..");
+        out_hex(mbase + msize);
+        out_nl();
+
+        /* The one fact R1 turns on: the workspace is a separate RMA block,
+         * and nothing this module writes is inside its image. */
+        out_str("workspace ");
+        out_hex(w);
+        out_str(" (");
+        out_dec(sizeof(struct hostws));
+        out_str(" bytes) ");
+        out_str((w >= mbase && w < mbase + msize) ? "INSIDE THE IMAGE"
+                                                   : "outside the image");
+        out_str(", private word ");
+        out_hex((uint32_t)(unsigned long)pw);
+        out_nl();
+
+        out_str("vmch ");
+        out_hex((uint32_t)(unsigned long)vmch);
+        out_str(" magic ");
+        out_hex(vmch ? vmch_reg(VMCH_MAGIC / 4) : 0);
+        out_str(" features ");
+        out_hex(vmch ? vmch_reg(VMCH_FEATURES / 4) : 0);
+        out_str(" requests ");
+        out_dec(ws->w_seq);
+        out_str(" registered ");
+        out_dec((uint32_t)registered);
+        out_nl();
+
         r.r[0] = 13;                     /* FSControl_LookupFS, by name */
         r.r[1] = (int)"HostFS";
-        e = _kernel_swi(XOS_FSControl, &r, &r);
-        printf("FSControl 13: e=%d", e != NULL);
-        if (e != NULL) {
-            printf(" num=%d %s", e->errnum, e->errmess);
-        } else {
-            printf(" R1=%08X R2=%08X R3=%08X", r.r[1], r.r[2], r.r[3]);
+        e = swix(XOS_FSControl, &r, &r);
+        out_probe("FSControl 13:", e);
+        if (e == NULL) {
+            out_str(" R1 ");
+            out_hex((uint32_t)r.r[1]);
+            out_str(" R2 ");
+            out_hex((uint32_t)r.r[2]);
         }
-        printf("\r\n");
-        r.r[0] = 20;                     /* FSControl_ReadModuleBase */
-        r.r[1] = (int)"HostFS";
-        e = _kernel_swi(XOS_FSControl, &r, &r);
-        printf("FSControl 20: e=%d", e != NULL);
-        if (e != NULL) {
-            printf(" num=%d %s", e->errnum, e->errmess);
-        } else {
-            printf(" R1=%08X", r.r[1]);
-        }
-        printf("\r\n");
+        out_nl();
         return NULL;
     }
 
@@ -1226,7 +1422,7 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
     }
 
     {
-        _kernel_oserror *me = ensure_vmch();
+        _kernel_oserror *me = ensure_vmch(ws);
         if (me != NULL) {
             return me;
         }
@@ -1238,7 +1434,7 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
     req->data[1] = 'N';
     req->data[2] = 'G';
     req->data[3] = '!';
-    if (vmch_go() != RC_OK || vmch_arglen() != 4) {
+    if (vmch_go(ws) != RC_OK || vmch_arglen(ws) != 4) {
         return &err_nodev;
     }
     return NULL;
