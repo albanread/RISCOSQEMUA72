@@ -26,10 +26,9 @@
 # plain run-macos.sh is unchanged.  tools/instance.sh builds on these to
 # run several isolated machines at once.
 #   RISCOS_MODULES space-separated module files spliced into the ROM
-#                  before boot (BOOTDESIGN.md §3; order = init order).
-#                  The spliced image is cached beside the stock one and
-#                  rebuilt only when a module changes.  Without it the
-#                  stock RISCOS.IMG is booted untouched.
+#                  before boot; a share (RISCOS_HOSTFS) also splices the
+#                  HostFS module.  See rom.zsh.  With neither, the stock
+#                  RISCOS.IMG is booted untouched.
 #
 # Anything after the options is passed on to QEMU.
 #
@@ -46,27 +45,9 @@ for f in "$Q" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
     [[ -e "$f" ]] || { print -u2 "missing: $f"; exit 1; }
 done
 
-# ROM module splicing (BOOTDESIGN.md §3): the spliced image is cached
-# under a hash of the stock ROM plus every module's contents, so a
-# module edit rebuilds it and a relaunch does not.
-ROM="$IMAGES/RISCOS.IMG"
-if [[ -n "${RISCOS_MODULES:-}" ]]; then
-    mods=(${=RISCOS_MODULES})
-    for m in $mods; do
-        [[ -e "$m" ]] || { print -u2 "RISCOS_MODULES: missing: $m"; exit 1; }
-    done
-    key=$( (shasum -a 256 "$ROM" $mods; shasum -a 256 $mods) \
-           | shasum -a 256 | cut -c1-16 )
-    ROM="$IMAGES/RISCOS-$key.IMG"
-    if [[ ! -e "$ROM" ]]; then
-        print "run-macos: splicing ${#mods} module(s) -> ${ROM:t}"
-        modargs=( -o "$ROM" )
-        for m in $mods; do modargs+=( -m "$m" ); done
-        "$HERE/mkrom.py" "$IMAGES/RISCOS.IMG" $modargs
-    else
-        print "run-macos: cached ${ROM:t}"
-    fi
-fi
+# ROM module splicing (BOOTDESIGN.md §3), and HostFS with a share
+source "$HERE/rom.zsh"
+rom_to_boot "$IMAGES"
 
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off

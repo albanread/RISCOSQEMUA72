@@ -871,6 +871,7 @@ Measured on the Mac Pi 4 machine, TCG, soft-loaded module:
 | 3 Names and types | dot/slash, `,xxx` consumed, 179-entry typemap, case-insensitive, host-local dates | `*Ex` screenshots; dotted names open |
 | 4 Metadata | `*SetType` renames, `*Access`, datestamps written back | module copied out as `,ffa` `RMLoad`s with no `SetType` |
 | 5 Directories | Rename; disc name; bit 23 with Func 23/24; Func 14/15/19; free space | `OS_GBPB` 9/10/11 records; `OS_FSControl 49` |
+| R1 From ROM | HostFS 2.00: workspace at the private word; no cmhg, no stubs; header, veneers and constants in objasm | spliced ROM, nothing soft-loaded: `*Modules` at &FC4BCDA8, `*Ex` types and dates, 256 KiB round trip `cmp`-identical |
 
 ### The acceptance rule for everything below
 
@@ -880,61 +881,114 @@ onto the chain, not that it runs — a module can splice, list, and then
 abort on its first write. Every sprint below names a working result: a
 transfer through the doorbell, a window that opens, a desktop reached.
 
-### R1 — HostFS runs from ROM
+### R1 — HostFS runs from ROM: done
 
-The theory, and it is the right one: a module on the ROM chain executes
-in place, so it may not write its own image, and its variables must live
-in RMA at the workspace the private word (R12) points to.
+Done 12 Sep 2026. A stock `RISCOS.IMG` spliced by `tools/mkrom.py` with
+HostFS 2.00, and booted with `BootHostFS` deleted from PreDesk so that
+nothing is soft-loaded:
 
-- **Every mutable static moves into one `struct hostws`**: the doorbell
-  window pointer, the request block and its physical address, the
-  sequence number, the per-handle arrays, the catalogue cache, the
-  registration flag, and v1's own additions — the two formatted error
-  buffers. Constant error blocks and `FilingSystemName` stay in the image:
-  never written, and ROM is readable.
-- **Claim it in init with `OS_Module 6`, size in R3** — not R2.
-  `Kernel/s/ModHand` reads R3; a size in R2 claims a garbage-sized block
-  and the zeroing that follows flattens its neighbours (found the hard way
-  in GVFill, `c0a55e4f44`).
-- **Store the address in the private word** — `*(struct hostws **)pw` —
-  and reach it through `pw` in every entry point, passed down into every
-  helper. **There must be no file-scope pointer to it.** That pointer is
-  itself a writable static, and writing it at init aborts from ROM.
-- **Free it in final**, and leave nothing behind if init fails part way.
-- **The lazy doorbell mapping becomes load-bearing.** `OS_Memory 13` fails
-  during module init, which is why `ensure_vmch()` maps on first use; from
-  ROM that is not a convenience but the only way it can work.
+- `*Modules` lists `HostFS` at &FC4BCDA8, a ROM address.
+- `*HostFSStatus` puts the image at &FC4BCDA8..&FC4BEB7C and the
+  16,660-byte workspace at &201B85F4, in the RMA.
+- `*Ex HostFS:` lists real types and dates; `*Type` streams; a 256 KiB
+  `*Copy` in and back out is `cmp`-identical.
+
+The same module soft-loads with `RMLoad` and passes the same tests.
+
+**The variables were the smaller half.** They moved as planned: one
+`struct hostws`, claimed with `OS_Module 6` (size in R3) at init, its
+address in the private word, handed to every handler through `pw` and to
+every helper as an argument, freed in final, with no file-scope pointer to
+it. But a module built the old way — cmhg header, `link -rmf` with
+`C:o.stubs` — cannot run in place whatever its variables do, for three
+reasons, each read in the source and confirmed in the binary:
+
+1. **Link's relocation code writes the image.** cmhg's init veneer calls
+   `__RelocCode`, which adds the load address to every absolute address
+   word in the module — 58 of them in `HostFSv6,ffa`. This is what aborted
+   the first splice, not a HostFS variable: its screen reads `Abort on
+   data transfer at &FC4BFC8C`, which is the `STR` in that module's
+   relocation routine (offset &2EE4), and its DFAR, &FC4BF10C, is the first
+   entry of the module's relocation table (offset &2364).
+2. **SharedCLibrary patches the stubs in place.** `_clib_initialisemodule`
+   calls `SharedCLibrary_LibInitModule`, which writes branch instructions
+   over the stub vectors in the image (`RISC_OSLib/s/initmodule`, `FixLDRs`).
+3. **The C runtime owns the private word.** `_kernel_moduleentry` stores
+   its own block there (`STR r2, [r12]`), and every cmhg veneer starts
+   `LDR r12, [r12]` to load its relocation offsets from that block. The
+   plan's `*(struct hostws **)pw = ws` would have broken every entry.
+
+And one earlier claim was wrong the other way: `C:o.stubs` does claim a
+workspace. With cmhg's `r0 = 1` it copies the statics into an RMA block,
+which is why `*HostFSStatus` saw them outside the image when soft-loaded —
+and why that proved nothing about ROM.
+
+**The build now** (`dde/Build,feb`), still all DDE:
+
+- `objasm` assembles `s.head`: the module header; the init, final, command
+  and FS entry veneers; `swix`, which calls any SWI through
+  `OS_CallASWIR12`; and the constant data C would otherwise reach through
+  an absolute address — the FS information block and the error blocks,
+  every word an offset within the one AREA.
+- `cc -zps1` compiles `c.hostfs`: no statics, no C library (`printf` and
+  `sprintf` replaced, and no division, which cc turns into a library
+  call), string literals reached PC-relative.
+- `link -rmf o.head o.hostfs`, and nothing else. Link appends
+  `__RelocCode` only to a module that imports it (DesktopTools, "Relocatable
+  modules"), and nothing here does.
+- **The check is `decaof -r`**, which `Build,feb` writes to `o.relocs`:
+  every relocation in both objects must be PC-relative. Today there are 10
+  in `o.head` and 19 in `o.hostfs`, all branches. The image is 7,632 bytes;
+  the stubs build was 12,644.
+
+The lazy doorbell mapping is load-bearing, as expected (`OS_Memory 13`
+fails during init). One bug fell out on the way: `hostfs_final` rang the
+doorbell to close handles even when it had never been mapped, so killing a
+HostFS that was never used wrote near address zero.
 
 Do not merge `zcode/romloader`'s `f5abc37686`. It converts the v0 module,
-which v1 has since rewritten, and it carries both fatal mistakes above: the
-workspace pointer is a module static (`static struct hostws *WS`), and the
-claim size is in R2.
-
-*Acceptance:* a stock `RISCOS.IMG` spliced by `tools/mkrom.py` with HostFS,
-booted with no HostFS in `!Boot.Choices.Boot.PreDesk` and nothing
-`*RMLoad`ed: `*Ex HostFS:` lists real types and dates, and a 256 KiB
-`*Copy` in and back out is byte-identical. The same module still
-soft-loads and passes the same test.
+keeps a static workspace pointer, claims with the size in R2 — and keeps
+cmhg and the stubs, so the relocation code would still abort before any of
+it ran.
 
 ### R2 — present when the machine starts
 
-- The launchers splice HostFS by default when a share is configured
-  (`RISCOS_HOSTFS` set implies the module), so a user never meets a machine
-  with a share and no filing system.
-- The card images stop needing HostFS in PreDesk; a PreDesk copy of an
-  older module must not shadow the ROM one — check which wins, and make
-  the answer the ROM.
-- First use after a cold boot maps the doorbell and works without any
-  command having primed it.
+- **Done: the Mac launchers splice HostFS whenever there is a share.**
+  `tools/rom.zsh`, sourced by `run-macos.sh` and `run-app.sh` (and so by
+  `instance.sh`), puts `hostfs/dde/HostFS,ffa` ahead of `RISCOS_MODULES`
+  when `RISCOS_HOSTFS` is set. `RISCOS_HOSTFS_MODULE` names another build,
+  or empty for none; a module titled HostFS already in `RISCOS_MODULES`
+  stands instead. The Windows launchers (`run.py`, `farm.py`) are not
+  changed; they boot RAM snapshots, and a snapshot taken without HostFS in
+  ROM restores a machine without it.
+- **Done: first use needs no priming.** After a reset, the very first
+  command, `*Cat HostFS:`, lists the share; the doorbell maps on that call.
+- **Open: the cards shadow the ROM.** Checked on the DDE card:
+  `!Boot.Choices.Boot.PreDesk.BootHostFS` is an unconditional
+  `RMLoad SDFS::0.$.hostfs`, and `RMLoad` replaces a ROM module of the same
+  name. A normal boot of the spliced ROM therefore ends with `*Help HostFS`
+  reporting the card's 1.01, not 2.00. `Service_ModulePreInit` cannot veto
+  a load, so the fix belongs on the cards, and it is the ordinary one:
+
+      RMEnsure HostFS 2.00 RMLoad SDFS::0.$.hostfs
+
+  or no `BootHostFS` at all. The images are shared team artefacts
+  (`ROS_PRIVATE/sdimg`), so the change waits for whoever owns them. Until
+  then, the tests above delete `BootHostFS` inside the session — the card
+  is opened with `snapshot=on`, so the deletion never reaches the image —
+  and reset.
 
 *Acceptance:* cold boot, and the very first command, `*Cat HostFS:`, lists
-the share.
+the share. Met with `BootHostFS` removed; met on every card once the cards
+carry the `RMEnsure`.
 
 ### D1 — a real disc: icon and Filer
 
 - **HostFSFiler** (`9fb0f156a6`, the Windows team's, on the RAMFSFiler
-  pattern) is also a C module and gets the R1 treatment, spliced after
-  HostFS.
+  pattern) is a cmhg module linked with the stubs, so it needs what HostFS
+  needed: header and veneers in objasm, no stubs, no statics, constants
+  where ADR reaches them. As a module task it also needs start code of its
+  own where `_clib_entermodule` was. Spliced after HostFS.
 - The HostFS disc is on the icon bar at startup; a click opens the root in
   a Filer window; files carry their real type icons, which sprints 3 and 4
   made possible; double-clicking a Text file opens it.
@@ -982,8 +1036,12 @@ filing-system calls and wall-clock.
 
 Errors on a registered filing system error base (§9) and a real FS number
 from ROOL before anything ships outside the team; `readonly=` (§10);
-several shares selected by disc name; wildcards in `FSEntry_File` 1–4; and
-64-bit free space (Func 35/36).
+several shares selected by disc name; wildcards in `FSEntry_File` 1–4;
+64-bit free space (Func 35/36); and time zones — the guest's clock is UTC
+with no zone configured while the host maps datestamps as local time, so a
+file saved from the guest reads an hour old on a Mac in BST. RISC OS
+datestamps are UTC by definition; the right fix is UTC on the wire and the
+zone configured in the guest, not a different offset in the host.
 
 ### The measurement that went with sprint 1
 

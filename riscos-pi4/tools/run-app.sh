@@ -18,7 +18,9 @@
 #   WITH_QMP=1     add the developer's QMP socket anyway
 #   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
 #                  guest (FSDESIGN.md); unset leaves the doorbell
-#                  device present but file commands off
+#                  device present but file commands off.  A share also
+#                  puts the HostFS module in the ROM (rom.zsh)
+#   RISCOS_MODULES further modules for the ROM (rom.zsh)
 #
 # Anything after the options is passed on as further QEMU arguments.
 #
@@ -32,9 +34,13 @@ for f in "$APP" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
     [[ -e "$f" ]] || { print -u2 "missing: $f"; exit 1; }
 done
 
+# The same ROM the developer's launch boots: HostFS in it with a share
+source "$HERE/rom.zsh"
+rom_to_boot "$IMAGES"
+
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off
-    -kernel "$IMAGES/RISCOS.IMG"
+    -kernel "$ROM"
     -device loader,file="$IMAGES/cmos.bin",addr=0x510000,force-raw=on
     -netdev user,id=n0
     -device usb-hub,bus=usb-bus.0,port=1
