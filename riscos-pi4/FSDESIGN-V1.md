@@ -219,10 +219,45 @@ Honest limits, recorded so nobody rediscovers them:
   first page of that buffer translates and the second does not.  The
   earlier text here assumed "application space or the RMA, so this is
   fine in practice".  The RMA half is right; **application space is
-  not**, and the mechanism is not yet established — RISC OS's
-  application slot is per-task and remapped on task switch, and whether
-  what fails is the translation regime, the access permissions, or a
-  genuinely absent mapping is the first thing sprint 1b has to find out.
+  not**.
+
+  What the evidence does and does not support, because the difference
+  matters to whoever picks this up:
+
+  - **Page crossing is not the problem.**  The 12320-byte transfer at
+    `0x493aa000` spans four pages and moves whole.  `cpu_memory_rw_debug`
+    crosses pages correctly.
+  - **It is not lazy mapping.**  Touching every page of the buffer from
+    BASIC first (`FOR I%=0 TO 262143 STEP 4096:B%?I%=0:NEXT`) changes
+    nothing: the next attempt fails at the same address, after the same
+    252 bytes.  The guest can read and write `0x9000` perfectly well at
+    the moment QEMU says it cannot translate it.
+  - **Translation is context-dependent, and the monitor is not a witness
+    to it.**  `gva2gpa` over QMP reports *Unmapped* for every one of
+    these addresses — including `0x493aa000`, which the same run had just
+    transferred successfully.  The monitor samples whatever task happens
+    to be current, so it cannot be used to check an address that was live
+    during somebody else's doorbell.  Any future diagnosis has to be made
+    from inside the handler, not from the monitor.
+
+  So the open question is narrow: why, at the instant the module rings
+  the doorbell on BASIC's behalf, does the ARM debug walk resolve
+  `0x8f04` and refuse `0x9000`.  The candidates are the mmu_idx the debug
+  path picks for the current mode, a permission check applied to the
+  walk, and RISC OS mapping application space in a form the walk handles
+  differently from a dynamic area.  Instrumenting `guest_rw_counted` to
+  log the failing address and the CPU's mode and TTBR at the point of
+  failure would settle it in one run.
+
+  **A fix that does not need that answer**: stage through memory that is
+  known to translate.  The module owns RMA, and RMA translates — so a
+  transfer whose guest buffer comes up short can be retried into an RMA
+  staging block and `memcpy`d to the caller in guest code, where the
+  guest's own MMU does the work and the question does not arise.  That
+  costs one copy and keeps the doorbell count proportional to the staging
+  size rather than to the page count: a 64 KiB stage makes a 256 KiB read
+  four doorbells instead of 130.  Worth doing on the failure path only,
+  so the fast path stays at one.
 
   Two consequences, neither optional:
 
