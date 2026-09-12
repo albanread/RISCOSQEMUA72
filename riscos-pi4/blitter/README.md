@@ -13,15 +13,27 @@ everything else through untouched.
 
 ## What it takes on
 
-**Fills** — any plain colour.  The colour block is sixteen words of
-interleaved `(ora, eor)` and a fill is `(dest ORR ora) EOR eor` per
-word; when every `ora` is all ones that reduces to a constant.  Other
-GCOL actions need the destination read back and are left alone.
+**Fills — any plain colour, at any whole-byte screen depth.**  The
+colour block is sixteen words of interleaved `(ora, eor)` and a fill is
+`(dest ORR ora) EOR eor` per word; when every `ora` is all ones that
+reduces to a constant.  Other GCOL actions need the destination read
+back and are left alone.  The constant is handed to the device as the
+shortest byte pattern it repeats at — one byte for an 8bpp plain
+colour, so the device memsets — which also keeps odd widths fillable
+(the device refuses a width the pattern does not divide).
 
-**Sprites** — `PutSpriteScaled` where the sprite is pointed at rather
-than named, 32bpp into a 32bpp screen, whole words edge to edge, and
-not actually scaling.  Nothing in a desktop session scales: every scale
-block sampled has equal multiplier and divisor, so this is a copy.
+**Sprites — pointed at, unmasked, the screen's own pixel format.**
+The sprite's type must be the one matching the screen (6 for 32bpp, 4
+for 8bpp, 5 for a 5:5:5 16bpp screen — the Pi's 16bpp is 5:6:5, where
+old type-5 sprites genuinely need conversion and are passed up), the
+plot must be a plain store, not really scaling, and whole-pixel at the
+left edge; the right edge may stop mid-word, at any depth.  At 8bpp a
+sprite that carries its own palette is passed up too: byte indices
+only copy when both sides mean the same colours by them.  A pixel
+translation table is allowed through only where it has nothing to say
+(same-format sprites); cross-depth plots — every desktop sprite onto
+an 8bpp screen — are passed to SpriteExtend, which really converts
+them.
 
 Masked sprites are **not** taken.  The mask merge was implemented,
 loaded, and drew the desktop wrong — windows in the wrong place, content
@@ -48,7 +60,7 @@ without involving GraphicsV.
 
 ## Where it stands
 
-On a 1920x1200 desktop with NetSurf and a filer window:
+On a 1920×1200 desktop with NetSurf and a filer window:
 
 - **98.2% of sprite pixels** on the host — 753,664 against 13,571
   passed.
@@ -56,6 +68,18 @@ On a 1920x1200 desktop with NetSurf and a filer window:
   80us, of which 61.8us is the host blit and about 18us is guest-side.
 - **0 differing pixels of 2,304,000** against the same scene with the
   module absent, re-checked after every change.
+
+Below 32bpp (v1.01, measured on the Windows rig, 2026-09-12): the fill
+path takes window-furniture and full-screen fills at **8bpp** with
+byte-exact geometry — a 91×17 title-bar segment in 2us, the
+1920×1200 mode-change erase in 303us — and the same code serves 16bpp
+unchanged, widths and strides being bytes.  Sprite plots onto an 8bpp
+screen are cross-depth by nature (the desktop's sprites are deep, with
+translation tables) and are passed to SpriteExtend by design; the
+same-format sprite gates are in place for when same-depth sprites
+appear.  A 16bpp 5:6:5 screen declines old type-5 sprites on purpose:
+a copy between the two 16bpp layouts re-tints, and passing those up
+keeps the pixels right.
 
 What is left is one thing, not many.  Counting every gate separately —
 named 0, wastage 0, scaling 0, mask 0, depth 3, no table 0 — leaves the

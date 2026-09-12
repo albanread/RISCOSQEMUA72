@@ -99,7 +99,7 @@ base:
 title:
     .asciz  "GVFill"
 help:
-    .asciz  "GVFill\t1.00 (11 Sep 2026) Host-blitter rectangle fill"
+    .asciz  "GVFill\t1.01 (12 Sep 2026) Host-blitter fill and sprite plot, 8/16/32bpp"
     .balign 4
 modflags:
     .word   1                       @ 32-bit compatible
@@ -287,7 +287,17 @@ gv_chk:
     STR     r3, [r0, #BLIT_WIDTH]
     STR     r6, [r0, #BLIT_HEIGHT]
     STR     r5, [r0, #BLIT_DSTRIDE]
+    @ The pattern's repeat length must divide the width in bytes, so
+    @ a word pattern would be refused on odd widths at 8bpp.  A plain
+    @ colour's word is the sub-pixel repeated; say so with the
+    @ shortest length it repeats at and the device memsets.
     MOV     r1, #4
+    TEQ     r9, r9, ROR #8
+    MOVEQ   r1, #1                  @ every byte equal: 8bpp plain colour
+    BEQ     gv_patlen
+    TEQ     r9, r9, ROR #16
+    MOVEQ   r1, #2                  @ halfwords equal: 16bpp plain colour
+gv_patlen:
     STR     r1, [r0, #BLIT_PATLEN]
     STR     r9, [r0, #BLIT_PATTERN]
     STR     r9, [r0, #BLIT_PATTERN + 4]
@@ -460,18 +470,17 @@ sv_handler:
     LDR     r9, [r2, #spTrans]
     TEQ     r8, r9
     BNE     sv_pass                 @ masked
-    LDR     r8, [r2, #spMode]
-    MOV     r8, r8, ASR #27
-    TEQ     r8, #6                  @ sprite type 6 = 32bpp
-    BNE     sv_pass
+    LDR     r7, [r2, #spMode]
+    MOV     r7, r7, ASR #27         @ sprite type, kept in a preserved
+                                    @ register: the SWIs below leave
+                                    @ r4-r11 alone, and it is compared
+                                    @ against the screen's own format
+                                    @ once the VDU constants are in
     TEQ     r5, #0                  @ GCOL action: store only
     BNE     sv_pass
     LDR     r8, [r2, #spLBit]
     TEQ     r8, #0
     BNE     sv_pass                 @ left-hand wastage
-    LDR     r8, [r2, #spRBit]
-    TEQ     r8, #31
-    BNE     sv_pass                 @ right-hand wastage
     TEQ     r6, #0
     BEQ     sv_scaled_ok
     LDMIA   r6, {r8, r9, r10, r11}
@@ -495,13 +504,51 @@ sv_scaled_ok:
     BVS     sv_pass
 sv_haveconst:
     ADR     r0, sv_winvars
-    ADR     r1, sv_vduvals + 20
+    ADR     r1, sv_vduvals + 24     @ after the six mode constants
     SWI     XOS_ReadVduVariables
     BVS     sv_pass
     ADR     r1, sv_vduvals
-    LDR     r8, [r1, #12]
-    TEQ     r8, #5                  @ screen 32bpp too
+    LDR     r8, [r1, #12]           @ Log2BPP
+    LDR     r9, [r1, #20]           @ NColour
+    @ The sprite must be in the screen's own pixel format, not merely
+    @ the same depth: 16bpp is two layouts (5:5:5 old sprites, 5:6:5
+    @ the Pi's screen), and a copy between them re-tints the picture.
+    CMP     r8, #3
+    BLO     sv_pass                 @ sub-byte screens are not ours
+    CMP     r8, #5
+    BHI     sv_pass
+    MOVEQ   r10, #6                 @ 32bpp screen: sprite type 6
+    BEQ     sv_fmt
+    TEQ     r8, #3
+    MOVEQ   r10, #4                 @ 8bpp screen: type 4
+    BEQ     sv_fmt
+    LDR     r10, =0x7FFF            @ 16bpp, and only a 5:5:5 screen
+    TEQ     r9, r10
+    BNE     sv_pass                 @ matches type 5; 5:6:5 converts
+    MOV     r10, #5
+sv_fmt:
+    TEQ     r7, r10                 @ the sprite is the screen's format
     BNE     sv_pass
+    TEQ     r10, #4                 @ 8bpp: indices only copy when both
+    BNE     sv_nopal                @ sides use the same palette, so a
+    LDR     r11, [r2, #spImage]     @ sprite that carries its own
+    TEQ     r11, #44                @ (spImage past the header) passes
+    BNE     sv_pass
+sv_nopal:
+    @ Pixels per row from the word count and the right-hand wastage --
+    @ below 32bpp a row is more pixels than words, and the desktop's
+    @ icons are routinely odd-width.  The stride stays words x 4:
+    @ rows are word padded at every depth.
+    LDR     r9, [r2, #spWidth]
+    ADD     r9, r9, #1              @ words per row
+    MOV     r9, r9, LSL #5          @ bits per row
+    LDR     r5, [r2, #spRBit]
+    RSB     r5, r5, #31             @ wasted bits in the last word
+    SUB     r9, r9, r5              @ bits the pixels occupy
+    MOV     r5, r9, LSR r8          @ pixels: /2^Log2BPP
+    SUB     r8, r8, #3
+    MOV     r6, #1
+    MOV     r6, r6, LSL r8          @ bytes per pixel
 
     @ OS units to pixels, and the bottom-left origin to the top-left one
     @ the device works in.
@@ -514,14 +561,12 @@ sv_haveconst:
     ADD     r4, r4, r9
     MOV     r4, r4, ASR r8          @ bottom edge, bottom origin
 
-    LDR     r5, [r2, #spWidth]
-    ADD     r5, r5, #1              @ pixels: one word each at 32bpp
-    LDR     r6, [r2, #spHeight]
-    ADD     r6, r6, #1
-    LDR     r7, [r1, #16]
-    ADD     r7, r7, #1              @ yres
-    SUB     r9, r7, r4
-    SUB     r9, r9, r6              @ top edge, top origin
+    LDR     r7, [r2, #spHeight]
+    ADD     r7, r7, #1              @ rows
+    LDR     r8, [r1, #16]
+    ADD     r8, r8, #1              @ yres
+    SUB     r9, r8, r4
+    SUB     r9, r9, r7              @ top edge, top origin
 
     ADR     r10, sv_accoff
     LDR     r10, [r10]
@@ -531,7 +576,7 @@ sv_haveconst:
     @ Keep the biggest sprite seen, not the last: *SprBench replots it,
     @ and the last one is usually a 128x128 wallpaper tile whose plot
     @ rounds to nothing either way.
-    MUL     r10, r6, r5
+    MUL     r10, r7, r5
     ADR     r11, sv_lastarea
     LDR     r11, [r11]
     CMP     r10, r11
@@ -555,14 +600,15 @@ sv_haveconst:
     LDR     r11, [r2, #spImage]
     ADD     r11, r11, r2            @ logical: the host walks the page tables
     STR     r11, [r10, #BLIT_SRC]
-    MOV     r11, r5, LSL #2
+    LDR     r11, [r2, #spWidth]
+    ADD     r11, r11, #1
+    MOV     r11, r11, LSL #2        @ SSTRIDE: rows are word padded
     STR     r11, [r10, #BLIT_SSTRIDE]
     STR     r5, [r10, #BLIT_WIDTH]
-    STR     r6, [r10, #BLIT_HEIGHT]
+    STR     r7, [r10, #BLIT_HEIGHT]
     STR     r3, [r10, #BLIT_DSTX]
     STR     r9, [r10, #BLIT_DSTY]
-    MOV     r11, #4
-    STR     r11, [r10, #BLIT_BPP]
+    STR     r6, [r10, #BLIT_BPP]    @ bytes per pixel, from the screen
 
     LDR     r11, [r1, #20]          @ GWLCol
     STR     r11, [r10, #BLIT_CLIPX0]
@@ -585,7 +631,7 @@ sv_haveconst:
     LDR     r9, [r8]
     ADD     r9, r9, #1
     STR     r9, [r8]
-    MUL     r9, r6, r5              @ pixels actually taken on
+    MUL     r9, r7, r5              @ pixels actually taken on
     ADR     r8, sv_accarea
     LDR     r10, [r8]
     ADD     r10, r10, r9
@@ -613,6 +659,15 @@ sv_pass:
     ADD     r9, r9, #1
     LDR     r10, [r2, #spHeight]
     ADD     r10, r10, #1
+    @ Words to pixels at the cached depth, so the taken and passed
+    @ areas stay in the same units below 32bpp; before the first take
+    @ the cache is zero and the 32bpp convention is assumed.
+    ADR     r11, sv_vduvals
+    LDR     r11, [r11, #12]         @ Log2BPP
+    CMP     r11, #3
+    MOVLO   r11, #5
+    RSB     r11, r11, #5            @ 2, 1 or 0 for 8, 16, 32bpp
+    MOV     r9, r9, LSL r11
     MUL     r9, r10, r9
     ADR     r8, sv_passarea
     LDR     r10, [r8]
@@ -659,6 +714,7 @@ sv_constvars:
     .word   6                       @ LineLength
     .word   9                       @ Log2BPP
     .word   12                      @ YWindLimit
+    .word   3                       @ NColour -- the 16bpp layout split
     .word   -1
 sv_winvars:
     .word   0x80                    @ GWLCol
@@ -669,7 +725,7 @@ sv_winvars:
     .word   0x89                    @ OrgY
     .word   -1
 sv_vduvals:
-    .space  4 * 11
+    .space  4 * 12
 sv_modestale:
     .word   1                       @ nothing cached yet
 sv_reasons:

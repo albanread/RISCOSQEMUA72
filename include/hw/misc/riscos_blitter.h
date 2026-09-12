@@ -44,7 +44,7 @@
 #define BLIT_FLAGS      0x14
 #define BLIT_DEST       0x18
 #define BLIT_SRC        0x1c
-#define BLIT_WIDTH      0x20    /* bytes per row */
+#define BLIT_WIDTH      0x20    /* FILL/COPY: bytes per row; SPRITE: pixels, x BLIT_BPP */
 #define BLIT_HEIGHT     0x24    /* rows */
 #define BLIT_DSTRIDE    0x28    /* signed bytes from one row to the next */
 #define BLIT_SSTRIDE    0x2c
