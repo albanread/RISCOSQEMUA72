@@ -1050,9 +1050,12 @@ and Quit, and Free opens the Free module's window on the host volume —
   in `s.head` (entered with the return address pushed on the caller's
   stack, and no stack of its own to use). The window asks 64-bit sizes
   first: `FSEntry_Func 35`, answered by the host.
-- Not yet exercised: interactive help, and files dragged or saved onto the
-  icon itself. The icon uses the hard disc sprite; one of its own is still
-  to draw.
+- Also verified: interactive help over the icon and over each menu entry;
+  a file dragged from an SDFS window onto the icon is copied into the
+  share's root. Not yet exercised: saving onto the icon from an
+  application. The icon uses the hard disc sprite; one of its own is still
+  to draw. After Quit the icon returns with the next desktop, as
+  RAMFSFiler's does; there is no command to bring it back sooner.
 
 ### D2 — behaving like a disc in the Filer: done
 
