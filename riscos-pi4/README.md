@@ -92,7 +92,8 @@ writes). Measured over an idle desktop: **100.0 ticks a second, worst gap
 11.6 ms**. The vsync rate is `-display dx11,vsync=N`, default 30; the
 render loop sends nothing.
 
-**macOS runs the same machine**, on Apple silicon, with `-display metal`:
+**macOS runs the same machine**, Apple silicon or Intel, with `-display
+metal`:
 `ui/metal.{h,c,m}`, the twin of the D3D11 front end, down to the same
 eleven-call boundary — a Cocoa window on the main thread, the guest
 framebuffer decoded by an MSL shader specialised per pixel format, the
@@ -104,7 +105,8 @@ i7-12700, and the centisecond ticker measures 100.0 a second with a worst
 gap of 12.5 ms on the POSIX branch of `system/hrtimer.c` against 11.6 ms
 from the Windows waitable timer — so that thread's precision did not have
 to be reproduced. `riscos-pi4/MACOS.md` is that record, with the rest of
-the numbers.
+the numbers; its §9 is the Intel Mac bring-up — the same program, no
+arm64-only code anywhere, only a different dependency road.
 
 The screen is 800×600 by default because the firmware channel answers
 `GET_EDID_BLOCK` with a synthetic monitor of that size and the image's own
@@ -305,6 +307,12 @@ ninja
 Pass Apple's clang explicitly: a Homebrew clang on `PATH` is picked up
 otherwise, and the Objective-C wants the system compiler and the system
 SDK to agree.
+
+On an Intel Mac, macOS 26 leaves Homebrew with no pourable bottles for
+pcre2, glib, libslirp or capstone. `riscos-pi4/tools/build-deps-macos.sh`
+builds those static with the Command Line Tools into `deps-macos-intel`
+beside the repos and pours everything brew still can; MACOS.md §9 is the
+record.
 
 ## Building on Windows
 
