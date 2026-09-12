@@ -221,43 +221,52 @@ Honest limits, recorded so nobody rediscovers them:
   fine in practice".  The RMA half is right; **application space is
   not**.
 
-  What the evidence does and does not support, because the difference
-  matters to whoever picks this up:
+  What is now established, by measurement:
 
-  - **Page crossing is not the problem.**  The 12320-byte transfer at
-    `0x493aa000` spans four pages and moves whole.  `cpu_memory_rw_debug`
-    crosses pages correctly.
-  - **It is not lazy mapping.**  Touching every page of the buffer from
-    BASIC first (`FOR I%=0 TO 262143 STEP 4096:B%?I%=0:NEXT`) changes
-    nothing: the next attempt fails at the same address, after the same
-    252 bytes.  The guest can read and write `0x9000` perfectly well at
-    the moment QEMU says it cannot translate it.
-  - **Translation is context-dependent, and the monitor is not a witness
-    to it.**  `gva2gpa` over QMP reports *Unmapped* for every one of
-    these addresses — including `0x493aa000`, which the same run had just
-    transferred successfully.  The monitor samples whatever task happens
-    to be current, so it cannot be used to check an address that was live
-    during somebody else's doorbell.  Any future diagnosis has to be made
-    from inside the handler, not from the monitor.
+  - **Page crossing is not the problem, and neither is size.**
+    `*Copy HostFS:BIGFILE` moves the whole 256 KiB in **one doorbell**,
+    `R2=0x493aa000`, `R3=0x40000`, `rc=0` — 64 pages, one call, correct
+    bytes.  Everything that goes through FileSwitch's own buffers works:
+    `*Copy`, `*Type`, the Filer, the DDE compiling off HostFS.
+  - **It is specifically low application space.**  A BASIC `DIM` at
+    `0x8f04` translates for 252 bytes — exactly to the page boundary —
+    and `va=0x00009000` will not translate at all.
+  - **It is not lazy mapping.**  Touching every page from BASIC first
+    changes nothing: the guest reads and writes `0x9000` perfectly well
+    at the moment QEMU says it cannot translate it.
+  - **It is the translation, not the access path.**  `riscos_blitter.c`
+    reads sprites out of guest virtual memory with
+    `cpu_translate_for_debug()` + `address_space_map()`, so `guest_rw()`
+    was rewritten on that proven pattern — and it fails identically,
+    with `cpu_translate_for_debug()` itself refusing `0x9000`.  The two
+    differences from `cpu_memory_rw_debug()` that looked promising — the
+    CPU address space versus `address_space_memory`, and MEMTX errors
+    being reported as translation failures — are not the cause.
+  - **`gva2gpa` over QMP is not a witness.**  It reports *Unmapped* for
+    every one of these addresses, including `0x493aa000` which the same
+    run had just transferred.  It samples whatever task is current.
 
-  So the open question is narrow: why, at the instant the module rings
-  the doorbell on BASIC's behalf, does the ARM debug walk resolve
-  `0x8f04` and refuse `0x9000`.  The candidates are the mmu_idx the debug
-  path picks for the current mode, a permission check applied to the
-  walk, and RISC OS mapping application space in a form the walk handles
-  differently from a dynamic area.  Instrumenting `guest_rw_counted` to
-  log the failing address and the CPU's mode and TTBR at the point of
-  failure would settle it in one run.
+  So the open question is narrow and specific: why, at the instant the
+  module rings the doorbell on BASIC's behalf, an ARM debug walk resolves
+  `0x8f04` and refuses `0x9000` — while the guest itself can use both.
+  That is a question about how RISC OS maps a task's application slot,
+  not about QEMU's file code, and it wants an answer from someone who
+  knows the memory model rather than another experiment.
 
-  **A fix that does not need that answer**: stage through memory that is
-  known to translate.  The module owns RMA, and RMA translates — so a
-  transfer whose guest buffer comes up short can be retried into an RMA
-  staging block and `memcpy`d to the caller in guest code, where the
-  guest's own MMU does the work and the question does not arise.  That
-  costs one copy and keeps the doorbell count proportional to the staging
-  size rather than to the page count: a 64 KiB stage makes a 256 KiB read
-  four doorbells instead of 130.  Worth doing on the failure path only,
-  so the fast path stays at one.
+  **A fix that does not need that answer**, and which the measurements
+  above show is sound: stage through memory that is known to translate.
+  Dynamic-area addresses translate — that is where `0x493aa000` lives and
+  it carries 256 KiB in one call — and the module can claim a block of
+  its own.  A transfer whose guest buffer comes up short is retried into
+  that staging block and `memcpy`d to the caller **in guest code**, where
+  the guest's own MMU does the work and the question does not arise.  One
+  copy, and the doorbell count follows the staging size rather than the
+  page count: a 64 KiB stage makes the worst case four doorbells, not
+  130.  On the failure path only, so the common path stays at one.
+
+  Until that is in, the failure is at least honest: the module returns
+  *"HostFS: transfer buffer is not mapped"* rather than reporting
+  success over a buffer it did not fill.
 
   Two consequences, neither optional:
 

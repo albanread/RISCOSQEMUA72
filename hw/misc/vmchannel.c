@@ -77,26 +77,84 @@ static void block_write(hwaddr a, const void *buf, uint32_t len)
  *
  * Returns true on success.
  */
+static void vmch_trace(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+
 static bool guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
 {
-    CPUState *cpu = current_cpu;
+    CPUState *cpu = current_cpu ? current_cpu : first_cpu;
+    uint8_t *p = buf;
 
     if (len == 0) {
         return true;
     }
     if (!cpu) {
-        return false;               /* not on a vCPU thread: refuse */
+        return false;
     }
-    return cpu_memory_rw_debug(cpu, (vaddr)addr, buf, len, is_write) == 0;
+
+    /*
+     * Translate a page at a time and move the bytes through
+     * address_space_memory, which is what riscos_blitter.c does to read
+     * sprites out of guest virtual memory and is proven on this board.
+     *
+     * cpu_memory_rw_debug() is the obvious call and was tried first, but
+     * it routes through cpu->cpu_ases[asidx], not the system address
+     * space, and it treats any MEMTX error as a translation failure —
+     * both of which this avoids.  cpu_translate_for_debug() itself does
+     * no protection checks (see its contract in hw/core/cpu.h), so a
+     * page the guest can reach is a page this can reach.
+     */
+    while (len) {
+        TranslateForDebugResult tres;
+        uint64_t page = addr & ~(uint64_t)0xFFF;
+        uint32_t off = (uint32_t)(addr - page);
+        uint32_t n = 0x1000 - off;
+        hwaddr plen;
+        void *host;
+
+        if (n > len) {
+            n = len;
+        }
+        if (!cpu_translate_for_debug(cpu, addr, &tres)) {
+            vmch_trace("vmch: translate failed at va=%08llx\n",
+                    (unsigned long long)addr);
+            return false;
+        }
+        plen = n;
+        host = address_space_map(&address_space_memory, tres.physaddr, &plen,
+                                 is_write, tres.attrs);
+        if (!host || plen == 0) {
+            vmch_trace("vmch: map failed va=%08llx pa=%08llx\n",
+                    (unsigned long long)addr,
+                    (unsigned long long)tres.physaddr);
+            if (host) {
+                address_space_unmap(&address_space_memory, host, plen,
+                                    is_write, 0);
+            }
+            return false;
+        }
+        if (plen < n) {
+            n = (uint32_t)plen;
+        }
+        if (is_write) {
+            memcpy(host, p, n);
+        } else {
+            memcpy(p, host, n);
+        }
+        address_space_unmap(&address_space_memory, host, plen, is_write,
+                            is_write ? n : 0);
+        p += n;
+        addr += n;
+        len -= n;
+    }
+    return true;
 }
 
 /*
  * Move as much as will translate, a page at a time, and say how far it
- * got.  A guest buffer is not necessarily mapped end to end — the
- * translation tables are read as they stand, and nothing here can fault
- * a page in — so a partly-mapped buffer must report a short count
- * rather than quietly deliver rubbish past the boundary.  The chunking
- * is host-side: it is still one doorbell.
+ * got.  A guest buffer is not necessarily reachable end to end — nothing
+ * here can fault a page in — so a partly-reachable buffer must report a
+ * short count rather than quietly deliver rubbish past the boundary.
+ * The chunking is host-side: it is still one doorbell.
  */
 static uint32_t guest_rw_counted(uint64_t addr, uint8_t *buf, uint32_t len,
                                  bool is_write)
