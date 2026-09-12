@@ -156,3 +156,12 @@ Substitute the peripheral addresses for the machine, then assemble flat:
 
 MIPS = instructions ÷ (printed microseconds ÷ 1e6). Measured on an i7-12700:
 ~2000 M/s for `bench`, ~500 M/s for `bench2`.
+
+On macOS Xcode has no `ld.lld`, and none is needed: `clang -target
+armv7a-none-eabi -c` emits an ELF, and the sources are position-contained
+(absolute peripheral immediates, PC-relative branches, no relocations), so
+the flat binary is just the object's `.text` bytes — extract them with any
+ELF reader (a dozen lines of Python over the section headers) and boot that.
+Verify the build by checking the object has no `.rel.*` section before
+extracting; `mboxtest.s` has the same property, with `MBOXB=0xFE00B800` as
+its second substitution.

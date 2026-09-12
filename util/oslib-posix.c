@@ -58,6 +58,10 @@
 #include <lwp.h>
 #endif
 
+#ifdef CONFIG_DARWIN
+#include <pthread/qos.h>
+#endif
+
 #include "qemu/memalign.h"
 #include "qemu/mmap-alloc.h"
 
@@ -1036,6 +1040,27 @@ int qemu_shm_alloc(size_t size, Error **errp)
 
 unsigned qemu_thread_prefer_performance_cores(void)
 {
+#ifdef CONFIG_DARWIN
+    /*
+     * Apple silicon has no core pinning to offer: thread affinity
+     * applies to Intel Macs and is ignored on the arm64 ones, so
+     * QEMU_VCPU_PIN has nothing to force here and the scheduler owns
+     * placement outright.  What the platform does have is the QoS
+     * ladder.  A pthread starts at QOS_CLASS_DEFAULT -- an unclassified
+     * thread, and the class is not inherited from the creator -- which
+     * the scheduler may park on the efficiency cores once the
+     * performance ones are busy, and a TCG vCPU that lands there runs
+     * at a fraction of its rate.  The interactive class is the
+     * opt-out: the scheduler keeps interactive threads on the
+     * performance cores and still owns the choice of which one, the
+     * same nothing-overridden default the Windows side measured.
+     */
+    if (getenv("QEMU_VCPU_ECORES")) {
+        return 0;                   /* asked to leave the scheduler alone */
+    }
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    return 0;                       /* placement stays the scheduler's call */
+#else
     /*
      * Nothing portable to do here yet.  Linux exposes asymmetric cores
      * through capacity in sysfs and through sched_setaffinity, but the
@@ -1043,4 +1068,5 @@ unsigned qemu_thread_prefer_performance_cores(void)
      * the scheduler alone rather than guess.
      */
     return 0;
+#endif
 }

@@ -61,7 +61,8 @@ every rule below". That turned out to be literally true: the main-thread
 hand-off it was built on — `system/main.c` runs `qemu_init()` on the main
 thread, and a display backend that sets `qemu_main` gets the main thread
 while the emulation moves to its own — exists *because* the Cocoa port
-needed it. Nothing in `system/main.c` was touched.
+needed it. Nothing in `system/main.c` was touched at the time (the one
+later line is the QoS call of §8's thread note).
 
 So the shapes correspond one for one:
 
@@ -342,3 +343,42 @@ than a spin loop, goes with the second number.
 same instrument. The boot figure came from sampling `screendump` over QMP
 twice a second and taking the moment the image stopped changing for three
 seconds; there is no tool for it yet.
+
+### Threads and cores, measured
+
+`qemu_thread_prefer_performance_cores()` — the hybrid-core helper measured
+on the i7-12700 and left to the scheduler — now has a macOS arm, and the
+threads it covers grew by two. Apple silicon offers no core pinning
+(thread affinity is an Intel-Mac notion, ignored on the arm64 ones), so
+there is no `QEMU_VCPU_PIN` here; what the platform has is the QoS
+ladder. A pthread starts at `QOS_CLASS_DEFAULT` — the class is *not*
+inherited from the creator; measured, a child of an interactive main
+thread still comes out default — and the scheduler is free to place
+default-class threads on the efficiency cores when it is rationing the
+performance ones. The helper opts the calling thread into
+`USER_INTERACTIVE`, which the scheduler keeps on the performance cores
+while the choice of which one stays its own: the same nothing-overridden
+default the Windows side measured. The TCG vCPU threads were already
+wired; the hrtimer clock thread and the `qemu_main` loop now call it too,
+and `QEMU_VCPU_ECORES` still leaves all of them alone.
+
+Measured with `bench2`, arms alternated, on this Mac (an M4: 4
+performance and 6 efficiency cores):
+
+| P-cores occupied by | before (M/s) | after (M/s) |
+| --- | --- | --- |
+| nothing | 968–975 | 931–977 |
+| 4 default-class spinners | 870 | 815 |
+| 4 interactive spinners | 856 | 803 |
+| 12 interactive spinners, every core oversubscribed | 714 | 843 |
+
+Neutral — like the i7's EcoQoS opt-out — until the machine is genuinely
+oversubscribed. With whole-core loads the scheduler never demoted the
+busy vCPU at all; it parked the unclassified spinners on the efficiency
+cores instead, and both arms timeshared the performance cores. Under
+oversubscription one run of the un-QoS'd arm came back at 451 M/s,
+efficiency-core territory, while no QoS'd run fell below 764: one
+occurrence in three, so a tendency rather than a rate. The cases the
+change is really kept for — Low Power Mode, a machine on battery —
+cannot be measured on this desktop Mac, which is the same sentence the
+Windows half of the helper ends on.

@@ -222,10 +222,22 @@ const char *qemu_thread_get_name(void);
  * qemu_thread_prefer_performance_cores:
  *
  * On a host whose cores are not all alike -- a package with fast
- * "performance" cores beside slow "efficient" ones -- confine the
- * calling thread to the fast ones, and tell the power manager not to
- * demote it again.  For the emulator's hot loops (a vCPU thread above
- * all) the difference is most of the guest's speed.
+ * "performance" cores beside slow "efficient" ones -- keep the calling
+ * thread on the fast ones.  For the emulator's hot loops (a vCPU thread
+ * above all) the difference is most of the guest's speed.
+ *
+ * What that means is the platform's to say.  Windows tells the power
+ * manager the thread is not background work, and with QEMU_VCPU_PIN set
+ * goes further and confines it to the fastest cores with a hard
+ * affinity mask -- measured slower, so off by default (oslib-win32.c).
+ * macOS has no core pinning at all, and opts the thread into the
+ * interactive QoS class, which the scheduler keeps on the performance
+ * cores while the choice of which one stays its.
+ *
+ * The threads the guest's speed and timing ride on call it for
+ * themselves: the TCG vCPU threads, the hrtimer clock thread, and the
+ * main-loop thread.  Each asks for itself because a pthread does not
+ * inherit the class of its creator.
  *
  * A no-op where the host's cores are uniform, where the platform has no
  * such notion, or when QEMU_VCPU_ECORES is set in the environment.

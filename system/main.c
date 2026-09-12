@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu-main.h"
 #include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "system/replay.h"
 #include "system/system.h"
 
@@ -44,6 +45,10 @@
 static void *qemu_default_main(void *opaque)
 {
     int status;
+
+    /* block completions and bottom halves land on this loop; one more
+     * of the hot threads asking for the fast cores (qemu/thread.h) */
+    qemu_thread_prefer_performance_cores();
 
     replay_mutex_lock();
     bql_lock();

@@ -92,6 +92,9 @@ static void *hrtimer_thread(void *arg)
     int64_t now, next;
     int n, i;
 
+    /* this thread is the guest's clock: a wake served on an efficiency
+     * core is a late tick */
+    qemu_thread_prefer_performance_cores();
     rcu_register_thread();
     g_mutex_lock(&hr.lock);
     for (;;) {
