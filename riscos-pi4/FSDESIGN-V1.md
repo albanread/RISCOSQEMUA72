@@ -872,6 +872,8 @@ Measured on the Mac Pi 4 machine, TCG, soft-loaded module:
 | 4 Metadata | `*SetType` renames, `*Access`, datestamps written back | module copied out as `,ffa` `RMLoad`s with no `SetType` |
 | 5 Directories | Rename; disc name; bit 23 with Func 23/24; Func 14/15/19; free space | `OS_GBPB` 9/10/11 records; `OS_FSControl 49` |
 | R1 From ROM | HostFS 2.00: workspace at the private word; no cmhg, no stubs; header, veneers and constants in objasm | spliced ROM, nothing soft-loaded: `*Modules` at &FC4BCDA8, `*Ex` types and dates, 256 KiB round trip `cmp`-identical |
+| D1 Icon and Filer | HostFSFiler 2.00 on RAMFSFiler's pattern, also from ROM; Free_Register and Func 35 | cold boot: icon present; click opens the share with real icons; double-click opens Text; Free window shows the host volume |
+| D2 A disc in the Filer | Func/File 8 create directory, Args 8 write zeroes, File 10 block size | by mouse: new directory, drag-copy both ways, Info, rename, delete — each checked on the host |
 
 ### The acceptance rule for everything below
 
@@ -982,33 +984,48 @@ it ran.
 the share. Met with `BootHostFS` removed; met on every card once the cards
 carry the `RMEnsure`.
 
-### D1 — a real disc: icon and Filer
+### D1 — a real disc: icon and Filer: done
 
-- **HostFSFiler** (`9fb0f156a6`, the Windows team's, on the RAMFSFiler
-  pattern) is a cmhg module linked with the stubs, so it needs what HostFS
-  needed: header and veneers in objasm, no stubs, no statics, constants
-  where ADR reaches them. As a module task it also needs start code of its
-  own where `_clib_entermodule` was. Spliced after HostFS.
-- The HostFS disc is on the icon bar at startup; a click opens the root in
-  a Filer window; files carry their real type icons, which sprints 3 and 4
-  made possible; double-clicking a Text file opens it.
-- A HostFS drive sprite of its own; it currently borrows the hard disc's.
-- The Filer's calls checked against v1 — HostFSFiler was written against
-  v0, before Func 14, 19, 23 and 24 were right.
+Done 12 Sep. Cold boot of a stock ROM spliced with HostFS and HostFSFiler:
+the HostFS icon is on the icon bar, left of the discs; SELECT opens
+`HostFS::HostFS.$` in a Filer window with every file's real icon; a
+double-click on `readme/txt` opens it in the editor; MENU offers Open, Free
+and Quit, and Free opens the Free module's window on the host volume —
+954 GB, 544 GB free, as `df` says.
 
-*Acceptance:* cold boot from the spliced ROM; the HostFS icon is present;
-click it; the window lists the share with correct icons; double-click a
-text file and it opens in the editor.
+- **HostFSFiler is rewritten**, not converted. The Windows team's module
+  started its task from init and `Service_StartFiler` with
+  `Wimp_StartTask`, which is not how filers start, and as a cmhg module
+  with stubs could not run from ROM. It now follows RAMFSFiler: no
+  workspace until `Service_StartFiler`, then claim it, keep it in the
+  private word, and answer with `Desktop_HostFSFiler`; the Filer runs that
+  as a task, which enters the module, whose start entry runs in user mode
+  on a stack at the end of the workspace. The icon opens the root with
+  `Message_FilerOpenDir` to the Filer. Same build as HostFS: objasm, cc,
+  link, no cmhg, no stubs.
+- **cc pools shared string literals** and reaches the far users through an
+  absolute address — a relocation only `decaof -r` shows. Each shared
+  string sits behind one function.
+- **Free space for the desktop** needs the Free module, not just
+  FileSwitch: HostFS registers with `Free_Register` at init, with a handler
+  in `s.head` (entered with the return address pushed on the caller's
+  stack, and no stack of its own to use). The window asks 64-bit sizes
+  first: `FSEntry_Func 35`, answered by the host.
+- Not yet exercised: interactive help, and files dragged or saved onto the
+  icon itself. The icon uses the hard disc sprite; one of its own is still
+  to draw.
 
-### D2 — behaving like a disc in the Filer
+### D2 — behaving like a disc in the Filer: done
 
-Whatever D1 turns up, and at least: new directory and rename from the
-Filer menu, drag-copy both ways between a HostFS window and an SDFS one,
-delete, `Info` showing type and date, and free space in the Filer's own
-display.
-
-*Acceptance:* each of those done by mouse in a desktop session, and the
-host directory checked afterwards.
+Done 12 Sep, by mouse in a desktop session, each checked in the host
+directory: New directory from the Filer menu; `readme/txt` dragged to an
+SDFS window; `Licence/pdf` dragged from SDFS arrives as `Licence.pdf`,
+type PDF, and Info shows its type, size, access and original date; Rename
+to `Terms/pdf` renames `Terms.pdf`; Delete removes it and a directory; the
+Free window. What it took: `FSEntry_File 8` (create directory) and
+`FSEntry_Args 8` (write zeroes, how FileSwitch grows a buffered file past
+its end) were both "unsupported", and are now done by the host;
+`FSEntry_File 10` answers the block size.
 
 ### B1 — boot off it
 
