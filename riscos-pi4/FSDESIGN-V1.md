@@ -555,10 +555,30 @@ and keeping the change to one source file; a `typemap=` device property
 plumbed through `bcm2838-peripherals` like `vmchannel-root` is the tidier
 end state and is a few lines when wanted.
 
-Still to do from this section: the `naming=` write-direction policy of
-§6.3.  Reading is complete — a host file's name and type arrive correctly
-however it is spelled — but a file *created* from RISC OS is still
-written under its guest name with no type encoded.
+**The write direction is built** (sprint 4), as `naming=smart` — the
+only policy implemented; `suffix` and `literal` are not.  A type is
+encoded only when it has to be: Text gets no decoration, a name already
+carrying the right extension is left alone, a type with a table extension
+gets that extension, and anything else gets `,xxx`.  The reverse table is
+one-to-many, so the *first* typemap entry for a type is the one written —
+reorder the file to change it.
+
+Verified: a module built on SDFS, copied out, lands as `HostFSv6,ffa`,
+copies back in as a Module and `*RMLoad`s with no `*SetType` — which
+failed earlier the same day.  `*SetType HostFS:readme/txt FF9` renames the
+host file to `readme.txt,ff9`, keeps its datestamp, and the guest sees
+`readme/txt`, Sprite.
+
+Known gaps:
+
+- **Wildcards in FSEntry_File 1..4.**  PRM2 hands those reasons a
+  *wildcarded* name.  A single named file works; `*SetType foo* FF9`
+  does not expand on the host yet.
+- **Untyped files lose their load/exec addresses.**  A file whose load
+  word is a real address rather than a `0xFFFtttDD` stamp has nowhere to
+  keep that pair — the name holds a type, not two addresses.  Rare on a
+  modern system and invisible until it matters; it is the one case §6.3's
+  per-share override file would be for.
 
 **Inference must never produce an executable type.**  Several RISC OS
 types mean "run me" when double-clicked — &FFA Module, &FF8 Absolute,

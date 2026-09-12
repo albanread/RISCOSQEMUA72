@@ -26,6 +26,7 @@
 #include "target/arm/cpu.h"
 #include "qemu/error-report.h"
 #include <glib/gstdio.h>
+#include <utime.h>
 
 /* ------------------------------------------------------------------ */
 /* Guest RAM access: physical, little-endian, through the system AS   */
@@ -502,6 +503,7 @@ static const struct { const char *ext; uint32_t type; } typemap_builtin[] = {
 };
 
 static GHashTable *typemap;             /* lowercased ext -> type + 1 */
+static GHashTable *typemap_rev;         /* type + 1 -> canonical ext */
 
 static void typemap_load(void)
 {
@@ -512,9 +514,21 @@ static void typemap_load(void)
         return;
     }
     typemap = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    /* The reverse direction is one-to-many — &FFF alone owns txt, c, h,
+     * py and a dozen more — so the FIRST entry for a type wins and
+     * becomes the extension used when RISC OS writes a file of that type.
+     * Reorder the typemap file to change it. */
+    typemap_rev = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                        NULL, g_free);
     for (i = 0; i < ARRAY_SIZE(typemap_builtin); i++) {
         g_hash_table_insert(typemap, g_strdup(typemap_builtin[i].ext),
                             GUINT_TO_POINTER(typemap_builtin[i].type + 1));
+        if (!g_hash_table_contains(typemap_rev,
+                GUINT_TO_POINTER(typemap_builtin[i].type + 1))) {
+            g_hash_table_insert(typemap_rev,
+                                GUINT_TO_POINTER(typemap_builtin[i].type + 1),
+                                g_strdup(typemap_builtin[i].ext));
+        }
     }
     if (file && *file) {
         char *text = NULL;
@@ -534,6 +548,12 @@ static void typemap_load(void)
                     if (*endp == '\0' && t < 0x1000) {
                         g_hash_table_insert(typemap, g_ascii_strdown(f[0], -1),
                                             GUINT_TO_POINTER((guint)t + 1));
+                        if (!g_hash_table_contains(typemap_rev,
+                                GUINT_TO_POINTER((guint)t + 1))) {
+                            g_hash_table_insert(typemap_rev,
+                                    GUINT_TO_POINTER((guint)t + 1),
+                                    g_ascii_strdown(f[0], -1));
+                        }
                         n++;
                     }
                 }
@@ -588,7 +608,18 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
 
         if (end == comma + 4 && t >= 0 && t < 0x1000) {
             *type = is_dir ? 0 : (uint32_t)t;
-            return g_strndup(host_leaf, (size_t)(comma - host_leaf));
+            out = g_strndup(host_leaf, (size_t)(comma - host_leaf));
+            /* The suffix is consumed, but what is left can still hold a
+             * dot — `readme.txt,ff9` — and a dot is still unrepresentable.
+             * Returning here without translating it listed the file as
+             * "readme.txt", visible and unopenable: the sprint-3 bug again,
+             * for every typed name with a dot in it. */
+            for (char *q = out; *q; q++) {
+                if (*q == '.') {
+                    *q = '/';
+                }
+            }
+            return out;
         }
     }
 
@@ -605,6 +636,64 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
     dot = strrchr(host_leaf, '.');
     *type = (dot && dot != host_leaf) ? type_for_ext(dot + 1) : 0xFFF;
     return out;
+}
+
+/*
+ * The host filename for a guest leafname of a given type — the reverse of
+ * guest_leaf_of(), and the `naming=smart` policy of FSDESIGN-V1 Sec 6.3.
+ *
+ *   "hello/c",  &FFF  ->  hello.c     the slash was a dot all along
+ *   "notes",    &FFF  ->  notes       Text is the default: nothing to say
+ *   "logo",     &FF9  ->  logo,ff9    no extension for Sprite in the table
+ *   "shot",     &B60  ->  shot.png    the table has one, so use it
+ *
+ * A type is only encoded when it has to be.  Text gets no decoration at
+ * all, because most files are text and a share full of ",fff" would be
+ * unusable from the Mac side; and a name that already carries the right
+ * extension is left to speak for itself, so a file copied in as
+ * `hello.c` copies out as `hello.c` rather than `hello.c,fff`.
+ */
+static char *host_leaf_for(const char *guest_leaf, uint32_t type)
+{
+    char *base = g_strdup(guest_leaf);
+    const char *ext;
+    char *dot;
+
+    for (char *q = base; *q; q++) {
+        if (*q == '/') {
+            *q = '.';
+        }
+    }
+    if (type == 0xFFF || type == 0) {
+        return base;                    /* Text, or a directory */
+    }
+
+    /* Already spelled with the right extension?  Leave it alone. */
+    dot = strrchr(base, '.');
+    if (dot && dot != base && type_for_ext(dot + 1) == type) {
+        return base;
+    }
+
+    typemap_load();
+    ext = g_hash_table_lookup(typemap_rev, GUINT_TO_POINTER(type + 1));
+    if (ext) {
+        char *out = g_strdup_printf("%s.%s", base, ext);
+        g_free(base);
+        return out;
+    }
+    {
+        char *out = g_strdup_printf("%s,%03x", base, type);
+        g_free(base);
+        return out;
+    }
+}
+
+/* The type a RISC OS load word carries, or 0xFFFFFFFF if the word is a
+ * real load address rather than a type stamp (PRM 2-542: a typed file has
+ * 0xFFF in the top twelve bits). */
+static uint32_t type_of_load(uint32_t load)
+{
+    return ((load >> 20) == 0xFFF) ? ((load >> 8) & 0xFFF) : 0xFFFFFFFFu;
 }
 
 /* The RISC OS load/exec pair for a typed, dated file (PRM 2-542): the
@@ -1112,6 +1201,168 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         stl_le_p(resp + 4, (uint32_t)(cs >> 32));
         block_write(base + VMCH_HDR_SIZE, resp, sizeof(resp));
         st32(base + VMCH_HDR_ARGLEN, sizeof(resp));
+        break;
+    }
+
+    case VMCH_CMD_FS_FILE: {
+        /*
+         * FSEntry_File, the reasons that *write* metadata: 1 write
+         * catalogue info, 2 write load, 3 write exec, 4 write attributes,
+         * and 7 create with a type.  The path comes inline; R0 is the
+         * reason, R2 load, R3 exec, and R5 attributes — except for reason
+         * 7, where R5 is the end address of the data (PRM 2-541) and is
+         * not an attribute word at all.
+         *
+         * Not yet handled: PRM gives 1..4 a *wildcarded* name.  A single
+         * named file works; `*SetType foo* FF9` does not expand here.
+         *
+         * These used to be answered by the module with "no-op, return
+         * success", so *SetType appeared to work and did nothing.  A
+         * silent lie is worse than an error, and there is no reason for
+         * one: the type rides the host filename, so setting it is a
+         * rename, and the datestamp is a utimes().
+         */
+        g_autofree char *path = arg_text(base, arglen);
+        uint32_t reason = ld32(base + VMCH_HDR_REGS + 0);
+        uint32_t load = ld32(base + VMCH_HDR_REGS + 8);
+        uint32_t exec = ld32(base + VMCH_HDR_REGS + 12);
+        uint32_t attr = ld32(base + VMCH_HDR_REGS + 20);
+        g_autofree char *hp = NULL;
+        uint32_t type;
+
+        if (!s->root) {
+            rc = VMCH_RC_NOROOT;
+            break;
+        }
+        if (!path) {
+            rc = VMCH_RC_BADPATH;
+            break;
+        }
+        hp = host_path(s, path, &rc);
+        if (!hp) {
+            break;
+        }
+
+        if (reason == 7) {              /* create empty, of a given type */
+            int fd;
+
+            type = type_of_load(load);
+            if (type != 0xFFFFFFFFu) {
+                /* Name it for its type now, rather than creating it and
+                 * renaming a moment later. */
+                g_autofree char *dir = g_path_get_dirname(hp);
+                g_autofree char *leaf = g_path_get_basename(hp);
+                g_autofree char *want = host_leaf_for(leaf, type);
+                g_free(hp);
+                hp = g_build_filename(dir, want, NULL);
+            }
+            fd = g_open(hp, O_WRONLY | O_CREAT | O_BINARY | O_TRUNC, 0644);
+            if (fd < 0) {
+                rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+            } else {
+                close(fd);
+            }
+            break;
+        }
+
+        /* 1..4: the object must exist */
+        {
+            GStatBuf st;
+
+            if (g_stat(hp, &st) != 0) {
+                rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+                break;
+            }
+
+            if (reason == 1 || reason == 4) {
+                /* RISC OS attributes to host mode: owner write, and the
+                 * locked bit, are the two the host can actually hold. */
+                mode_t m = st.st_mode & ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
+                if ((attr & 2) && !(attr & 8)) {     /* write, not locked */
+                    m |= S_IWUSR;
+                }
+                if (g_chmod(hp, m) != 0) {
+                    rc = VMCH_RC_ACCESS;
+                    break;
+                }
+            }
+
+            if (reason == 1 || reason == 2 || reason == 3) {
+                uint64_t cs;
+
+                /*
+                 * PRM 2-536..2-538: reason 1 carries load AND exec, but
+                 * reason 2 carries only R2 (load) and reason 3 only R3
+                 * (exec) — the other register is whatever the caller left
+                 * there.  Take the missing half from the file as it
+                 * stands, or a WriteLoad would stamp a date built from
+                 * junk.
+                 */
+                if (reason != 1) {
+                    uint32_t cur_type = (uint32_t)riscos_type_for(hp, &st);
+                    uint32_t cur_load, cur_exec;
+
+                    load_exec_for(cur_type, date_cs_for(&st),
+                                  &cur_load, &cur_exec);
+                    if (reason == 2) {
+                        exec = cur_exec;
+                    } else {
+                        load = cur_load;
+                    }
+                }
+
+                type = type_of_load(load);
+                if (reason != 3 && type != 0xFFFFFFFFu) {
+                    g_autofree char *dir = g_path_get_dirname(hp);
+                    g_autofree char *leaf = g_path_get_basename(hp);
+                    uint32_t had;
+                    g_autofree char *shown = guest_leaf_of(leaf, false, &had);
+                    g_autofree char *want = host_leaf_for(shown, type);
+
+                    if (strcmp(want, leaf) != 0) {
+                        g_autofree char *dest = g_build_filename(dir, want,
+                                                                 NULL);
+                        /* Setting a type renames the host file.  That is
+                         * what encoding the type in the name means, and
+                         * it surprises anyone watching the directory, so
+                         * it is traced. */
+                        if (g_rename(hp, dest) == 0) {
+                            vmch_trace("vmch: settype %s -> %s (&%03x)\n",
+                                       leaf, want, type);
+                            g_free(hp);
+                            hp = g_steal_pointer(&dest);
+                        } else {
+                            rc = VMCH_RC_ACCESS;
+                            break;
+                        }
+                    }
+                }
+
+                /* The 5-byte instant back to a host time.  Only when it
+                 * looks like one: an untyped file's load/exec are real
+                 * addresses and must not be read as a date. */
+                if (type != 0xFFFFFFFFu) {
+                    cs = ((uint64_t)(load & 0xFF) << 32) | exec;
+                    if (cs > 2208988800ULL * 100) {
+                        gint64 secs = (gint64)(cs / 100) - 2208988800LL;
+                        GDateTime *dt = g_date_time_new_from_unix_local(secs);
+
+                        if (dt) {
+                            secs -= g_date_time_get_utc_offset(dt)
+                                    / G_TIME_SPAN_SECOND;
+                            g_date_time_unref(dt);
+                        }
+                        {
+                            struct utimbuf ut;
+
+                            ut.actime = (time_t)secs;
+                            ut.modtime = (time_t)secs;
+                            (void)g_utime(hp, &ut);
+                        }
+                    }
+                }
+            }
+        }
         break;
     }
 

@@ -64,6 +64,7 @@ struct vmreq {
  * scratch[] starts at +20, which is where R0..R7 live, so REQW(n) is Rn. */
 #define C_FS_GETBYTES 0x101
 #define C_FS_PUTBYTES 0x102
+#define C_FS_FILE     0x105
 
 #define C_PING     0
 #define C_OPEN     1
@@ -237,6 +238,22 @@ static uint32_t objtype_of(uint32_t rc, uint32_t type)
         return 0;
     }
     return type == 0 ? 2 : 1;
+}
+
+/* FSEntry_File on the host: R0 reason, R2 load, R3 exec, R5 attr, and the
+ * path inline.  The host decides what they mean — including that setting
+ * a type renames the file — so this passes them through and nothing
+ * more. */
+static uint32_t file_on_host(_kernel_swi_regs *r, const char *name)
+{
+    req->cmd = C_FS_FILE;
+    req->handle = 0;
+    REQW(0) = (uint32_t)r->r[0];
+    REQW(2) = (uint32_t)r->r[2];
+    REQW(3) = (uint32_t)r->r[3];
+    REQW(5) = (uint32_t)r->r[5];
+    put_path(name);
+    return vmch_go();
 }
 
 static uint32_t vmch_req_close(uint32_t h)
@@ -691,11 +708,8 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     case 0:                            /* save  */
         return &err_retired;
 
-    case 7:                            /* create empty */
-        req->cmd = C_CREATE;
-        req->handle = 0;
-        put_path(name);
-        rc = vmch_go();
+    case 7:                            /* create empty, of the type in R2 */
+        rc = file_on_host(r, name);
         if (rc != RC_OK) {
             return rc_to_error(rc);
         }
@@ -724,12 +738,13 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     case 2:                            /* write load address */
     case 3:                            /* write execution address */
     case 4:                            /* write attributes */
-        /* The host filesystem has no RISC OS metadata store: a file's
-         * type rides its name suffix (name,xxx), set at create.  So
-         * accept these and no-op rather than failing the caller —
-         * *Copy, the Filer and *SetType all stamp the destination here,
-         * and erroring turns a good copy into "unsupported operation". */
-        return NULL;
+        /* These used to return success and do nothing, so *SetType
+         * appeared to work and changed nothing — and *Copy lost every
+         * type it was asked to preserve.  The host now applies them: a
+         * type is a rename (the type rides the host filename), a
+         * datestamp is utimes(), attributes are chmod(). */
+        rc = file_on_host(r, name);
+        return (rc == RC_OK) ? NULL : rc_to_error(rc);
 
     default:
         return &err_unsupported;
