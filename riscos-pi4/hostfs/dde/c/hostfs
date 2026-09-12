@@ -120,6 +120,8 @@ struct vmreq {
 #define XOS_Write0          0x20002
 #define XOS_NewLine         0x20003
 #define XOS_CLI             0x20005
+#define XOS_Byte            0x20006
+#define XOS_File            0x20008
 #define XOS_Module          0x2001E
 #define XOS_FSControl       0x20029
 #define XOS_Memory          0x20068
@@ -135,6 +137,15 @@ _kernel_oserror *hostfs_register(void *pw);
  * *ShowFree and the filer's Free window can read HostFS's free space */
 struct hostws;
 _kernel_oserror *hostfs_free_register(struct hostws *ws, int deregister);
+
+/* in s.head: the hooks that keep CMOS on the share — op 0 add the start-up
+ * callback, 1 remove it, 2 claim ByteV, 3 release it */
+_kernel_oserror *hostfs_cmos_hooks(void *pw, int op);
+#define CMOS_CALLBACK_ADD     0
+#define CMOS_CALLBACK_REMOVE  1
+#define CMOS_BYTEV_CLAIM      2
+#define CMOS_BYTEV_RELEASE    3
+void hostfs_cmos_check(void *pw);
 
 /* in s.head: the constant error blocks, by number, in its table's order */
 _kernel_oserror *hostfs_error(int which);
@@ -221,6 +232,7 @@ struct hostws {
     uint32_t w_req_phys;                /* its physical address */
     uint32_t w_seq;
     int w_registered;
+    int w_cmos_saving;                  /* on ByteV, saving to $.CMOS */
     uint32_t w_hptr[VMCH_MAX_OPEN];     /* per handle; handles are 1-based */
     uint32_t w_hext[VMCH_MAX_OPEN];
     uint32_t w_hload[VMCH_MAX_OPEN];
@@ -1355,7 +1367,42 @@ _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
 
     /* Free space for *ShowFree.  No Free module is no reason to refuse. */
     (void)hostfs_free_register(ws, 0);
+
+    /* Whether to keep CMOS on the share is decided once start-up is over
+     * (hostfs_cmos_check); no callback is no reason to refuse either. */
+    (void)hostfs_cmos_hooks(pw, CMOS_CALLBACK_ADD);
     return NULL;
+}
+
+/*
+ * The start-up callback.  Keep CMOS on the share when HostFS is the
+ * configured filing system and the share holds $.CMOS of type Configuration
+ * (or DOS, as SDCMOS also accepts): after that, every CMOS write runs
+ * *SaveCMOS HostFS:$.CMOS (s.head, MyByteV).  A share that is not the boot
+ * disc is never written to.
+ */
+void hostfs_cmos_check(void *pw)
+{
+    struct hostws *ws = WS_OF(pw);
+    _kernel_swi_regs r;
+
+    if (ws == NULL || ws->w_cmos_saving) {
+        return;
+    }
+    r.r[0] = 161;                        /* OS_Byte 161: read CMOS */
+    r.r[1] = 5;                          /* FileLangCMOS: *Configure FileSystem */
+    if (swix(XOS_Byte, &r, &r) != NULL || r.r[2] != 220) {
+        return;
+    }
+    r.r[0] = 23;                         /* OS_File 23: info with type */
+    r.r[1] = (int)"HostFS:$.CMOS";
+    if (swix(XOS_File, &r, &r) != NULL || r.r[0] != 1
+        || (r.r[6] != 0xFF2 && r.r[6] != 0xFE4)) {
+        return;
+    }
+    if (hostfs_cmos_hooks(pw, CMOS_BYTEV_CLAIM) == NULL) {
+        ws->w_cmos_saving = 1;
+    }
 }
 
 _kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw)
@@ -1366,6 +1413,11 @@ _kernel_oserror *hostfs_final(int fatal, int podule_base, void *pw)
     (void)podule_base;
     if (ws == NULL) {
         return NULL;
+    }
+    (void)hostfs_cmos_hooks(pw, CMOS_CALLBACK_REMOVE);
+    if (ws->w_cmos_saving) {
+        (void)hostfs_cmos_hooks(pw, CMOS_BYTEV_RELEASE);
+        ws->w_cmos_saving = 0;
     }
     if (registered) {
         _kernel_swi_regs r;
@@ -1492,6 +1544,9 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
         out_dec(ws->w_seq);
         out_str(" registered ");
         out_dec((uint32_t)registered);
+        out_nl();
+        out_str(ws->w_cmos_saving ? "CMOS is saved to HostFS:$.CMOS"
+                                  : "CMOS is not saved to the share");
         out_nl();
 
         r.r[0] = 13;                     /* FSControl_LookupFS, by name */

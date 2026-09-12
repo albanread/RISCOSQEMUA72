@@ -6,9 +6,13 @@
 #   cmos_to_boot <images dir>    sets CMOS to the blob for the loader
 #
 #   RISCOS_BOOT           "hostfs" boots from the share (FSDESIGN-V1.md §13
-#                         B1): the CMOS gets FileSystem HostFS, written by
-#                         mkcmos.py to cmos-hostfs.bin beside cmos.bin and
-#                         remade when cmos.bin changes.  Unset boots as
+#                         B1, B2).  The CMOS comes from the share's own
+#                         CMOS,ff2 — which HostFS rewrites after every
+#                         *Configure, as SDCMOS does on a card — or, the
+#                         first time, from cmos.bin, and the share is seeded
+#                         with it.  Either way it is written to
+#                         cmos-hostfs.bin with FileSystem HostFS forced, so
+#                         the launch option always wins.  Unset boots as
 #                         cmos.bin says.  A card stays attached either way,
 #                         and reachable as SDFS::0.
 #
@@ -86,7 +90,7 @@ rom_to_boot() {
 }
 
 cmos_to_boot() {
-    local images="$1" here="$_ROM_ZSH_DIR" out
+    local images="$1" here="$_ROM_ZSH_DIR" out saved="" base
 
     CMOS="$images/cmos.bin"
     case "${RISCOS_BOOT:-}" in
@@ -98,15 +102,22 @@ cmos_to_boot() {
             print -u2 "RISCOS_BOOT=hostfs: set RISCOS_HOSTFS to the share to boot"
             return 1
         }
+        [[ -e "$RISCOS_HOSTFS/CMOS,ff2" ]] && saved="$RISCOS_HOSTFS/CMOS,ff2"
+        [[ -z "$saved" && -e "$RISCOS_HOSTFS/CMOS,fe4" ]] && saved="$RISCOS_HOSTFS/CMOS,fe4"
+        base="${saved:-$CMOS}"
         out="$images/cmos-hostfs.bin"
-        if [[ ! -e "$out" || "$CMOS" -nt "$out" ]]; then
-            # 220 is HostFS's filing system number (hostfs/dde/s.head)
-            python3 "$here/mkcmos.py" --symbols "$here/cmos-symbols-530.json" \
-                --base "$CMOS" --filesystem 220 -o "$out" 2>/dev/null || {
-                print -u2 "cmos: mkcmos.py failed"
-                return 1
-            }
-            print "cmos: FileSystem HostFS -> ${out:t}"
+        # Remade every launch: it is cheap, and the share may have changed.
+        # 220 is HostFS's filing system number (hostfs/dde/s.head).
+        python3 "$here/mkcmos.py" --symbols "$here/cmos-symbols-530.json" \
+            --base "$base" --filesystem 220 -o "$out" 2>/dev/null || {
+            print -u2 "cmos: mkcmos.py failed on $base"
+            return 1
+        }
+        if [[ -n "$saved" ]]; then
+            print "cmos: from the share's ${saved:t}"
+        else
+            cp "$out" "$RISCOS_HOSTFS/CMOS,ff2"
+            print "cmos: FileSystem HostFS; the share now keeps it, as CMOS,ff2"
         fi
         CMOS="$out"
         ;;

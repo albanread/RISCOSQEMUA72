@@ -935,6 +935,7 @@ static void vmch_trace(const char *fmt, ...)
 
 static void vmchannel_do(VMChannelState *s, hwaddr base)
 {
+    gint64 started = g_get_monotonic_time();    /* for the trace */
     uint32_t cmd = ld32(base + VMCH_HDR_CMD);
     uint32_t arglen = ld32(base + VMCH_HDR_ARGLEN);
     uint32_t rc = VMCH_RC_OK;
@@ -1298,8 +1299,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                         uint32_t type = (uint32_t)riscos_type_for(hp1, &st);
                         g_autofree char *dir = g_path_get_dirname(hp2);
                         g_autofree char *leaf = g_path_get_basename(hp2);
-                        g_autofree char *base = host_base_of(leaf);
-                        g_autofree char *want = host_leaf_for(base, type);
+                        g_autofree char *stem = host_base_of(leaf);
+                        g_autofree char *want = host_leaf_for(stem, type);
 
                         if (strcmp(want, leaf) != 0) {
                             char *typed = g_build_filename(dir, want, NULL);
@@ -1484,8 +1485,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                  * renaming a moment later. */
                 g_autofree char *dir = g_path_get_dirname(hp);
                 g_autofree char *leaf = g_path_get_basename(hp);
-                g_autofree char *base = host_base_of(leaf);
-                g_autofree char *want = host_leaf_for(base, type);
+                g_autofree char *stem = host_base_of(leaf);
+                g_autofree char *want = host_leaf_for(stem, type);
                 g_free(hp);
                 hp = g_build_filename(dir, want, NULL);
             }
@@ -1580,8 +1581,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 if (reason != 3 && type != 0xFFFFFFFFu) {
                     g_autofree char *dir = g_path_get_dirname(hp);
                     g_autofree char *leaf = g_path_get_basename(hp);
-                    g_autofree char *base = host_base_of(leaf);
-                    g_autofree char *want = host_leaf_for(base, type);
+                    g_autofree char *stem = host_base_of(leaf);
+                    g_autofree char *want = host_leaf_for(stem, type);
 
                     if (strcmp(want, leaf) != 0) {
                         g_autofree char *dest = g_build_filename(dir, want,
@@ -1753,9 +1754,12 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
      * first block words so layout disputes can be settled from the
      * log alone. */
     {
-        vmch_trace("vmch: cmd=%u seq=%u rc=%u hnd=%08x arglen=%u",
+        /* us= is the host time spent on the request, which is what a
+         * boot's filing system calls cost beside its CPU (FSDESIGN §13 B2) */
+        vmch_trace("vmch: cmd=%u seq=%u rc=%u hnd=%08x arglen=%u us=%lld",
                 cmd, ld32(base + VMCH_HDR_SEQ), rc,
-                ld32(base + VMCH_HDR_HANDLE), arglen);
+                ld32(base + VMCH_HDR_HANDLE), arglen,
+                (long long)(g_get_monotonic_time() - started));
         if (cmd >= 0x100) {
             vmch_trace(" R1=%08x R2=%08x R3=%08x R4=%08x",
                     ld32(base + VMCH_HDR_REGS + 4),

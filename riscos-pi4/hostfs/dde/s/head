@@ -29,10 +29,12 @@
         IMPORT  fsentry_close_handler
         IMPORT  fsentry_file_handler
         IMPORT  fsentry_func_handler
+        IMPORT  hostfs_cmos_check
 
         EXPORT  swix
         EXPORT  hostfs_register
         EXPORT  hostfs_free_register
+        EXPORT  hostfs_cmos_hooks
         EXPORT  hostfs_error
 
 V_bit           *       1 :SHL: 28
@@ -40,6 +42,13 @@ XOS_FSControl   *       &20029
 XOS_CallASWIR12 *       &20071
 XFree_Register  *       &644C0
 XFree_DeRegister *      &644C1
+XOS_CLI         *       &20005
+XOS_Claim       *       &2001F
+XOS_Release     *       &20020
+XOS_AddCallBack *       &20054
+XOS_RemoveCallBack *    &2005F
+ByteV           *       6
+OsByte_WriteCMOS *      162
 
 Module_Base
         DCD     0                               ; start: not an application
@@ -341,6 +350,78 @@ Free_Error
 
 Free_Path
         =       "HostFS:$", 0
+        ALIGN
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *hostfs_cmos_hooks(void *pw, int op)
+;
+; Keeping CMOS on the share, as SDCMOS keeps it on a card
+; (HWSupport/SD/SDCMOS): when HostFS is the boot filing system and the share
+; has a $.CMOS, every CMOS write is followed by *SaveCMOS to it, and the
+; launcher boots from that file next time (tools/rom.zsh).
+;
+;   op 0  OS_AddCallBack the check — it has to wait until after start-up,
+;         like SDCMOS's, because HostFS cannot map its doorbell during init
+;   op 1  OS_RemoveCallBack it, in case HostFS is killed first
+;   op 2  claim ByteV            op 3  release ByteV
+;
+; The addresses are found with ADR here, not taken in C: a function
+; address in C is an absolute relocation.
+; ---------------------------------------------------------------------------
+hostfs_cmos_hooks
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r4, r0
+        MOV     r5, r1
+        ADRL    r0, CMOSCallBack
+        MOV     r1, r4
+        TEQ     r5, #0                          ; branches, not SWIEQ/SWINE:
+        BNE     %FT10                           ; a SWI's flags are its own
+        SWI     XOS_AddCallBack
+        B       %FT90
+10      TEQ     r5, #1
+        BNE     %FT20
+        SWI     XOS_RemoveCallBack
+        B       %FT90
+20      MOV     r0, #ByteV
+        ADRL    r1, MyByteV
+        MOV     r2, r4
+        TEQ     r5, #2
+        BNE     %FT30
+        SWI     XOS_Claim
+        B       %FT90
+30      SWI     XOS_Release
+90      MOVVC   r0, #0
+        LDMFD   sp!, {r4-r11, pc}
+
+; The callback: SVC mode, R12 = the private word pointer; everything
+; preserved.  hostfs_cmos_check(pw) decides whether to claim ByteV.
+CMOSCallBack
+        STMFD   sp!, {r0-r11, lr}
+        MOV     r0, r12
+        BL      hostfs_cmos_check
+        LDMFD   sp!, {r0-r11, pc}
+
+; ByteV, as SDCMOS's MyByteV: pass OS_Byte 162 on with a return address
+; of our own on the stack, so that once the kernel has written the byte
+; and pulled PC we come back, save, and return to the original caller.
+MyByteV
+        TEQ     r0, #OsByte_WriteCMOS
+        MOVNE   pc, lr
+        ADR     r0, ByteV_Written
+        STMFD   sp!, {r0, r12}
+        MOV     r0, #OsByte_WriteCMOS
+        MOV     pc, lr
+ByteV_Written
+        LDR     r12, [sp], #4
+        LDRVS   pc, [sp], #4                    ; an error: pass it straight up
+        STR     r0, [sp, #-4]!
+        ADR     r0, SaveCMOS_Command
+        SWI     XOS_CLI
+        STRVS   r0, [sp]
+        LDMFD   sp!, {r0, pc}
+
+SaveCMOS_Command
+        =       "SaveCMOS HostFS:$.CMOS", 0
         ALIGN
 
 ; ---------------------------------------------------------------------------
