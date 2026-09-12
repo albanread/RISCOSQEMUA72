@@ -1,0 +1,277 @@
+; s.head — HostFSFiler: the module header, the service handler, the
+; Desktop_HostFSFiler command, the task's start entry, and swix.
+;
+; Built the way HostFS is (riscos-pi4/hostfs/dde/s/head): objasm, cc and
+; link -rmf, with no cmhg and no C:o.stubs, so the module runs from ROM.
+; Nothing here is an absolute address, and nothing writes the image.
+;
+; The shape is RAMFSFiler's (RiscOS/Sources/FileSys/RAMFS/RAMFSFiler):
+;
+;   - No workspace until the Filer asks for filers, with Service_StartFiler.
+;     Claim it then, keep it in the private word, and claim the service by
+;     answering with Desktop_HostFSFiler, which the Filer starts as a task.
+;   - That command enters the module (OS_Module 2); the start entry runs the
+;     task in user mode, on a stack at the end of the workspace, in C.
+;   - The task leaves through filer_exit, which closes it down, frees the
+;     workspace and calls OS_Exit without touching the stack it just freed.
+;
+; The private word is 0 before the Filer starts us, the workspace while we
+; exist, and -1 after a start that gave up — so the Filer, which re-issues
+; Service_StartFiler until nobody claims it, does not restart a task that
+; cannot run.  Service_StartedFiler clears the -1.
+;
+; The first three words of the workspace are shared with c.hostfsfiler's
+; struct filerws: keep WS_* in step with it.  filer_task() checks WS_Size.
+
+        AREA    |!!!Module$$Header|, CODE, READONLY
+
+        IMPORT  filer_task
+
+        EXPORT  swix
+        EXPORT  filer_exit
+
+V_bit                   *       1 :SHL: 28
+XOS_Module              *       &2001E
+XOS_CallASWIR12         *       &20071
+XWimp_CloseDown         *       &600DD
+OS_Exit                 *       &11
+OS_GenerateError        *       &2B
+
+Service_Reset           *       &27
+Service_StartFiler      *       &4B
+Service_StartedFiler    *       &4C
+Service_FilerDying      *       &4F
+
+WS_PrivateWord          *       0
+WS_FilerTask            *       4
+WS_Task                 *       8
+WS_Size                 *       5048    ; sizeof(struct filerws), checked at start
+
+Module_Base
+        DCD     Start - Module_Base             ; start: the task
+        DCD     0                               ; init: nothing until the Filer asks
+        DCD     Final - Module_Base
+        DCD     Service - Module_Base
+        DCD     Title - Module_Base
+        DCD     Help - Module_Base
+        DCD     Commands - Module_Base
+        DCD     0                               ; SWI chunk: none
+        DCD     0                               ; SWI handler
+        DCD     0                               ; SWI decoding table
+        DCD     0                               ; SWI decoding code
+        DCD     0                               ; Messages file
+        DCD     Flags - Module_Base
+
+Flags   DCD     1                               ; bit 0: 32-bit compatible
+
+Title   =       "HostFSFiler", 0
+Help    =       "HostFSFiler", 9, "2.00 (12 Sep 2026)", 0
+        ALIGN
+
+; *Command table (PRM 1-205).  Information word: byte 0 minimum parameters,
+; byte 1 GSTrans map, byte 2 maximum parameters, byte 3 flags.
+Commands
+Command_Desktop
+        =       "Desktop_HostFSFiler", 0
+        ALIGN
+        DCD     Cmd_Desktop - Module_Base
+        DCD     0
+        DCD     Desktop_Syntax - Module_Base
+        DCD     Desktop_Help - Module_Base
+        =       0
+
+Desktop_Help
+        =       "The HostFS filer puts the host computer's shared directory "
+        =       "on the icon bar, and uses the Filer to show it.", 13
+        =       "Do not use *Desktop_HostFSFiler, use *Desktop instead.", 13, 0
+Desktop_Syntax
+        =       "Syntax: *Desktop_HostFSFiler", 0
+        ALIGN
+
+Err_UseDesktop
+        DCD     0
+        =       "Use *Desktop to start HostFSFiler", 0
+        ALIGN
+
+Task_Word
+        =       "TASK"
+        ALIGN
+
+; ---------------------------------------------------------------------------
+; Service calls.  In: R1 = service number, R12 -> private word, SVC mode.
+; A service handler cannot return an error, so V is always cleared.
+; ---------------------------------------------------------------------------
+Service
+        TEQ     r1, #Service_StartFiler
+        TEQNE   r1, #Service_StartedFiler
+        TEQNE   r1, #Service_FilerDying
+        TEQNE   r1, #Service_Reset
+        MOVNE   pc, lr
+
+        TEQ     r1, #Service_StartFiler
+        BEQ     Svc_StartFiler
+        TEQ     r1, #Service_StartedFiler
+        BEQ     Svc_StartedFiler
+
+; Service_FilerDying and Service_Reset: the Filer, or the whole desktop, is
+; going and the task with it.  After a reset the Wimp has already gone, so
+; the task is not closed down, only forgotten.
+        STMFD   sp!, {r0-r3, lr}
+        LDR     r2, [r12]
+        CMP     r2, #0
+        MOVLT   r2, #0
+        STRLT   r2, [r12]                       ; clear "do not start"
+        BLE     %FT90
+        TEQ     r1, #Service_Reset
+        MOVEQ   r0, #0
+        STREQ   r0, [r2, #WS_Task]
+        BL      FreeWorkspace
+90      CMP     r0, r0                          ; clear V
+        LDMFD   sp!, {r0-r3, pc}
+
+; Service_StartFiler.  In: R0 = the Filer's task handle.  Claim by returning
+; R0 -> the command that starts us, R1 = 0.
+Svc_StartFiler
+        STMFD   sp!, {r2-r6, lr}
+        LDR     r2, [r12]
+        CMP     r2, #0
+        BNE     %FT80                           ; running, starting, or told not to
+        MOV     r6, r0
+        MOV     r0, #6                          ; OS_Module 6: claim, size in R3
+        LDR     r3, =WS_Size
+        SWI     XOS_Module
+        BVS     %FT70
+        MOV     r0, #0
+        MOV     r4, r2
+        ADD     r5, r2, r3
+60      STR     r0, [r4], #4                    ; zero it: every field starts at 0
+        CMP     r4, r5
+        BLO     %BT60
+        STR     r12, [r2, #WS_PrivateWord]
+        STR     r6, [r2, #WS_FilerTask]
+        STR     r2, [r12]
+        ADRL    r0, Command_Desktop
+        MOV     r1, #0                          ; claimed
+        CMP     r0, r0
+        LDMFD   sp!, {r2-r6, pc}
+70      MVN     r2, #0
+        STR     r2, [r12]                       ; no memory: do not ask again
+        MOV     r0, r6
+80      CMP     r0, r0
+        LDMFD   sp!, {r2-r6, pc}
+        LTORG
+
+Svc_StartedFiler
+        STMFD   sp!, {r0, lr}
+        LDR     r0, [r12]
+        CMP     r0, #0
+        MOVLT   r0, #0
+        STRLT   r0, [r12]                       ; the Filer may start us again
+        CMP     r0, r0
+        LDMFD   sp!, {r0, pc}
+
+; In: R2 -> workspace, R12 -> private word.  Closes the task down if it is
+; running, frees the block, zeroes the private word.  Corrupts R0-R2.
+FreeWorkspace
+        STR     lr, [sp, #-4]!
+        LDR     r0, [r2, #WS_Task]
+        CMP     r0, #0
+        LDRGT   r1, Task_Word
+        SWIGT   XWimp_CloseDown                 ; errors ignored
+        MOV     r0, #0
+        STR     r0, [r12]
+        MOV     r0, #7                          ; OS_Module 7: free, block in R2
+        SWI     XOS_Module
+        LDR     pc, [sp], #4
+
+; ---------------------------------------------------------------------------
+; Finalisation.  In: R12 -> private word.
+; ---------------------------------------------------------------------------
+Final
+        STMFD   sp!, {r0-r2, lr}
+        LDR     r2, [r12]
+        CMP     r2, #0
+        MOVLT   r0, #0
+        STRLT   r0, [r12]
+        BLGT    FreeWorkspace
+        CMP     r0, r0                          ; clear V: never refuse to die
+        LDMFD   sp!, {r0-r2, pc}
+
+; ---------------------------------------------------------------------------
+; *Desktop_HostFSFiler.  In: R12 -> private word, SVC mode.  Enters the
+; module as the current application, which runs Start; that only makes
+; sense once Service_StartFiler has given us a workspace.
+; ---------------------------------------------------------------------------
+Cmd_Desktop
+        STR     lr, [sp, #-4]!
+        LDR     r2, [r12]
+        CMP     r2, #0
+        BLE     %FT10
+        MOV     r0, #2                          ; OS_Module 2: enter
+        ADRL    r1, Title
+        MOV     r2, #0
+        SWI     XOS_Module                      ; returns only with an error
+        LDR     pc, [sp], #4
+10      ADRL    r0, Err_UseDesktop
+        MOV     r1, #0
+        CMP     r1, #&80000000                  ; set V
+        LDR     pc, [sp], #4
+
+; ---------------------------------------------------------------------------
+; The task.  In: user mode, R12 -> private word.  The stack is the last
+; bytes of the workspace; filer_task never returns.
+; ---------------------------------------------------------------------------
+Start
+        LDR     r4, [r12]
+        CMP     r4, #0
+        BLE     %FT10
+        LDR     r1, =WS_Size
+        ADD     sp, r4, r1
+        MOV     r0, r4
+        BL      filer_task
+        MOV     r0, r4
+        MOV     r1, #1
+        B       filer_exit
+10      ADRL    r0, Err_UseDesktop
+        SWI     OS_GenerateError
+        LTORG
+
+; ---------------------------------------------------------------------------
+; void filer_exit(struct filerws *ws, int do_not_restart)
+;
+; Leave the task for good.  Nothing after the free may use the stack,
+; which is inside the block; OS_Exit does not return.
+; ---------------------------------------------------------------------------
+filer_exit
+        MOV     r4, r0
+        MOV     r5, r1
+        LDR     r0, [r4, #WS_Task]
+        CMP     r0, #0
+        LDRGT   r1, Task_Word
+        SWIGT   XWimp_CloseDown
+        LDR     r12, [r4, #WS_PrivateWord]
+        MOVS    r0, r5
+        MVNNE   r0, #0                          ; -1: do not restart
+        STR     r0, [r12]
+        MOV     r0, #7
+        MOV     r2, r4
+        SWI     XOS_Module
+        SWI     OS_Exit
+
+; ---------------------------------------------------------------------------
+; _kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
+;                       _kernel_swi_regs *out)
+; As in HostFS: any SWI, as its X form, through OS_CallASWIR12.
+; ---------------------------------------------------------------------------
+swix
+        STMFD   sp!, {r4-r11, lr}
+        STR     r2, [sp, #-4]!
+        ORR     r12, r0, #&20000
+        LDMIA   r1, {r0-r9}
+        SWI     XOS_CallASWIR12
+        LDR     r12, [sp], #4
+        STMIA   r12, {r0-r9}
+        MOVVC   r0, #0
+        LDMFD   sp!, {r4-r11, pc}
+
+        END

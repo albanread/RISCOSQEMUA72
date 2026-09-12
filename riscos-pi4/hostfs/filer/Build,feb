@@ -1,8 +1,15 @@
-| Build — compile and link the HostFSFiler module with the DDE.
-| Produces <Obey$Dir>.HostFSFiler,ffa.  Run after SetDDE.
+| Build — assemble, compile and link HostFSFiler with the DDE.
+| Produces <Obey$Dir>.HostFSFiler,ffa: one module that runs from ROM as
+| well as from the RMA.  Obey halts at the first failing command, so any
+| error below is the one to read.  The o directory must exist already.
+|
+| Built as HostFS is (../dde/Build): no cmhg and no C:o.stubs, which both
+| write into the module image at initialisation.  o.relocs must hold only
+| PC-relative relocations.
 Set HFiler$Dir <Obey$Dir>
 Dir <Obey$Dir>
-cc -c -zM -zps1 -ffah -IC: -o o.hostfsfiler c.hostfsfiler
-cmhg cmhg.HostFSFiler -o o.head
-link -rmf -o HostFSFiler,ffa o.head o.hostfsfiler C:o.stubs
+objasm -o o.head s.head
+cc -c -zps1 -ffah -o o.hostfsfiler c.hostfsfiler
+link -rmf -o HostFSFiler,ffa o.head o.hostfsfiler
+decaof -r o.head o.hostfsfiler { > o.relocs }
 Echo Built <HFiler$Dir>.HostFSFiler,ffa

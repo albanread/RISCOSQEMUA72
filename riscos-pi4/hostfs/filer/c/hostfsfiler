@@ -1,227 +1,539 @@
-/* hostfsfiler.c — the HostFS icon-bar filer (DDE build).  Sprint 6D.
+/* hostfsfiler.c — the HostFS disc on the icon bar (FSDESIGN-V1.md §13 D1).
  *
- * A desktop filer module on the RAMFSFiler pattern.  It provides a
- * Desktop_HostFSFiler command; the desktop starts that as a Wimp task
- * (it Wimp_StartTasks every Desktop_* command at *Desktop time), and
- * the task puts a HostFS disc on the icon bar.  Clicking it opens
- * HostFS:$ — the desktop's own Filer draws the directory window, since
- * HostFS answers the FSEntry_Func calls a Filer makes.
+ * The task half of HostFSFiler.  s.head does what must happen outside the
+ * task — the service calls that start it, the command the Filer runs, the
+ * user-mode entry with a stack in the workspace — and calls filer_task()
+ * here, which never returns.
  *
- * The module also starts the task itself on Service_StartFiler and at
- * init (when the Wimp is already up), so RMLoading it on a running
- * desktop adds the icon without a reboot.
+ * The desktop's own Filer draws the directory windows, from the
+ * FSEntry_Func calls HostFS answers; this task only owns the icon.  SELECT
+ * or ADJUST on it opens the share's root, MENU offers Open, Free and Quit,
+ * interactive help describes each, and a file dropped on the icon — dragged
+ * from a Filer window or saved from an application — lands in the root.
+ * That is the behaviour RAMFSFiler gives RAM:, without the parts only a RAM
+ * disc has.
+ *
+ * Built like HostFS, to run from ROM: every variable is in struct filerws,
+ * claimed by s.head and never in the image; no C library (swix() in s.head
+ * stands in for _kernel_swi); no division; string literals only, which cc
+ * reaches PC-relative.  `decaof -r` must list PC-relative relocations only.
  */
-
-#include "kernel.h"
 
 #define NULL ((void *)0)
 
-/* Wimp / OS SWIs (swis.h is more surface than this needs) */
-#define Wimp_Initialise   0x400C0
-#define Wimp_CreateIcon   0x400C2
-#define Wimp_Poll         0x400C7
-#define Wimp_CloseDown    0x400DD
-#define Wimp_StartTask    0x400DE
-#define Wimp_CreateMenu   0x400D4
-#define XWimp_StartTask   0x600DE
-#define XOS_CLI           0x20005
+typedef struct { int r[10]; } _kernel_swi_regs;
+typedef struct { int errnum; char errmess[252]; } _kernel_oserror;
 
-/* Service and icon-bar constants */
-#define Service_StartFiler  0x4B
-#define Iconbar_Left        (-2)          /* filing systems live here */
+#define XOS_CLI               0x20005
+#define XOS_FSControl         0x20029
+#define XOS_ReadModeVariable  0x20035
+#define XWimp_Initialise      0x600C0
+#define XWimp_CreateIcon      0x600C2
+#define XWimp_Poll            0x600C7
+#define XWimp_GetPointerInfo  0x600CF
+#define XWimp_CreateMenu      0x600D4
+#define XWimp_ReportError     0x600DF
+#define XWimp_SendMessage     0x600E7
+#define XWimp_SpriteOp        0x600E9
 
-/* icon flags: indirected sprite+text, h/v centred, button type 3 (click),
- * foreground colour 7 (black) */
-#define ICON_FLAGS  0x1700310Bu   /* sprite+text, h-centred, indirected, button 3 (RAMFSFiler pattern) */
+#define TASK_WORD             0x4B534154        /* "TASK" */
+#define HOSTFS_FS_NUMBER      220
+#define ICON_SPRITE           "harddisc"
 
-static _kernel_oserror err_started =
-    { 0x1B000000, "HostFSFiler is already running" };
+/* Just right of the hard discs on the icon bar: HostFS stands for the
+ * host's own disc (Desktop/Wimp/hdr/Wimp: WimpPriority_HardDiscs is
+ * &70000000, WimpPriority_FloppyDiscs &60000000). */
+#define ICON_PRIORITY         0x6F000000
 
-/* the running task's handle, 0 when not running (one instance only) */
-static int task_handle;
+#define Mouse_Click           6
+#define Menu_Selection        9
+#define User_Message          17
+#define User_Message_Recorded 18
 
-/* ---- the Wimp task -------------------------------------------------- */
+#define Message_Quit          0
+#define Message_DataSave      1
+#define Message_DataSaveAck   2
+#define Message_DataLoad      3
+#define Message_DataLoadAck   4
+#define Message_FilerOpenDir  0x400
+#define Message_FilerDevicePath 0x408
+#define Message_HelpRequest   0x502
+#define Message_HelpReply     0x503
 
-static int poll[64];
-static int icon[10];
-static char disc_name[12] = "HostFS";
-static char validation[16] = "Sharddisc";     /* S<sprite> for the bar icon */
+#define ICONBAR               (-2)
 
-/* menu: header (28) + 2 items (24 each): Info, Quit */
-static int menu[28];
-static char m_title[12] = "HostFS";
-static char m_info[12]  = "Info";
-static char m_quit[12]  = "Quit";
+#define MENU_OPEN             0
+#define MENU_FREE             1
+#define MENU_QUIT             2
+#define MENU_ITEMS            3
 
-static void make_icon(void)
+#define STACK_SIZE            4096
+
+/* in s.head */
+_kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
+                      _kernel_swi_regs *out);
+
+struct filerws {
+    int private_word;           /* +0  \  s.head reads and writes these */
+    int filer_task;             /* +4   | three by offset: keep them first, */
+    int task;                   /* +8  /  and in this order */
+    int icon;
+    int poll[64];               /* Wimp_Poll's block; messages arrive here */
+    int message[64];            /* messages we send */
+    int menu[7 + MENU_ITEMS * 6];   /* 28-byte header, 24 bytes per item */
+    int pointer[5];             /* Wimp_GetPointerInfo */
+    int messages[4];            /* the messages we ask the Wimp for */
+    char icon_text[16];
+    char validation[16];
+    _kernel_oserror error;
+    char stack[STACK_SIZE];     /* the task's stack: s.head sets sp to the
+                                 * end of the block */
+};
+
+void filer_exit(struct filerws *ws, int do_not_restart);   /* in s.head */
+void filer_task(struct filerws *ws, int size);
+
+/* ---- small things the C library would have done ------------------- */
+
+static char *str_copy(char *d, const char *s)
 {
-    _kernel_swi_regs r;
-
-    icon[0] = -6;                         /* icon bar, left, with priority */
-    icon[1] = 0;                          /* x0 */
-    icon[2] = 0;                          /* y0 */
-    icon[3] = 136;                        /* x1 */
-    icon[4] = 68;                         /* y1: the icon-bar height */
-    icon[5] = (int)ICON_FLAGS;
-    icon[6] = (int)disc_name;             /* indirected text */
-    icon[7] = (int)validation;            /* validation: the sprite */
-    icon[8] = sizeof(disc_name);
-    r.r[0] = 0;
-    r.r[1] = (int)icon;
-    _kernel_swi(Wimp_CreateIcon, &r, &r); /* r.r[0] = icon handle, unused */
-}
-
-static void build_menu(void)
-{
-    /* header */
-    ((char *)menu)[0]  = 0;               /* title, filled below */
-    /* title text, 12 bytes */
-    {
-        int i;
-        for (i = 0; i < 12; i++) {
-            ((char *)menu)[i] = (i < 6) ? m_title[i] : 0;
-        }
+    while ((*d = *s++) != 0) {
+        d++;
     }
-    ((char *)menu)[12] = 7;               /* title fg */
-    ((char *)menu)[13] = 2;               /* title bg */
-    ((char *)menu)[14] = 7;               /* work fg */
-    ((char *)menu)[15] = 0;               /* work bg */
-    menu[4] = 200;                        /* +16 width */
-    menu[5] = 44;                         /* +20 item height */
-    menu[6] = 0;                          /* +24 gap */
-    /* item 0: Info (+28) */
-    menu[7]  = 0;                         /* flags */
-    menu[8]  = -1;                        /* submenu */
-    menu[9]  = 0x07000021;               /* icon flags: text, filled, fg 7 */
-    { int i; for (i = 0; i < 12; i++) ((char *)&menu[10])[i] = i < 4 ? m_info[i] : 0; }
-    /* item 1: Quit (+52) */
-    menu[13] = 0x80;                      /* last item */
-    menu[14] = -1;
-    menu[15] = 0x07000021;
-    { int i; for (i = 0; i < 12; i++) ((char *)&menu[16])[i] = i < 4 ? m_quit[i] : 0; }
+    return d;
 }
 
-static void open_root(void)
+static int str_len(const char *s)
+{
+    int n = 0;
+
+    while (s[n] >= ' ') {
+        n++;
+    }
+    return n;
+}
+
+/* The strings used in more than one place, each behind the one function
+ * that holds it.  cc pools a literal used by several functions and reaches
+ * it from the distant ones through an absolute address word — a relocation,
+ * which `decaof -r` catches and ROM cannot take.  A literal with a single
+ * user sits in that function's own pool and is reached PC-relative. */
+static char *copy_root(char *d)
+{
+    return str_copy(d, "HostFS::HostFS.$");
+}
+
+static const char *task_name(void)
+{
+    return "HostFS Filer";
+}
+
+static char *copy_disc_name(char *d)
+{
+    return str_copy(d, "HostFS");
+}
+
+/* word-aligned size of a message whose last byte is at `end` */
+static int message_size(int *block, char *end)
+{
+    int n = (int)(end - (char *)block) + 1;
+
+    return (n + 3) & ~3;
+}
+
+/* ---- errors ---------------------------------------------------------- */
+
+/* Report an error in the standard box, OK button only. */
+static void report(struct filerws *ws, _kernel_oserror *e)
 {
     _kernel_swi_regs r;
-    r.r[0] = (int)"Filer_OpenDir HostFS:$";
-    _kernel_swi(XOS_CLI, &r, &r);         /* errors ignored: no window is fine */
+
+    (void)ws;
+    r.r[0] = (int)e;
+    r.r[1] = 1;                         /* OK */
+    r.r[2] = (int)task_name();
+    (void)swix(XWimp_ReportError, &r, &r);
 }
 
-static void show_menu(int x)
+/* Report an error and give up for good: the Filer is not to restart us. */
+static void give_up(struct filerws *ws, _kernel_oserror *e)
 {
-    _kernel_swi_regs r;
-    r.r[1] = (int)menu;
-    r.r[2] = x - 64;
-    r.r[3] = 96 + 44 * 3;                 /* above the bar */
-    _kernel_swi(Wimp_CreateMenu, &r, &r);
+    if (e != NULL) {
+        report(ws, e);
+    }
+    filer_exit(ws, 1);
 }
 
-/* Run the Wimp task.  Entered as a task by Wimp_StartTask (the desktop
- * does this for Desktop_HostFSFiler), so the poll loop multitasks. */
-static _kernel_oserror *run_task(void)
+/* ---- the icon -------------------------------------------------------- */
+
+static _kernel_oserror *make_icon(struct filerws *ws)
 {
     _kernel_swi_regs r;
     _kernel_oserror *e;
-    int done = 0;
+    int block[9];
+    int width = 0, height = 0, xeig = 1, yeig = 1, text_width;
 
-    if (task_handle != 0) {
-        return &err_started;
+    (void)copy_disc_name(ws->icon_text);
+    (void)str_copy(str_copy(ws->validation, "S"), ICON_SPRITE);
+
+    /* Size the icon to the sprite in this mode, as RAMFSFiler does, and to
+     * the text beneath it (16 OS units a character in the system font). */
+    r.r[0] = 40;                        /* SpriteOp: ReadSpriteSize */
+    r.r[2] = (int)ICON_SPRITE;
+    e = swix(XWimp_SpriteOp, &r, &r);
+    if (e == NULL) {
+        int mode = r.r[6];
+
+        width = r.r[3];
+        height = r.r[4];
+        r.r[0] = mode;
+        r.r[1] = 4;                     /* XEigFactor */
+        if (swix(XOS_ReadModeVariable, &r, &r) == NULL) {
+            xeig = r.r[2];
+        }
+        r.r[0] = mode;
+        r.r[1] = 5;                     /* YEigFactor */
+        if (swix(XOS_ReadModeVariable, &r, &r) == NULL) {
+            yeig = r.r[2];
+        }
+    } else {
+        width = 34;                     /* no sprite: size for a typical one */
+        height = 17;
     }
+    width <<= xeig;
+    height <<= yeig;
+    text_width = str_len(ws->icon_text) * 16;
 
-    r.r[0] = 310;
-    r.r[1] = 0x4B534154;                  /* "TASK" */
-    r.r[2] = (int)"HostFS";
-    e = _kernel_swi(Wimp_Initialise, &r, &r);
+    block[0] = -6;                      /* icon bar, left, with priority */
+    block[1] = 0;
+    block[2] = -16;                     /* text baseline */
+    block[3] = width > text_width ? width : text_width;
+    block[4] = 20 + height;             /* sprite above the text */
+    block[5] = 0x1700310B;              /* sprite + text, h-centred,
+                                         * indirected, click, fg 7, bg 1 */
+    block[6] = (int)ws->icon_text;
+    block[7] = (int)ws->validation;
+    block[8] = sizeof(ws->icon_text);
+
+    r.r[0] = ICON_PRIORITY;
+    r.r[1] = (int)block;
+    e = swix(XWimp_CreateIcon, &r, &r);
+    if (e == NULL) {
+        ws->icon = r.r[0];
+    }
+    return e;
+}
+
+/* ---- opening the root ------------------------------------------------ */
+
+/* Message_FilerOpenDir to the Filer (Desktop/Filer/s/MsgsIn: data+0 the
+ * filing system number, +4 flags, +8 the directory's full name). */
+static void open_root(struct filerws *ws)
+{
+    _kernel_swi_regs r;
+    int *m = ws->message;
+    char *end;
+
+    m[1] = m[2] = m[3] = 0;
+    m[4] = Message_FilerOpenDir;
+    m[5] = HOSTFS_FS_NUMBER;
+    m[6] = 0;
+    end = copy_root((char *)&m[7]);
+    m[0] = message_size(m, end);
+
+    r.r[0] = User_Message_Recorded;
+    r.r[1] = (int)m;
+    r.r[2] = ws->filer_task;
+    (void)swix(XWimp_SendMessage, &r, &r);
+}
+
+/* ---- the menu -------------------------------------------------------- */
+
+static void menu_item(struct filerws *ws, int i, const char *text, int last)
+{
+    int *item = &ws->menu[7 + i * 6];
+    int k;
+
+    item[0] = last ? 0x80 : 0;          /* menu flags: bit 7 last item */
+    item[1] = -1;                       /* no submenu */
+    item[2] = 0x07000021;               /* text, filled, fg 7 bg 0 */
+    for (k = 0; k < 12; k++) {
+        ((char *)&item[3])[k] = 0;
+    }
+    (void)str_copy((char *)&item[3], text);
+}
+
+static void build_menu(struct filerws *ws)
+{
+    char *title = (char *)ws->menu;
+    int k;
+
+    for (k = 0; k < 12; k++) {
+        title[k] = 0;
+    }
+    (void)copy_disc_name(title);
+    title[12] = 7;                      /* title foreground */
+    title[13] = 2;                      /* title background */
+    title[14] = 7;                      /* work area foreground */
+    title[15] = 0;                      /* work area background */
+    ws->menu[4] = 7 * 16 + 16;          /* width: the widest text, and a margin */
+    ws->menu[5] = 44;                   /* item height */
+    ws->menu[6] = 0;                    /* gap */
+    menu_item(ws, MENU_OPEN, "Open", 0);
+    menu_item(ws, MENU_FREE, "Free", 0);
+    menu_item(ws, MENU_QUIT, "Quit", 1);
+}
+
+static void show_menu(struct filerws *ws, int x)
+{
+    _kernel_swi_regs r;
+
+    r.r[1] = (int)ws->menu;
+    r.r[2] = x - 64;
+    r.r[3] = 96 + MENU_ITEMS * 44;      /* opens above the icon bar */
+    (void)swix(XWimp_CreateMenu, &r, &r);
+}
+
+/* The Free module's window, as RAMFSFiler's Free entry opens for RAM:. */
+static void show_free(struct filerws *ws)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    r.r[0] = (int)"ShowFree -FS HostFS HostFS";    /* -FS <fs> <device> */
+    e = swix(XOS_CLI, &r, &r);
     if (e != NULL) {
-        return e;
+        report(ws, e);
     }
-    task_handle = r.r[1];
+}
 
-    build_menu();
-    make_icon();
+static void menu_selection(struct filerws *ws)
+{
+    _kernel_swi_regs r;
+    int choice = ws->poll[0];
 
-    while (!done) {
-        r.r[0] = 0x00003831;              /* mask null and pointer moves */
-        r.r[1] = (int)poll;
-        _kernel_swi(Wimp_Poll, &r, &r);
-        switch (r.r[0]) {
-        case 6:                           /* Mouse_Click */
-            if (poll[3] == Iconbar_Left) {
-                if (poll[2] & 5) {        /* Select or Adjust */
-                    open_root();
-                } else if (poll[2] & 2) { /* Menu */
-                    show_menu(poll[0]);
-                }
-            }
+    switch (choice) {
+    case MENU_OPEN:
+        open_root(ws);
+        break;
+    case MENU_FREE:
+        show_free(ws);
+        break;
+    case MENU_QUIT:
+        filer_exit(ws, 0);              /* HostFS stays; only the icon goes */
+        break;
+    default:
+        return;
+    }
+    /* ADJUST keeps the menu up */
+    r.r[1] = (int)ws->pointer;
+    if (swix(XWimp_GetPointerInfo, &r, &r) == NULL && (ws->pointer[2] & 1)) {
+        show_menu(ws, ws->pointer[0]);
+    }
+}
+
+/* ---- messages -------------------------------------------------------- */
+
+/* Interactive help, for the icon and for each menu entry. */
+static void help_request(struct filerws *ws)
+{
+    _kernel_swi_regs r;
+    int *m = ws->poll;
+    int window = m[8], icon = m[9];
+    const char *text = NULL;
+    char *end;
+
+    if (window == ICONBAR && icon == ws->icon) {
+        text = "This is the HostFS icon: the host computer's shared directory."
+               "|MClick SELECT to open it.|MClick MENU for more options.";
+    } else {
+        int state[10];
+
+        r.r[0] = 1;                     /* the item under the pointer */
+        r.r[1] = (int)state;
+        r.r[2] = window;
+        r.r[3] = icon;
+        if (swix(0x600F4, &r, &r) != NULL) {    /* Wimp_GetMenuState */
+            return;
+        }
+        if (state[1] != -1) {
+            return;                     /* not one of our menus */
+        }
+        switch (state[0]) {
+        case MENU_OPEN:
+            text = "Opens the root directory of the host's shared directory.";
             break;
-        case 9:                           /* Menu selection */
-            if (poll[0] == 0) {
-                open_root();              /* Info -> for now, open (placeholder) */
-            } else if (poll[0] == 1) {
-                done = 1;                 /* Quit */
-            }
+        case MENU_FREE:
+            text = "Shows how much space is free on the host.";
             break;
-        case 17: case 18:                 /* User_Message */
-            if (poll[4] == 0) {           /* Message_Quit */
-                done = 1;
-            }
+        case MENU_QUIT:
+            text = "Removes the HostFS icon from the icon bar.|MHostFS itself "
+                   "stays: HostFS: still reaches the share.";
             break;
+        default:
+            return;
         }
     }
 
-    r.r[0] = task_handle;
-    r.r[1] = 0x4B534154;
-    _kernel_swi(Wimp_CloseDown, &r, &r);
-    task_handle = 0;
-    return NULL;
+    m[3] = m[2];                        /* your ref = their my ref */
+    m[4] = Message_HelpReply;
+    end = str_copy((char *)&m[5], text);
+    m[0] = message_size(m, end);
+    r.r[0] = User_Message;
+    r.r[1] = (int)m;
+    r.r[2] = m[1];                      /* back to the sender */
+    (void)swix(XWimp_SendMessage, &r, &r);
 }
 
-/* Ask the Wimp to start us as a task (used from init and the service). */
-static void start_task(void)
+/* A file saved onto the icon: tell the saver where it goes, the root. */
+static void data_save(struct filerws *ws)
 {
     _kernel_swi_regs r;
-    r.r[0] = (int)"Desktop_HostFSFiler";
-    _kernel_swi(XWimp_StartTask, &r, &r); /* fails harmlessly if no Wimp yet */
-}
+    int *m = ws->poll;
+    char leaf[212];
+    char *end;
+    int i;
 
-/* ---- module lifecycle ---------------------------------------------- */
-
-_kernel_oserror *hostfsfiler_init(const char *tail, int podule, void *pw)
-{
-    (void)tail; (void)podule; (void)pw;
-    start_task();                         /* if a desktop is already up */
-    return NULL;
-}
-
-_kernel_oserror *hostfsfiler_final(int fatal, int podule, void *pw)
-{
-    (void)fatal; (void)podule; (void)pw;
-    if (task_handle != 0) {
-        _kernel_swi_regs r;
-        r.r[0] = task_handle;
-        r.r[1] = 0x4B534154;
-        _kernel_swi(Wimp_CloseDown, &r, &r);
-        task_handle = 0;
+    /* the proposed leaf name is at +44; keep a copy, then write the full
+     * path over it (PRM 3-253) */
+    for (i = 0; i < 211 && ((char *)m)[44 + i] >= ' '; i++) {
+        leaf[i] = ((char *)m)[44 + i];
     }
-    return NULL;
+    leaf[i] = 0;
+    end = str_copy(str_copy(copy_root((char *)&m[11]), "."), leaf);
+    m[0] = message_size(m, end);
+    m[3] = m[2];
+    m[4] = Message_DataSaveAck;
+    m[9] = -1;                          /* estimated size: unsafe, not ours */
+    r.r[0] = User_Message;
+    r.r[1] = (int)m;
+    r.r[2] = m[1];
+    (void)swix(XWimp_SendMessage, &r, &r);
 }
 
-void hostfsfiler_service(int service, _kernel_swi_regs *r, void *pw)
+/* Files dropped on the icon from a Filer window (your ref 0): answer with
+ * the device path, and the Filer copies them into the root.  Otherwise
+ * this is the end of a save to the icon: acknowledge, and show where the
+ * file went. */
+static void data_load(struct filerws *ws)
 {
-    (void)r; (void)pw;
-    if (service == Service_StartFiler) {
-        start_task();
+    _kernel_swi_regs r;
+    int *m = ws->poll;
+    char *end;
+
+    if (m[3] == 0) {
+        int sender = m[1];
+
+        m[3] = 0;
+        m[4] = Message_FilerDevicePath;
+        end = copy_root((char *)&m[5]);
+        m[0] = message_size(m, end);
+        r.r[0] = User_Message;
+        r.r[1] = (int)m;
+        r.r[2] = sender;
+        (void)swix(XWimp_SendMessage, &r, &r);
+        return;
+    }
+    m[3] = m[2];
+    m[4] = Message_DataLoadAck;
+    r.r[0] = User_Message;
+    r.r[1] = (int)m;
+    r.r[2] = m[1];
+    (void)swix(XWimp_SendMessage, &r, &r);
+    open_root(ws);
+}
+
+static void user_message(struct filerws *ws)
+{
+    switch (ws->poll[4]) {
+    case Message_Quit:
+        filer_exit(ws, 0);
+        break;
+    case Message_HelpRequest:
+        help_request(ws);
+        break;
+    case Message_DataSave:
+        if (ws->poll[5] == ICONBAR && ws->poll[6] == ws->icon) {
+            data_save(ws);
+        }
+        break;
+    case Message_DataLoad:
+        if (ws->poll[5] == ICONBAR && ws->poll[6] == ws->icon) {
+            data_load(ws);
+        }
+        break;
     }
 }
 
-_kernel_oserror *hostfsfiler_command(const char *tail, int argc,
-                                     int cmd_no, void *pw)
+/* ---- the task -------------------------------------------------------- */
+
+void filer_task(struct filerws *ws, int size)
 {
-    (void)tail; (void)argc; (void)pw;
-    if (cmd_no == 0) {                    /* Desktop_HostFSFiler: be the task */
-        return run_task();
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    if (size != (int)sizeof(struct filerws)) {
+        ws->error.errnum = 0;
+        (void)str_copy(ws->error.errmess,
+                       "HostFSFiler: s.head's WS_Size is not "
+                       "sizeof(struct filerws)");
+        give_up(ws, &ws->error);
     }
-    start_task();                         /* *HostFSFiler: spawn the task */
-    return NULL;
+
+    /* No HostFS, no icon: quietly, and for good (RAMFSFiler does the same
+     * when RAMFS is missing). */
+    r.r[0] = 13;                        /* FSControl 13: is it there? */
+    r.r[1] = HOSTFS_FS_NUMBER;
+    if (swix(XOS_FSControl, &r, &r) != NULL || r.r[2] == 0) {
+        give_up(ws, NULL);
+    }
+
+    r.r[0] = 310;
+    r.r[1] = TASK_WORD;
+    r.r[2] = (int)task_name();
+    ws->messages[0] = Message_DataSave;
+    ws->messages[1] = Message_DataLoad;
+    ws->messages[2] = Message_HelpRequest;
+    ws->messages[3] = Message_Quit;     /* always delivered; ends the list */
+    r.r[3] = (int)ws->messages;
+    e = swix(XWimp_Initialise, &r, &r);
+    if (e != NULL) {
+        give_up(ws, e);
+    }
+    ws->task = r.r[1];
+
+    build_menu(ws);
+    e = make_icon(ws);
+    if (e != NULL) {
+        give_up(ws, e);
+    }
+
+    for (;;) {
+        r.r[0] = 0x31;                  /* no null events, no pointer
+                                         * entering or leaving */
+        r.r[1] = (int)ws->poll;
+        e = swix(XWimp_Poll, &r, &r);
+        if (e != NULL) {
+            report(ws, e);
+            continue;
+        }
+        switch (r.r[0]) {
+        case Mouse_Click:
+            if (ws->poll[3] == ICONBAR && ws->poll[4] == ws->icon) {
+                if (ws->poll[2] & 5) {          /* SELECT or ADJUST */
+                    open_root(ws);
+                } else if (ws->poll[2] & 2) {   /* MENU */
+                    show_menu(ws, ws->poll[0]);
+                }
+            }
+            break;
+        case Menu_Selection:
+            menu_selection(ws);
+            break;
+        case User_Message:
+        case User_Message_Recorded:
+            user_message(ws);
+            break;
+        }
+    }
 }

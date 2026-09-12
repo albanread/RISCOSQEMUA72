@@ -7,14 +7,15 @@
 #                         before boot (BOOTDESIGN.md §3; order = init order).
 #                         The spliced image is cached beside the stock one
 #                         and rebuilt only when a module changes.
-#   RISCOS_HOSTFS         a share.  A share brings the HostFS module with it,
-#                         spliced ahead of RISCOS_MODULES, so no machine
-#                         starts with a share and no filing system to reach
-#                         it (FSDESIGN-V1.md §13, R1 and R2).
-#   RISCOS_HOSTFS_MODULE  the HostFS build to splice (default: the one
-#                         committed beside its source, hostfs/dde/HostFS,ffa);
-#                         set it empty to splice none.  A module titled
-#                         HostFS already in RISCOS_MODULES stands instead.
+#   RISCOS_HOSTFS         a share.  A share brings HostFS and its icon-bar
+#                         filer with it, spliced ahead of RISCOS_MODULES, so
+#                         no machine starts with a share and no filing
+#                         system to reach it (FSDESIGN-V1.md §13, R1, R2, D1).
+#   RISCOS_HOSTFS_MODULES the builds to splice for a share (default: the ones
+#                         committed beside their sources,
+#                         hostfs/dde/HostFS,ffa hostfs/filer/HostFSFiler,ffa);
+#                         set it empty to splice none.  A module whose title
+#                         is already in RISCOS_MODULES stands instead.
 #
 # With no modules to splice, the stock RISCOS.IMG is booted untouched.
 
@@ -31,7 +32,8 @@ print(b[t:b.index(b"\0", t)].decode("latin-1"))' "$1"
 rom_to_boot() {
     local images="$1" here="$_ROM_ZSH_DIR"
     local -a mods
-    local m key hostfs_mod
+    local m key hm title
+    local -a hostfs_mods titles
 
     ROM="$images/RISCOS.IMG"
     mods=(${=RISCOS_MODULES:-})
@@ -40,17 +42,22 @@ rom_to_boot() {
     done
 
     if [[ -n "${RISCOS_HOSTFS:-}" ]]; then
-        hostfs_mod="${RISCOS_HOSTFS_MODULE-${here:h}/hostfs/dde/HostFS,ffa}"
+        local list="${here:h}/hostfs/dde/HostFS,ffa ${here:h}/hostfs/filer/HostFSFiler,ffa"
+        list="${RISCOS_HOSTFS_MODULES-$list}"
+        hostfs_mods=(${=list})
         for m in $mods; do
-            [[ "$(_rom_module_title "$m")" == HostFS ]] && hostfs_mod=""
+            titles+=("$(_rom_module_title "$m")")
         done
-        if [[ -n "$hostfs_mod" ]]; then
-            [[ -e "$hostfs_mod" ]] || {
-                print -u2 "RISCOS_HOSTFS_MODULE: missing: $hostfs_mod"
+        local -a add
+        for hm in $hostfs_mods; do
+            [[ -e "$hm" ]] || {
+                print -u2 "RISCOS_HOSTFS_MODULES: missing: $hm"
                 return 1
             }
-            mods=("$hostfs_mod" $mods)
-        fi
+            title="$(_rom_module_title "$hm")"
+            (( ${titles[(Ie)$title]} )) || add+=("$hm")
+        done
+        mods=($add $mods)
     fi
     (( ${#mods} )) || return 0
 
