@@ -1183,6 +1183,21 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
         e = _kernel_swi(XOS_Module, &r, &r);
         printf("OS_Module 18: e=%d R1(num)=%08X R3(base)=%08X R4(pw)=%08X\r\n",
                e != NULL, r.r[1], r.r[3], r.r[4]);
+        /* Where the static data really lives.  A module that is to run
+         * from ROM must not write its own image, so these must be outside
+         * [base, base+size) — which -zM promises and this checks.  The
+         * module's size word is at base-4. */
+        if (e == NULL) {
+            uint32_t mbase = (uint32_t)r.r[3];
+            uint32_t msize = *(uint32_t *)(mbase - 4);
+            uint32_t a = (uint32_t)(unsigned long)reqstore;
+            uint32_t c = (uint32_t)(unsigned long)catents;
+            printf("image %08X..%08X  reqstore=%08X %s  catents=%08X %s  req=%08X\r\n",
+                   mbase, mbase + msize,
+                   a, (a >= mbase && a < mbase + msize) ? "IN-IMAGE" : "outside",
+                   c, (c >= mbase && c < mbase + msize) ? "IN-IMAGE" : "outside",
+                   (unsigned int)(unsigned long)req);
+        }
         r.r[0] = 13;                     /* FSControl_LookupFS, by name */
         r.r[1] = (int)"HostFS";
         e = _kernel_swi(XOS_FSControl, &r, &r);
