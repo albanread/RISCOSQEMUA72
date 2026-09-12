@@ -13,6 +13,18 @@
 #   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
 #                  guest (FSDESIGN.md); unset leaves the doorbell
 #                  device present but file commands off
+#   RISCOS_QMP     the -qmp chardev (default tcp:127.0.0.1:4455,server,nowait).
+#                  Two machines cannot share a port; give each its own,
+#                  or a unix socket: unix:/path/qmp.sock,server,nowait
+#   RISCOS_NAME    -name, so a machine is identifiable in ps and its window
+#   RISCOS_PIDFILE -pidfile, so a machine can be stopped without touching
+#                  anyone else's.  Stop machines by pidfile or QMP quit,
+#                  never by process name: pkill -f qemu-system-aarch64
+#                  kills every session on the host.
+#
+# Everything above defaults to exactly what this script did before, so a
+# plain run-macos.sh is unchanged.  tools/instance.sh builds on these to
+# run several isolated machines at once.
 #   RISCOS_MODULES space-separated module files spliced into the ROM
 #                  before boot (BOOTDESIGN.md §3; order = init order).
 #                  The spliced image is cached beside the stock one and
@@ -68,8 +80,10 @@ args=(
     -audiodev "$AUDIODEV",id=snd0
     -global bcm2835-vchiq.audiodev=snd0
     -display "$DISPLAY_OPT"
-    -qmp tcp:127.0.0.1:4455,server,nowait
+    -qmp "${RISCOS_QMP:-tcp:127.0.0.1:4455,server,nowait}"
 )
+[[ -n "${RISCOS_NAME:-}" ]] && args+=(-name "$RISCOS_NAME")
+[[ -n "${RISCOS_PIDFILE:-}" ]] && args+=(-pidfile "$RISCOS_PIDFILE")
 # Without a card it boots to the desktop from ROM alone, with nothing
 # behind the SD icon.  snapshot=on keeps the image pristine across runs.
 # MODE=1920x1200 etc: the EDID preferred timing, so RISC OS brings the
