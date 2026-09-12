@@ -35,6 +35,8 @@ typedef unsigned char  uint8_t;
 #define VMCH_CMD        0x0C
 #define VMCH_MAGIC_VALUE 0x48434D56u
 #define VMCH_FEATURE_FS 0x1u
+#define VMCH_FEATURE_FSENTRY  0x8u      /* v1 register-frame commands */
+#define VMCH_FEATURE_VIRTADDR 0x10u     /* host walks the guest's MMU */
 
 #define VMCH_MAX_ARG 4032   /* 64-byte header + 4032 = one 4 KB page */
 #define VMCH_MAX_OPEN 16                 /* device handle slots (1-based) */
@@ -57,6 +59,11 @@ struct vmreq {
 /* word n of the scratch arg area (READ/WRITE buffer+count, SEEK
  * offset+whence, SETSIZE size) */
 #define REQW(n) (*(uint32_t *)&req->scratch[(n) * 4])
+
+/* v1: the register frame goes on the wire and the host does the work.
+ * scratch[] starts at +20, which is where R0..R7 live, so REQW(n) is Rn. */
+#define C_FS_GETBYTES 0x101
+#define C_FS_PUTBYTES 0x102
 
 #define C_PING     0
 #define C_OPEN     1
@@ -124,6 +131,8 @@ static _kernel_oserror err_nomap    = { 0x1E5, "HostFS: OS_Memory 13 failed" };
 static _kernel_oserror err_badmagic = { 0x1E6, "HostFS: magic wrong" };
 static _kernel_oserror err_nofs        = { 0x1E4, "HostFS: device has no root" };
 static _kernel_oserror err_unsupported = { 0x1E8, "HostFS: unsupported operation" };
+static _kernel_oserror err_oldhost = { 0x1E7,
+    "HostFS: this module needs a vmchannel v1 host" };
 
 static _kernel_oserror *rc_to_error(uint32_t rc)
 {
@@ -238,22 +247,6 @@ struct pbrec {
     uint32_t phys;                  /* physical address */
 };
 
-static uint32_t mem_phys(uint32_t log)
-{
-    struct pbrec pb;
-    _kernel_swi_regs r;
-
-    pb.page = -1;
-    pb.log = log;
-    pb.phys = 0;
-    r.r[0] = (1u << 9) | (1u << 13);    /* logical given, physical filled */
-    r.r[1] = (int)&pb;
-    r.r[2] = 1;
-    if (_kernel_swi(XOS_Memory, &r, &r) != NULL) {
-        return log;                     /* last resort: assume identity */
-    }
-    return pb.phys;
-}
 
 /* Move n bytes between the file (at file offset ptr) and guest memory
  * at logical address mem.  Chunks never cross a 4KB page, so each
@@ -262,50 +255,25 @@ static uint32_t mem_phys(uint32_t log)
 static uint32_t xfer(uint32_t h, uint32_t ptr, uint32_t mem, uint32_t n,
                      int is_write)
 {
-    uint32_t done = 0;
-
-    while (done < n) {
-        uint32_t chunk = n - done;
-        uint32_t left = 0x1000u - ((mem + done) & 0xFFFu);
-        uint32_t rc, moved;
-
-        if (chunk > left) {
-            chunk = left;
-        }
-
-        req->cmd = C_SEEK;
-        req->handle = h;
-        req->arglen = 0;
-        REQW(0) = ptr + done;
-        REQW(1) = 0;             /* SEEK_SET */
-        if (vmch_go() != RC_OK) {
-            break;
-        }
-
-        req->cmd = is_write ? C_WRITE : C_READ;
-        req->handle = h;
-        req->arglen = 0;
-        REQW(0) = mem_phys(mem + done);
-        REQW(1) = chunk;
-        rc = vmch_go();
-        if (rc != RC_OK) {
-            break;
-        }
-        moved = req->handle;             /* bytes actually transferred */
-        if (moved > chunk) {
-            moved = chunk;
-        }
-        if (moved == 0) {
-            break;                      /* nothing moved (EOF, full disc,
-                                         * refused write): stop, and the
-                                         * caller sees the short count */
-        }
-        done += moved;
-        if (moved < chunk && !is_write) {
-            break;                      /* short read: stop at EOF */
-        }
+    /* One round trip, whatever the size or alignment.  `mem` goes on the
+     * wire as the guest's own logical address and the host walks the MMU
+     * to reach it; `ptr` is the file offset, so there is no seek.
+     *
+     * This replaces a loop that split every transfer at 4 KiB, called
+     * OS_Memory per chunk to get a physical address, and issued a SEEK
+     * before each READ — two doorbells per page, and on a failed
+     * translation it used the logical address as if it were physical.
+     * A 256 KiB read cost 130 round trips; it now costs one. */
+    req->cmd = (uint32_t)(is_write ? C_FS_PUTBYTES : C_FS_GETBYTES);
+    req->arglen = 0;
+    REQW(1) = h;
+    REQW(2) = mem;
+    REQW(3) = n;
+    REQW(4) = ptr;
+    if (vmch_go() != RC_OK) {
+        return 0;
     }
-    return done;
+    return n;
 }
 
 
@@ -336,6 +304,14 @@ static _kernel_oserror *ensure_vmch(void)
     }
     if (!(v[VMCH_FEATURES / 4] & VMCH_FEATURE_FS)) {
         return &err_nofs;
+    }
+    /* v1 is required, not preferred.  The v0 transfer path translated
+     * addresses in the guest and fell back to the identity mapping when
+     * OS_Memory failed, writing file data wherever that landed; falling
+     * back to it silently would be worse than not loading. */
+    if ((v[VMCH_FEATURES / 4] & (VMCH_FEATURE_FSENTRY | VMCH_FEATURE_VIRTADDR))
+        != (VMCH_FEATURE_FSENTRY | VMCH_FEATURE_VIRTADDR)) {
+        return &err_oldhost;
     }
     /* The device DMAs physical addresses.  The block is one page-aligned
      * page, so a single OS_Memory 0 translation covers all of it. */

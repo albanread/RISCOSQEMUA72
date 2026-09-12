@@ -22,6 +22,7 @@
 #include "hw/misc/vmchannel.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
+#include "hw/core/cpu.h"
 #include "qemu/error-report.h"
 #include <glib/gstdio.h>
 
@@ -57,6 +58,63 @@ static void block_write(hwaddr a, const void *buf, uint32_t len)
 {
     address_space_rw(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
                      (void *)buf, len, true);
+}
+
+/*
+ * Guest *logical* memory.  v1 puts the guest's own addresses on the wire
+ * — the ones FileSwitch handed the module — and the host walks the MMU
+ * to reach them.  cpu_memory_rw_debug() does the translation with the
+ * CPU's current settings and crosses pages itself, which is exactly what
+ * QEMU's semihosting uses for SYS_READ and SYS_WRITE (semihosting/
+ * uaccess.c).  current_cpu is the vCPU that rang the doorbell: the
+ * handler runs synchronously inside its MMIO write, under the BQL.
+ *
+ * It will not fault a page in — an address that is not mapped right now
+ * fails rather than being invented.  That is the point: the v0 module
+ * translated addresses itself and fell back to the identity mapping when
+ * OS_Memory failed, which wrote file data to whatever physical address
+ * the logical one happened to resemble.
+ *
+ * Returns true on success.
+ */
+static bool guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
+{
+    CPUState *cpu = current_cpu;
+
+    if (len == 0) {
+        return true;
+    }
+    if (!cpu) {
+        return false;               /* not on a vCPU thread: refuse */
+    }
+    return cpu_memory_rw_debug(cpu, (vaddr)addr, buf, len, is_write) == 0;
+}
+
+/*
+ * Move as much as will translate, a page at a time, and say how far it
+ * got.  A guest buffer is not necessarily mapped end to end — the
+ * translation tables are read as they stand, and nothing here can fault
+ * a page in — so a partly-mapped buffer must report a short count
+ * rather than quietly deliver rubbish past the boundary.  The chunking
+ * is host-side: it is still one doorbell.
+ */
+static uint32_t guest_rw_counted(uint64_t addr, uint8_t *buf, uint32_t len,
+                                 bool is_write)
+{
+    uint32_t done = 0;
+
+    while (done < len) {
+        uint32_t chunk = 0x1000 - (uint32_t)((addr + done) & 0xFFF);
+
+        if (chunk > len - done) {
+            chunk = len - done;
+        }
+        if (!guest_rw(addr + done, buf + done, chunk, is_write)) {
+            break;
+        }
+        done += chunk;
+    }
+    return done;
 }
 
 /* ------------------------------------------------------------------ */
@@ -688,6 +746,75 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         break;
     }
 
+    case VMCH_CMD_FS_GETBYTES:
+    case VMCH_CMD_FS_PUTBYTES: {
+        /* FSEntry_GetBytes / _PutBytes on a buffered file, whole, in one
+         * round trip: R1 handle, R2 guest logical buffer, R3 count, R4
+         * file offset.  No exit registers (PRM 2-544).  The offset rides
+         * in the request, so there is no seek and no per-page chunking —
+         * the v0 module cost two doorbells per 4 KiB for want of both. */
+        bool is_put = (cmd == VMCH_CMD_FS_PUTBYTES);
+        uint32_t r1 = ld32(base + VMCH_HDR_REGS + 4);
+        uint64_t addr = (uint64_t)ld32(base + VMCH_HDR_REGS + 8);
+        uint32_t len = ld32(base + VMCH_HDR_REGS + 12);
+        uint64_t off = (uint64_t)ld32(base + VMCH_HDR_REGS + 16);
+        int h = (int)r1 - 1;
+        g_autofree uint8_t *tmp = NULL;
+        ssize_t n;
+
+        if (!s->root) {
+            rc = VMCH_RC_NOROOT;
+            break;
+        }
+        if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
+            rc = VMCH_RC_ACCESS;
+            break;
+        }
+        if (len > 16 * 1024 * 1024) {
+            rc = VMCH_RC_IOERR;
+            break;
+        }
+        tmp = g_malloc(len ? len : 1);
+
+        if (is_put) {
+            uint32_t got = guest_rw_counted(addr, tmp, len, false);
+
+            if (got != len) {
+                st32(base + VMCH_HDR_REGS + 12, got);
+                rc = VMCH_RC_BADADDR;
+                break;
+            }
+            n = pwrite(s->fds[h], tmp, len, (off_t)off);
+            if (n < 0) {
+                rc = VMCH_RC_IOERR;
+            } else if ((uint32_t)n != len) {
+                rc = VMCH_RC_FULL;      /* short write: out of space */
+            }
+        } else {
+            n = pread(s->fds[h], tmp, len, (off_t)off);
+            if (n < 0) {
+                rc = VMCH_RC_IOERR;
+                break;
+            }
+            /* A short read is the normal end of a file: the count is a
+             * multiple of the buffer size, so the last block runs past
+             * the extent.  Zero the tail rather than leave the guest's
+             * buffer holding whatever was there before. */
+            if ((uint32_t)n < len) {
+                memset(tmp + n, 0, len - (uint32_t)n);
+            }
+            {
+                uint32_t put = guest_rw_counted(addr, tmp, len, true);
+
+                st32(base + VMCH_HDR_REGS + 12, put);
+                if (put != len) {
+                    rc = VMCH_RC_BADADDR;
+                }
+            }
+        }
+        break;
+    }
+
     default:
         rc = VMCH_RC_BADCMD;
         break;
@@ -700,6 +827,13 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         vmch_trace("vmch: cmd=%u seq=%u rc=%u hnd=%08x arglen=%u",
                 cmd, ld32(base + VMCH_HDR_SEQ), rc,
                 ld32(base + VMCH_HDR_HANDLE), arglen);
+        if (cmd >= 0x100) {
+            vmch_trace(" R1=%08x R2=%08x R3=%08x R4=%08x",
+                    ld32(base + VMCH_HDR_REGS + 4),
+                    ld32(base + VMCH_HDR_REGS + 8),
+                    ld32(base + VMCH_HDR_REGS + 12),
+                    ld32(base + VMCH_HDR_REGS + 16));
+        }
         if (cmd == VMCH_CMD_OPEN || cmd == VMCH_CMD_CREATE ||
             cmd == VMCH_CMD_DELETE || cmd == VMCH_CMD_CAT ||
             cmd == VMCH_CMD_FILEARGS) {
@@ -743,6 +877,7 @@ static uint64_t vmchannel_read_inner(VMChannelState *s, hwaddr offset,
         return VMCH_VERSION_VALUE;
     case VMCH_FEATURES:
         return VMCH_FEATURE_CONSOLE | VMCH_FEATURE_TIME
+             | VMCH_FEATURE_FSENTRY | VMCH_FEATURE_VIRTADDR
              | (s->root ? VMCH_FEATURE_FS : 0);
     case VMCH_STATUS:
         return 1;                       /* synchronous: always done */

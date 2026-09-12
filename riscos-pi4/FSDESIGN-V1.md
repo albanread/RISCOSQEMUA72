@@ -206,11 +206,37 @@ Three consequences, all of them the point:
 
 Honest limits, recorded so nobody rediscovers them:
 
-- `cpu_memory_rw_debug` **will not fault a page in**.  It reads the
-  translation tables as they stand.  RISC OS buffers handed to OS_GBPB
-  live in mapped application space or the RMA, so this is fine in
-  practice — but it is an assumption, and `VMCH_RC_BADADDR` exists so
-  that when it is wrong the guest gets an error instead of corruption.
+- `cpu_memory_rw_debug` **will not fault a page in**, and measurement
+  says that matters.  Sprint 1 built this and tried it:
+
+  | Buffer | Result |
+  | --- | --- |
+  | `0x493aa000`, 12320 bytes (RMA / dynamic area) — module copied out | **whole transfer, one doorbell** |
+  | FileSwitch's own buffer, `*Type` | works |
+  | `0x00008f04`, a BASIC `DIM` in application space | **252 bytes translate, then the page at `0x9000` fails** |
+
+  252 bytes is exactly the distance to the next page boundary, so the
+  first page of that buffer translates and the second does not.  The
+  earlier text here assumed "application space or the RMA, so this is
+  fine in practice".  The RMA half is right; **application space is
+  not**, and the mechanism is not yet established — RISC OS's
+  application slot is per-task and remapped on task switch, and whether
+  what fails is the translation regime, the access permissions, or a
+  genuinely absent mapping is the first thing sprint 1b has to find out.
+
+  Two consequences, neither optional:
+
+  1. The host transfers **page at a time and reports how far it got**
+     (`guest_rw_counted`), so a partly-mapped buffer produces a short
+     count rather than plausible-looking rubbish past the boundary.
+  2. The **module must return an error** when the count is short.
+     Buffered GetBytes has no exit registers, so the only way to say
+     "this failed" is a `_kernel_oserror` — and the first cut of this
+     sprint dropped the old `r->r[3] = moved` without putting that in
+     its place, so a failed transfer was reported to FileSwitch as
+     success. `OS_GBPB` then cheerfully answered "0 bytes not
+     transferred" over a buffer holding 252 good bytes and 261892 stale
+     ones. Silence is the worst possible failure here.
 - `current_cpu` is the right CPU: the handler runs synchronously inside
   the vCPU's MMIO write, under the BQL, as `FSDESIGN.md` requires.
   Assert it is non-NULL rather than assuming.
@@ -448,34 +474,83 @@ rule: modules are `!RunImage`, or `Modules.Foo`, or carry `,ffa` — and
 rules 1 and 5 already handle all three.  The same reasoning keeps `.bin`,
 `.abs`, `.com` and `.exe` out of the table.
 
-### 6.3 Type persistence, on the way out
+### 6.3 Type persistence: a table, not a database
 
-Inference is a guess; a file given a type by RISC OS must keep it.  Take
-9pfs's `mapped-file` model: a sidecar directory `.riscos-meta/` beside
-the files, one `key=value` file per object:
+Inference is a guess, and a file *given* a type by RISC OS must keep it.
+The question is where that fact lives.  Three answers were considered.
 
-    type=fff
-    load=fff0ce41
-    exec=3a7c1e80
-    attr=03
+**A sidecar per file** (9pfs's `mapped-file` model, `.riscos-meta/name`
+holding `type=fff`).  Portable and self-describing, and it travels when
+a subtree is copied.  But it clutters every directory, it costs a second
+filesystem operation per file — which lands squarely on directory
+enumeration, the hot path of §8 — and it orphans the moment anyone
+renames a file in the Finder.
 
-Rules:
-- `.riscos-meta` is **filtered out of every enumeration**, exactly as
-  9pfs hides `.virtfs_metadata`.
-- Written only when the guest sets something inference would lose.  The
-  common case — copying a `.c` file in and out — touches no sidecar and
-  leaves the host directory pristine.
-- Missing or stale sidecar is never fatal: fall back to inference.
+**A host-side database keyed by filename** — the natural next thought,
+and a small SQLite would do it.  One indexed query per directory instead
+of N opens, transactional, inspectable with tooling the team already
+uses.  Two costs, though, and the second is the one that decides it:
 
-`naming=` chooses what a newly created guest file is called on the host:
-`smart` (default — canonical extension if the type has one, else
-`,xxx`, else plain), `suffix` (always `,xxx` for non-&FFF), or `literal`
-(`/` to `.`, types only in the sidecar).
+- Linking libsqlite3 into `qemu-system-aarch64` is a real dependency on
+  three platforms, and this tree has already fought Homebrew over
+  pcre2/glib/libslirp on Intel macOS.  A hash table over a plain text
+  index does this job — tens to hundreds of rows, looked up by name —
+  without any of that.
+- **It would need a filesystem watcher.**  If the database is the truth
+  about a file's type, then a file dropped into the share has no truth
+  until something notices it, and "something notices it" is FSEvents on
+  macOS, inotify on Linux and `ReadDirectoryChangesW` on Windows —
+  three implementations, each with its own coalescing and limits, inside
+  a QEMU device.
 
-A consequence to state plainly: under `smart` and `suffix`,
-`fsfile_WriteInfo` (set type) may have to **rename the host file**.
-That is what encoding a type in a name means, but it will surprise
-anyone watching the host directory — document it, and trace it.
+**So: the lookup table, and only the lookup table.**  The watcher is not
+needed because the premise that requires it is wrong.  The host
+filesystem is the truth; the extension table turns a name into a type;
+and nothing needs to know a file exists before it is asked about it:
+
+- A file dropped in has no entry anywhere.  Its type is derived from its
+  extension when the guest first looks, which is the right answer with
+  no work and no event.
+- A file whose type RISC OS *sets* is the only case a table cannot
+  derive — and `naming=` already handles it by encoding the type in the
+  name (`,xxx`, or the canonical extension).  The name **is** the store,
+  it travels with the file, it survives Finder moves, archives and
+  other filesystems, and no index can go stale against it.
+
+That leaves exactly one gap: a type with no canonical extension, set on
+a file whose name must not change.  That is rare enough to take the
+honest answer — refuse it and say so — rather than build an index, a
+watcher and an invalidation story to cover it.  If it turns out to bite
+in practice, a per-share override file (plain `name<TAB>type` lines,
+loaded at start and rewritten on change, no watcher because we are the
+only writer) is a day's work and slots in behind the same lookup.
+
+### 6.3.1 The table is data, and deserves a UI
+
+`typemap=` names a plain text file: extension, type code, description.
+
+    txt   FFF   Text
+    c     FFF   C source
+    png   B60   PNG image
+    zip   A91   Archive
+
+Generate the default from **`Hdr/Global/FileTypes`**, which already
+carries both halves — `FileType_PNG EQU &00000B60` and
+`FileType_PNG_Name SETS "PNG"` — so the table is derived from ROOL's
+allocation list rather than typed out, and regenerating it picks up new
+allocations.
+
+A host-side editor for that file is worth having and costs nothing in
+the device: the table is read at startup and on demand, so anything that
+can write the file can change the mapping.  It is also the natural first
+customer for the Apple Events surface in `SCRIPTING.md` — a typed
+command to read and set rows, with the UI on top.
+
+One thing the UI should *not* do is carry descriptions into the guest.
+RISC OS already knows that &FFF is "Text": `*Ex` and the Filer get type
+names from the OS's own table via `OS_FSControl 18`/`19`, and HostFS
+returns a type number, never a name.  The descriptions in this file are
+for the person editing it on the Mac.
 
 ### 6.4 Case
 

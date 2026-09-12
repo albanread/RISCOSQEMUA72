@@ -21,18 +21,22 @@
 
 /* Register offsets within the 16 KiB region */
 #define VMCH_MAGIC      0x00    /* reads 'VMCH' (0x48434D56 little-endian) */
-#define VMCH_VERSION    0x04    /* protocol version: 0 */
+#define VMCH_VERSION    0x04    /* protocol version: 1 */
 #define VMCH_FEATURES   0x08    /* bitmask, see below */
 #define VMCH_CMD        0x0c    /* write: request block's guest phys addr */
 #define VMCH_STATUS     0x10    /* 0 idle, 1 done (always 1: synchronous) */
 #define VMCH_REGION_SIZE 0x4000
 
 #define VMCH_MAGIC_VALUE   0x48434D56
-#define VMCH_VERSION_VALUE 0
+#define VMCH_VERSION_VALUE 1
 
 #define VMCH_FEATURE_FS       0x1     /* file commands (root configured) */
 #define VMCH_FEATURE_CONSOLE  0x2
 #define VMCH_FEATURE_TIME     0x4
+#define VMCH_FEATURE_FSENTRY  0x8     /* v1 register-frame commands */
+#define VMCH_FEATURE_VIRTADDR 0x10    /* guest addresses on the wire are
+                                       * logical, and the host walks the
+                                       * MMU to reach them */
 
 /* Request block: 64-byte header, then arg_len bytes of inline data.
  * All fields little-endian, guest-physical addressing. */
@@ -60,6 +64,40 @@
 #define VMCH_CMD_TIME     17
 #define VMCH_CMD_SETSIZE  18
 
+/* ---- v1: the wire speaks FileSwitch ---------------------------------
+ *
+ * A v1 request carries a RISC OS register frame verbatim: the module
+ * copies R0..R7 in, rings the doorbell, and copies R0..R7 back out.  It
+ * does not interpret them.  Addresses inside the frame are the guest's
+ * own *logical* addresses, exactly as FileSwitch passed them; the host
+ * reaches them through the CPU's MMU, the way semihosting's SYS_READ
+ * and SYS_WRITE do.  See riscos-pi4/FSDESIGN-V1.md.
+ *
+ * The v1 header reuses the v0 words: +12 becomes the RISC OS error
+ * number rather than a handle, and the eight registers occupy the
+ * scratch area at +20.
+ */
+#define VMCH_CMD_FS_OPEN      0x100
+#define VMCH_CMD_FS_GETBYTES  0x101
+#define VMCH_CMD_FS_PUTBYTES  0x102
+#define VMCH_CMD_FS_ARGS      0x103
+#define VMCH_CMD_FS_CLOSE     0x104
+#define VMCH_CMD_FS_FILE      0x105
+#define VMCH_CMD_FS_FUNC      0x106
+
+#define VMCH_HDR_ERRNUM   12   /* v1: RISC OS error number, 0 = none */
+#define VMCH_HDR_REGS     20   /* v1: R0..R7, +20 .. +51 */
+#define VMCH_HDR_PSR      52   /* v1: bit 29 = C flag to return */
+
+/* FSEntry_GetBytes / _PutBytes on a buffered file (PRM 2-544, 2-546):
+ *   R1 = the filing system's own handle
+ *   R2 = address of the buffer, a guest logical address
+ *   R3 = number of bytes
+ *   R4 = file offset to transfer at
+ * There are no exit registers.  A short read is not an error: the count
+ * is a multiple of the file's buffer size, so the final block of a file
+ * routinely runs past its extent. */
+
 /* rc codes */
 #define VMCH_RC_OK        0
 #define VMCH_RC_NOROOT    1   /* file commands need root= to be set */
@@ -72,6 +110,7 @@
 #define VMCH_RC_ISDIR     8
 #define VMCH_RC_BADCMD    9
 #define VMCH_RC_IOERR    10
+#define VMCH_RC_BADADDR  11   /* a guest address would not translate */
 
 /* OPEN: header word at +12 (before handle is filled) is the flags */
 #define VMCH_OPEN_READ    0x1
