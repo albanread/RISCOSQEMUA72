@@ -707,6 +707,26 @@ Wire notes:
 
 E4's breakpoints and step are the remaining debugging surface.
 
+**`type`, rewritten after it lied to us.**  The E2 implementation
+blasted every key event of the string in one burst; a TCG guest
+services USB reports slower than that, so keys appeared held past the
+auto-repeat delay and the desktop received garbage runs (`*Dan
+RKKK…`).  Chasing it cost two more lessons before the fix: timers on
+the main loop already hold the BQL (taking it again was a
+self-deadlock and one abort), and events sent from a main-loop timer
+context do not reach the guest at all — while the same events from
+the UI thread (the window's own path) and from QMP's dispatcher
+thread arrive perfect, and only macOS virtual keycodes through the
+osx map, not raw linux codes, produce the right letters.  The typer
+is now a worker thread in the proven shape: one BQL acquisition per
+character's four events, a real 250 ms sleep between characters
+(`pace_ms`, 50 to 1000, the QMP-measured value), osx keycodes through
+`metal_glue_key`'s own map.  Proof on the wire: `*HostFSPing` typed
+purely through the surface rings the doorbell (`RD 48434d56`,
+`cmd=0 rc=0`).  The handler blocks for the text's duration —
+`ms_per_char` in the reply says how long; `waiting` and the timeout
+semantics are the bottom-half class's.
+
 ## Sources
 
 Written against the tree, with these checked: `ui/metal.c` (input glue

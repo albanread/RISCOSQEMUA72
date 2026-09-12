@@ -37,7 +37,6 @@
 #include "block/snapshot.h"
 #include "hw/core/cpu.h"
 #include "target/arm/cpu.h"     /* the Pi's AArch32 core: regs, cpsr */
-#include "standard-headers/linux/input-event-codes.h"
 #include <zlib.h>
 
 /* monitor/qmp-cmds.c: the HMP bridge the design names, which has no
@@ -261,8 +260,8 @@ static const ScriptCmd script_cmds[] = {
       "One key event: a macOS virtual keycode, down or up.",
       "keycode int, down bool", 'f' },
     { "type", "MQemType",
-      "Type ASCII text through the US keymap, shifted punctuation included.",
-      "text str", 'f' },
+      "Type ASCII text through the US keymap, paced a character at a time (pace_ms, default 250) so the guest sees typing, not lost keys.",
+      "text str, pace_ms int (50 to 1000), waiting int s", 'f' },
     { "mouse", "MQemMous",
       "Move the pointer to guest pixel coordinates on the current screen.",
       "x int, y int", 'f' },
@@ -723,80 +722,195 @@ static int script_screendump(const char *name, const char *prefix,
 }
 
 /* ------------------------------------------------------------------ */
-/* Typing: ASCII to linux key codes, the same entry point the osx      */
-/* keymap feeds.  US layout spelling for the shifted punctuation,      */
-/* documented in the command's help.                                   */
+/* Typing: ASCII to macOS virtual keycodes, fed through metal_glue_key */
+/* — the window's own, proven path.  A tick once sent linux key codes  */
+/* straight to the input layer instead; the case pattern arrived and   */
+/* every letter was wrong, while the same characters through the       */
+/* osx map landed clean, so the osx map is the one to use.  US         */
+/* spelling for the shifted punctuation, documented in the command's   */
+/* help.                                                               */
 
-static void script_send_linux(unsigned lnx, bool down)
+static int script_key_for_char(char c, uint32_t *osx, bool *shift)
 {
-    cnt.keys++;                 /* typed text counts as key events too */
-    bql_lock();
-    qemu_input_event_send_key_linux(NULL, lnx, down);
-    bql_unlock();
-}
+    static const struct { char ch; uint32_t k; } plain[] = {
+        { 'a', 0 }, { 's', 1 }, { 'd', 2 }, { 'f', 3 }, { 'h', 4 },
+        { 'g', 5 }, { 'z', 6 }, { 'x', 7 }, { 'c', 8 }, { 'v', 9 },
+        { 'b', 11 }, { 'q', 12 }, { 'w', 13 }, { 'e', 14 }, { 'r', 15 },
+        { 'y', 16 }, { 't', 17 }, { '1', 18 }, { '2', 19 }, { '3', 20 },
+        { '4', 21 }, { '6', 22 }, { '5', 23 }, { '9', 25 }, { '7', 26 },
+        { '8', 28 }, { '0', 29 }, { 'o', 31 }, { 'u', 32 }, { 'i', 34 },
+        { 'p', 35 }, { 'l', 37 }, { 'j', 38 }, { 'k', 40 }, { 'n', 45 },
+        { 'm', 46 }, { ' ', 49 }, { '.', 47 }, { ',', 43 }, { '-', 27 },
+        { '=', 24 }, { '[', 33 }, { ']', 30 }, { ';', 41 }, { '\'', 39 },
+        { '\\', 42 }, { '`', 50 }, { '/', 44 }, { '\r', 36 }, { '\n', 36 },
+        { '\t', 48 },
+    };
 
-static int script_key_for_char(char c, unsigned *code, bool *shift)
-{
     *shift = false;
-    if (c >= 'a' && c <= 'z') {
-        *code = KEY_A + (c - 'a');
-        return 0;
-    }
     if (c >= 'A' && c <= 'Z') {
-        *code = KEY_A + (c - 'A');
+        c = c - 'A' + 'a';
         *shift = true;
-        return 0;
     }
-    if (c >= '1' && c <= '9') {
-        *code = KEY_1 + (c - '1');
-        return 0;
+    for (unsigned i = 0; i < sizeof(plain) / sizeof(plain[0]); i++) {
+        if (plain[i].ch == c) {
+            *osx = plain[i].k;
+            return 0;
+        }
     }
     switch (c) {
-    case '0': *code = KEY_0; return 0;
-    case ' ': *code = KEY_SPACE; return 0;
-    case '\n': case '\r': *code = KEY_ENTER; return 0;
-    case '\t': *code = KEY_TAB; return 0;
-    case '!': *code = KEY_1; *shift = true; return 0;
-    case '@': *code = KEY_2; *shift = true; return 0;
-    case '#': *code = KEY_3; *shift = true; return 0;
-    case '$': *code = KEY_4; *shift = true; return 0;
-    case '%': *code = KEY_5; *shift = true; return 0;
-    case '^': *code = KEY_6; *shift = true; return 0;
-    case '&': *code = KEY_7; *shift = true; return 0;
-    case '*': *code = KEY_8; *shift = true; return 0;
-    case '(': *code = KEY_9; *shift = true; return 0;
-    case ')': *code = KEY_0; *shift = true; return 0;
-    case '-': *code = KEY_MINUS; return 0;
-    case '_': *code = KEY_MINUS; *shift = true; return 0;
-    case '=': *code = KEY_EQUAL; return 0;
-    case '+': *code = KEY_EQUAL; *shift = true; return 0;
-    case '[': *code = KEY_LEFTBRACE; return 0;
-    case '{': *code = KEY_LEFTBRACE; *shift = true; return 0;
-    case ']': *code = KEY_RIGHTBRACE; return 0;
-    case '}': *code = KEY_RIGHTBRACE; *shift = true; return 0;
-    case '\\': *code = KEY_BACKSLASH; return 0;
-    case '|': *code = KEY_BACKSLASH; *shift = true; return 0;
-    case ';': *code = KEY_SEMICOLON; return 0;
-    case ':': *code = KEY_SEMICOLON; *shift = true; return 0;
-    case '\'': *code = KEY_APOSTROPHE; return 0;
-    case '"': *code = KEY_APOSTROPHE; *shift = true; return 0;
-    case '`': *code = KEY_GRAVE; return 0;
-    case '~': *code = KEY_GRAVE; *shift = true; return 0;
-    case ',': *code = KEY_COMMA; return 0;
-    case '<': *code = KEY_COMMA; *shift = true; return 0;
-    case '.': *code = KEY_DOT; return 0;
-    case '>': *code = KEY_DOT; *shift = true; return 0;
-    case '/': *code = KEY_SLASH; return 0;
-    case '?': *code = KEY_SLASH; *shift = true; return 0;
+    case '!': *osx = 18; *shift = true; return 0;
+    case '@': *osx = 19; *shift = true; return 0;
+    case '#': *osx = 20; *shift = true; return 0;
+    case '$': *osx = 21; *shift = true; return 0;
+    case '%': *osx = 23; *shift = true; return 0;
+    case '^': *osx = 22; *shift = true; return 0;
+    case '&': *osx = 26; *shift = true; return 0;
+    case '*': *osx = 28; *shift = true; return 0;
+    case '(': *osx = 25; *shift = true; return 0;
+    case ')': *osx = 29; *shift = true; return 0;
+    case '_': *osx = 27; *shift = true; return 0;
+    case '+': *osx = 24; *shift = true; return 0;
+    case '{': *osx = 33; *shift = true; return 0;
+    case '}': *osx = 30; *shift = true; return 0;
+    case ':': *osx = 41; *shift = true; return 0;
+    case '"': *osx = 39; *shift = true; return 0;
+    case '|': *osx = 42; *shift = true; return 0;
+    case '~': *osx = 50; *shift = true; return 0;
+    case '<': *osx = 43; *shift = true; return 0;
+    case '>': *osx = 47; *shift = true; return 0;
+    case '?': *osx = 44; *shift = true; return 0;
     default:
         return -1;
     }
 }
 
-static char *cmd_type(const QDict *q, int *err, const char **errmsg)
+/*
+ * Typing has to be paced.  The first version sent every key event of
+ * the whole string in one burst from the handler; a TCG guest services
+ * USB reports slower than the burst arrives, so keys appeared held
+ * past the guest's auto-repeat delay and the desktop received garbage
+ * runs of repeated letters -- while the same events with a quarter
+ * second between characters, sent over QMP, arrived perfect.  The
+ * guest tolerates a character's four events together; it needs room
+ * between characters and nothing else.
+ *
+ * So the typer is a worker thread in exactly the shape of the proven
+ * senders: the window's events go out from the UI thread and QMP's
+ * input-send-event from its dispatcher thread, both one BQL acquisition
+ * per event, and both land; events sent from a main-loop timer context
+ * did not.  The worker sleeps between characters holding no lock, takes
+ * the BQL for each character's four events, and posts when done.  The
+ * handler waits on the same semaphore pattern the bottom-half class
+ * uses; a timeout leaves the typing running and the next command busy,
+ * exactly like a slow bh.
+ */
+#define SCRIPT_TYPE_MS 250
+
+static struct {
+    QemuThread thread;
+    QemuSemaphore go;
+    QemuSemaphore done;
+    bool armed;                 /* a typing is queued or running */
+    char *text;                 /* the worker's once go is posted */
+    int64_t pace_ms;
+    unsigned typed;
+} typer;
+static bool typer_started;
+
+/* metal_glue_key's send without its BQL: the worker holds the lock
+ * around each character's events itself. */
+static void type_send(uint32_t osx, bool down)
+{
+    unsigned lnx;
+
+    if (osx >= qemu_input_map_osx_to_linux_len) {
+        return;
+    }
+    lnx = qemu_input_map_osx_to_linux[osx];
+    if (lnx == 0) {
+        return;
+    }
+    cnt.keys++;
+    qemu_input_event_send_key_linux(NULL, lnx, down);
+}
+
+static void *type_worker(void *arg)
+{
+    for (;;) {
+        qemu_sem_wait(&typer.go);
+        typer.typed = 0;
+        for (const char *c = typer.text; c && *c; c++) {
+            uint32_t osx;
+            bool shift;
+
+            if (script_key_for_char(*c, &osx, &shift) == 0) {
+                bql_lock();
+                if (shift) {
+                    type_send(56, true);
+                }
+                type_send(osx, true);
+                type_send(osx, false);
+                if (shift) {
+                    type_send(56, false);
+                }
+                bql_unlock();
+                typer.typed++;
+            }
+            if (c[1]) {
+                g_usleep(typer.pace_ms * 1000);
+            }
+        }
+        typer.armed = false;            /* before the post, as ever */
+        qemu_sem_post(&typer.done);
+    }
+    return NULL;
+}
+
+/* Validate-before-send is the caller's; this only paces and waits.
+ * waiting_s is the dispatch's already-clamped parameter.  The wait
+ * blocks the handler -- the envelope is synchronous by design -- so a
+ * long text freezes the window for its duration; ms_per_char in the
+ * reply says how long that was. */
+static char *script_type_paced(const char *text, int64_t waiting_s,
+                               int64_t pace_ms, int *err,
+                               const char **errmsg)
+{
+    int64_t wait_ms = waiting_s * 1000;
+
+    if (typer.armed) {
+        *err = SCRIPT_E_BUSY;
+        *errmsg = "another typing is still in flight";
+        return NULL;
+    }
+    if (!typer_started) {
+        qemu_sem_init(&typer.go, 0);
+        qemu_sem_init(&typer.done, 0);
+        qemu_thread_create(&typer.thread, "typer", type_worker,
+                           NULL, QEMU_THREAD_JOINABLE);
+        typer_started = true;
+    }
+    /* drain a completion that arrived after an earlier timeout */
+    while (qemu_sem_timedwait(&typer.done, 0) == 0) {
+    }
+    g_free(typer.text);
+    typer.text = g_strdup(text);
+    typer.pace_ms = pace_ms;
+    typer.armed = true;
+    qemu_sem_post(&typer.go);
+
+    if (qemu_sem_timedwait(&typer.done, (int)MIN(wait_ms, INT_MAX)) != 0) {
+        *err = SCRIPT_E_TIMEOUT;
+        *errmsg = "waiting expired; the typing continues";
+        return NULL;
+    }
+    return g_strdup_printf("{\"typed\":%u,\"ms_per_char\":%" PRId64 "}",
+                           typer.typed, typer.pace_ms);
+}
+
+static char *cmd_type(const QDict *q, int64_t waiting, int *err,
+                      const char **errmsg)
 {
     const char *text = arg_str(q, "text");
-    unsigned typed = 0;
 
     if (!text || !*text) {
         *err = SCRIPT_E_INVALID;
@@ -817,17 +931,11 @@ static char *cmd_type(const QDict *q, int *err, const char **errmsg)
             *errmsg = "only ASCII printable text is supported in v1";
             return NULL;
         }
-        if (shift) {
-            script_send_linux(KEY_LEFTSHIFT, true);
-        }
-        script_send_linux(code, true);
-        script_send_linux(code, false);
-        if (shift) {
-            script_send_linux(KEY_LEFTSHIFT, false);
-        }
-        typed++;
     }
-    return g_strdup_printf("{\"typed\":%u}", typed);
+    return script_type_paced(text, waiting,
+                             MIN(MAX(arg_int(q, "pace_ms", SCRIPT_TYPE_MS),
+                                     50), 1000),
+                             err, errmsg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1444,7 +1552,7 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
             data = g_strdup("{\"sent\":true}");
         }
     } else if (!strcmp(cmd->name, "type")) {
-        data = cmd_type(qdict, &err, &errmsg);
+        data = cmd_type(qdict, waiting, &err, &errmsg);
     } else if (!strcmp(cmd->name, "mouse")) {
         MetalFbView v;
         int64_t x = arg_int(qdict, "x", INT64_MIN);

@@ -125,7 +125,7 @@
 				<type type="text" description="The JSON reply envelope."/>
 			</result>
 		</command>
-		<command name="type" code="MQemType" description="Type ASCII text through the US keymap, shifted punctuation included.">
+		<command name="type" code="MQemType" description="Type ASCII text through the US keymap, paced a character at a time (pace_ms, default 250) so the guest sees typing, not lost keys.">
 			<direct-parameter>
 				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
 			</direct-parameter>
