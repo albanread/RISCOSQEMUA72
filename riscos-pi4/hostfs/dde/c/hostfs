@@ -141,6 +141,8 @@ static _kernel_oserror err_oldhost = { 0x1E7,
  * whatever prepared the buffer, and the offset points straight at it —
  * "+258300" says the last page was missed, which a bare "not mapped"
  * would have left to a diagnostic build to discover. */
+static _kernel_oserror err_retired = { 0x1EA,
+    "HostFS: whole-file entry called despite dontuseload/dontusesave" };
 static _kernel_oserror err_badaddr_buf;
 
 static _kernel_oserror *badaddr_at(uint32_t off)
@@ -659,7 +661,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
 
     uint32_t reason = (uint32_t)r->r[0];
     const char *name = (const char *)r->r[1];
-    uint32_t size, type, attr, cs_lo, cs_hi, rc, h, load, exec, len;
+    uint32_t size, type, attr, cs_lo, cs_hi, rc, load, exec;
 
     (void)pw;
 
@@ -688,87 +690,16 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
         }
         return NULL;
 
-    case 0xFF: {                       /* load into memory at r2 */
-        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
-        if (rc == RC_NOTFOUND) {
-            r->r[0] = 0;
-            return NULL;
-        }
-        if (rc != RC_OK) {
-            return rc_to_error(rc);
-        }
-        if (type == 0) {
-            r->r[0] = 2;
-            return &err_unsupported;
-        }
-        req->cmd = C_OPEN;
-        req->handle = O_READ;
-        put_path(name);
-        rc = vmch_go();
-        if (rc != RC_OK) {
-            return rc_to_error(rc);
-        }
-        h = req->handle;
-
-        {
-            uint32_t moved = xfer(h, 0, (uint32_t)r->r[2], size, 0);
-
-            vmch_req_close(h);
-            if (moved != size) {
-                return &err_access;
-            }
-            rc = RC_OK;
-        }
-        if (rc != RC_OK) {
-            return rc_to_error(rc);
-        }
-        stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
-        r->r[0] = 1;
-        r->r[2] = (int)load;
-        r->r[3] = (int)exec;
-        r->r[4] = (int)size;
-        r->r[5] = (int)attr;
-        return NULL;
-    }
-
-    case 0: {                          /* save: data r4..r5 */
-        len = (uint32_t)(r->r[5] - r->r[4]);
-        req->cmd = C_CREATE;
-        req->handle = 0;
-        put_path(name);
-        rc = vmch_go();
-        if (rc != RC_OK) {
-            return rc_to_error(rc);
-        }
-        req->cmd = C_OPEN;
-        req->handle = O_WRITE | O_TRUNC;
-        put_path(name);
-        rc = vmch_go();
-        if (rc != RC_OK) {
-            return rc_to_error(rc);
-        }
-        h = req->handle;
-        {
-            uint32_t moved = xfer(h, 0, (uint32_t)r->r[4], len, 1);
-
-            vmch_req_close(h);
-            if (moved != len) {
-                return &err_access;
-            }
-            rc = RC_OK;
-        }
-        rc = info_of(name, &size, &type, &attr, &cs_lo, &cs_hi);
-        load = exec = 0xFFFFFFFFu;
-        if (rc == RC_OK) {
-            stamp_load_exec(type, cs_hi, cs_lo, &load, &exec);
-        }
-        r->r[0] = 1;
-        r->r[2] = (int)load;
-        r->r[3] = (int)exec;
-        r->r[4] = (int)len;
-        r->r[5] = 3;
-        return NULL;
-    }
+    /*
+     * fsfile_Load (0xFF) and fsfile_Save (0) are retired: information
+     * word bits 20 and 19 tell FileSwitch to build *Load and *Save out
+     * of Open/GetBytes/PutBytes/Close instead.  Answered rather than
+     * deleted, so that if FileSwitch ever calls them anyway the failure
+     * is named instead of mysterious.
+     */
+    case 0xFF:                         /* load  */
+    case 0:                            /* save  */
+        return &err_retired;
 
     case 7:                            /* create empty */
         req->cmd = C_CREATE;
@@ -974,7 +905,16 @@ static void *hostfs_pw;
 
 #define OUR_FS_NUMBER 220
 #define INFO_FSFILE9_NOLEN 0x04000000u  /* LowFSI:121 fsinfo_fsfilereadinfonolen */
-#define INFO_WORD (OUR_FS_NUMBER | (16u << 8) | INFO_FSFILE9_NOLEN)
+/* LowFSI: fsinfo_dontuseload (bit 20) and fsinfo_dontusesave (bit 19).
+ * "FileSwitch does *Load with Open, GBPB, close" — Doc/SimpleFS
+ * recommends both for a network-flavour filing system, and they are what
+ * makes whole-file and streaming one code path instead of two that can
+ * disagree.  They did disagree: *Copy worked while *Type and BGET#
+ * returned garbage, because only the whole-file path was exercised. */
+#define INFO_DONTUSESAVE   0x00080000u
+#define INFO_DONTUSELOAD   0x00100000u
+#define INFO_WORD (OUR_FS_NUMBER | (16u << 8) | INFO_FSFILE9_NOLEN \
+                   | INFO_DONTUSELOAD | INFO_DONTUSESAVE)
 
 _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
 {
