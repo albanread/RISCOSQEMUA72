@@ -106,6 +106,10 @@ static uint32_t seq;
 /* Per-handle state, for FSEntry_Args: the doorbell is stateless (each
  * op carries its own seek), so ptr/ext/load/exec live here instead.
  * Device handles are 1-based; 0 means no file. */
+/* FileSwitch buffer size: power of two, 64..1024 (PRM 2-541).  Take the
+ * maximum — the doorbell, not the copy, is what a transfer costs. */
+#define HOSTFS_BUFSIZE 1024u
+
 static uint32_t hptr[VMCH_MAX_OPEN];
 static uint32_t hext[VMCH_MAX_OPEN];
 static uint32_t hload[VMCH_MAX_OPEN];
@@ -409,13 +413,21 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     hload[idx] = load;
     hexec[idx] = exec;
 
-    /* file information word: write+read granted, bit 28 declares the
-     * unbuffered GBPB convention (address in R2, file ptr in R4) */
-    r->r[0] = (int)((1u << 31) | (1u << 30) | (1u << 28));
+    /* File information word, PRM 2-542.  Bit 28 (unbuffered GBPB) must
+     * stay CLEAR: it tells FileSwitch the FS_gbpb entry handles multi-
+     * byte transfers itself, and this module leaves that entry (info
+     * block word 10) zero, so setting it dispatched every transfer into
+     * nothing.  Buffered instead: R2 carries a buffer size, which
+     * PRM 2-541 requires to be a power of two between 64 and 1024, and
+     * FileSwitch then drives GetBytes/PutBytes in whole blocks and
+     * tracks PTR#/EXT# for us. */
+    r->r[0] = (int)((1u << 31) | (1u << 30) |
+                    ((type == 0) ? (1u << 29) : 0u));   /* 29: directory */
     r->r[1] = (int)h;
-    r->r[2] = 0;      /* unbuffered: every get/put carries the address */
-    r->r[3] = (int)((type == 0) ? 0 : size);
-    r->r[4] = (int)((size + 0xFFFu) & ~0xFFFu);   /* allocated: rounded */
+    r->r[2] = HOSTFS_BUFSIZE;
+    r->r[3] = (int)((type == 0) ? 0 : size);            /* extent */
+    /* allocated space: must be a multiple of the buffer size */
+    r->r[4] = (int)((size + (HOSTFS_BUFSIZE - 1u)) & ~(HOSTFS_BUFSIZE - 1u));
     return NULL;
 }
 
@@ -442,7 +454,10 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
     }
     moved = xfer(h, ptr, mem, n, 0);
     hptr[idx] = ptr + moved;
-    r->r[3] = (int)moved;
+    /* Buffered GetBytes has no exit registers (PRM 2-544), and a short
+     * read is normal: the count is a multiple of the buffer size, so the
+     * final block runs past the extent.  Not an error. */
+    (void)moved;
     return NULL;
 }
 
@@ -472,7 +487,7 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
     if (hptr[idx] > hext[idx]) {
         hext[idx] = hptr[idx];
     }
-    r->r[3] = (int)moved;
+    (void)moved;                /* buffered PutBytes returns nothing */
     return NULL;
 }
 
