@@ -853,38 +853,143 @@ host-side bug, fixable in seconds.
 
 ## 13. Sprints
 
-1. **Transport and streams.**  `cpu_memory_rw_debug` helpers in the
-   device, `VMCH_RC_BADADDR`, VERSION 1, the v1 block, and
-   `FSENTRY_OPEN/GETBYTES/PUTBYTES/ARGS/CLOSE` host-side.  Module:
-   `vmch_call()` and five veneers.  **Clear bit 28 and return a valid
-   power-of-two buffer size** (§5) — that alone is the stream fix.
-   *Acceptance:* `*Type` prints; `BGET#` returns `l`; the DDE compiles a
-   source read straight off HostFS.
-2. **The information word.**  Set bits 19/20 so `*Load`/`*Save` become
-   Open/GBPB/Close, retire `fsfile_Load`/`Save`, and confirm `*Copy`
-   still works through the stream path alone.
-3. **Names and types.**  Dot/slash, `,xxx` consumed, the table generated
-   from `Hdr/Global/FileTypes`, `typemap=`, `naming=`, case fallback.
-   *Acceptance:* `*Ex` shows real types and dates; `readme/txt` opens.
-4. **Metadata.**  load/exec/attrs host-side, the `.riscos-meta` sidecar,
-   `WriteInfo`/`WriteAttr`.
-5. **Directories.**  Func 14/15, the enumeration snapshot, Func 24
-   returning −1, 27, 30 (`*Free`), 16.
-   *Acceptance:* the Filer opens a HostFS window with correct icons and
-   a double-click loads a text file into StrongED.
-6. **Edges and measurement.**  Errors on the §9 base, `readonly=`,
-   multiple shares, and the doorbell budget of §5 on paper.
+Revised 12 Sep 2026 around three goals, in this order:
 
-### The measurement that goes with sprint 1
+1. **HostFS is in the base ROM** and present when the machine starts.
+2. **It is a real disc to the user** — an icon on the icon bar, browsable
+   in the Filer, files with their proper icons.
+3. **The machine boots off it.**
 
-`VMCH_TRACE` a 256 KiB read from BASIC — `OPENIN`, then a `BGET` loop,
-then again with `OS_GBPB 4` — and count `cmd=` lines.  The design
-predicts 1 doorbell for the `OS_GBPB` case and 256 for the `BGET` case;
-if either is wildly out, something about the buffered path is not what
-§5 thinks it is, and that is worth knowing on day one rather than in
-sprint 6.  Nothing about the *design* now hangs on the result: the PRM
-and `Doc/SimpleFS` settle what to build.  The number is there to catch a
-mistake in the building.
+### Done
+
+Measured on the Mac Pi 4 machine, TCG, soft-loaded module:
+
+| Sprint | What landed | Evidence |
+| --- | --- | --- |
+| 1 Streams | buffered FS; v1 transport, host walks the guest MMU; touch-and-retry for unmapped pages | 256 KiB read: 130 doorbells → 1; `BGET#`, `OS_GBPB` byte-exact |
+| 2 Info word | bits 19/20: one data path for load, save and streams | 256 KiB in and out, `cmp` identical |
+| 3 Names and types | dot/slash, `,xxx` consumed, 179-entry typemap, case-insensitive, host-local dates | `*Ex` screenshots; dotted names open |
+| 4 Metadata | `*SetType` renames, `*Access`, datestamps written back | module copied out as `,ffa` `RMLoad`s with no `SetType` |
+| 5 Directories | Rename; disc name; bit 23 with Func 23/24; Func 14/15/19; free space | `OS_GBPB` 9/10/11 records; `OS_FSControl 49` |
+
+### The acceptance rule for everything below
+
+**A result counts only when it works from a spliced ROM with nothing
+soft-loaded.** `*Modules` showing a ROM address proves the module loaded
+onto the chain, not that it runs — a module can splice, list, and then
+abort on its first write. Every sprint below names a working result: a
+transfer through the doorbell, a window that opens, a desktop reached.
+
+### R1 — HostFS runs from ROM
+
+The theory, and it is the right one: a module on the ROM chain executes
+in place, so it may not write its own image, and its variables must live
+in RMA at the workspace the private word (R12) points to.
+
+- **Every mutable static moves into one `struct hostws`**: the doorbell
+  window pointer, the request block and its physical address, the
+  sequence number, the per-handle arrays, the catalogue cache, the
+  registration flag, and v1's own additions — the two formatted error
+  buffers. Constant error blocks and `FilingSystemName` stay in the image:
+  never written, and ROM is readable.
+- **Claim it in init with `OS_Module 6`, size in R3** — not R2.
+  `Kernel/s/ModHand` reads R3; a size in R2 claims a garbage-sized block
+  and the zeroing that follows flattens its neighbours (found the hard way
+  in GVFill, `c0a55e4f44`).
+- **Store the address in the private word** — `*(struct hostws **)pw` —
+  and reach it through `pw` in every entry point, passed down into every
+  helper. **There must be no file-scope pointer to it.** That pointer is
+  itself a writable static, and writing it at init aborts from ROM.
+- **Free it in final**, and leave nothing behind if init fails part way.
+- **The lazy doorbell mapping becomes load-bearing.** `OS_Memory 13` fails
+  during module init, which is why `ensure_vmch()` maps on first use; from
+  ROM that is not a convenience but the only way it can work.
+
+Do not merge `zcode/romloader`'s `f5abc37686`. It converts the v0 module,
+which v1 has since rewritten, and it carries both fatal mistakes above: the
+workspace pointer is a module static (`static struct hostws *WS`), and the
+claim size is in R2.
+
+*Acceptance:* a stock `RISCOS.IMG` spliced by `tools/mkrom.py` with HostFS,
+booted with no HostFS in `!Boot.Choices.Boot.PreDesk` and nothing
+`*RMLoad`ed: `*Ex HostFS:` lists real types and dates, and a 256 KiB
+`*Copy` in and back out is byte-identical. The same module still
+soft-loads and passes the same test.
+
+### R2 — present when the machine starts
+
+- The launchers splice HostFS by default when a share is configured
+  (`RISCOS_HOSTFS` set implies the module), so a user never meets a machine
+  with a share and no filing system.
+- The card images stop needing HostFS in PreDesk; a PreDesk copy of an
+  older module must not shadow the ROM one — check which wins, and make
+  the answer the ROM.
+- First use after a cold boot maps the doorbell and works without any
+  command having primed it.
+
+*Acceptance:* cold boot, and the very first command, `*Cat HostFS:`, lists
+the share.
+
+### D1 — a real disc: icon and Filer
+
+- **HostFSFiler** (`9fb0f156a6`, the Windows team's, on the RAMFSFiler
+  pattern) is also a C module and gets the R1 treatment, spliced after
+  HostFS.
+- The HostFS disc is on the icon bar at startup; a click opens the root in
+  a Filer window; files carry their real type icons, which sprints 3 and 4
+  made possible; double-clicking a Text file opens it.
+- A HostFS drive sprite of its own; it currently borrows the hard disc's.
+- The Filer's calls checked against v1 — HostFSFiler was written against
+  v0, before Func 14, 19, 23 and 24 were right.
+
+*Acceptance:* cold boot from the spliced ROM; the HostFS icon is present;
+click it; the window lists the share with correct icons; double-click a
+text file and it opens in the editor.
+
+### D2 — behaving like a disc in the Filer
+
+Whatever D1 turns up, and at least: new directory and rename from the
+Filer menu, drag-copy both ways between a HostFS window and an SDFS one,
+delete, `Info` showing type and date, and free space in the Filer's own
+display.
+
+*Acceptance:* each of those done by mouse in a desktop session, and the
+host directory checked afterwards.
+
+### B1 — boot off it
+
+`BOOTDESIGN.md` has the design.
+
+- **An index for typed names first.** A `,xxx`-suffixed file misses the
+  fast-path stat and costs a directory scan on every lookup; a boot is
+  thousands of lookups. This must be in before a boot is attempted.
+- CMOS pre-seeded for `FileSystem HostFS` and `Boot` (`mkcmos.py`).
+- `FSEntry_Func 10` performs the boot action — run `&.!Boot` per the boot
+  option — instead of returning.
+- The working card's tree unpacked to plain host files through the mapping
+  that already exists, and booted.
+
+*Acceptance:* a cold boot from a host directory reaches the desktop with
+no card attached.
+
+### B2 — persistence and measurement
+
+Persistent CMOS, so `*Configure` survives power-off; the SD-versus-HostFS
+boot comparison of `BOOTDESIGN.md` §5.5, as MMIO accesses against
+filing-system calls and wall-clock.
+
+### Edges, folded in where they start to matter
+
+Errors on a registered filing system error base (§9) and a real FS number
+from ROOL before anything ships outside the team; `readonly=` (§10);
+several shares selected by disc name; wildcards in `FSEntry_File` 1–4; and
+64-bit free space (Func 35/36).
+
+### The measurement that went with sprint 1
+
+`VMCH_TRACE` a 256 KiB read from BASIC and count `cmd=` lines. Done:
+predicted one doorbell for a buffer-aligned `OS_GBPB`, measured one, down
+from 130.
 
 ---
 

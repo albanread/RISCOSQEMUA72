@@ -467,21 +467,24 @@ follow once there is something worth persisting.
 
 ## 8. Sprints
 
-1. **Splice.**  The ROM injector as a library, driven by a device
-   property, with `mkcmos.py`'s chain walker as the starting point.
-   *Acceptance:* `*Modules` lists HostFS with a ROM address, on a stock
-   `RISCOS.IMG`, with no module on the card.
-2. **Pre-seed CMOS** for `FileSystem HostFS` + `Boot`, and confirm the
-   spliced module survives the `image_size` change (§3.3).
-3. **Enumeration** — `FSDESIGN-V1.md` §8, now on the critical path, with
-   the `resolve_leaf()` index of §5.4 alongside it.
-4. **Unpack and boot** (§4.5): the working card's tree as plain files,
-   `RISCOS_HOSTFS` pointed at it, desktop reached.
-5. **Measure** (§5.5): MMIO accesses for an SD boot against filing-system
-   calls for a HostFS boot, and the wall-clock beside it.
-6. **`*Free`, wildcards, coherence policy** — whatever the boot actually
-   turned out to need, which will not be exactly this list.
-7. **Persistent CMOS**, and the bundle question of §2.5.
+The sprints for booting off HostFS now live in one plan with the filing
+system work, **`FSDESIGN-V1.md` §13**, because booting depends on HostFS
+first running from ROM (R1), being present at startup (R2), and looking
+up typed names fast (B1). This document keeps the design.
+
+**The acceptance test this section used to give for splicing was too
+weak.** It was "`*Modules` lists HostFS with a ROM address" — which proves
+the module loaded onto the chain, not that it runs, and a module that
+splices and then aborts passes it. It was cited as passing for work that
+did not run. The test is now a working result from a spliced ROM with
+nothing soft-loaded (`FSDESIGN-V1.md` §13).
+
+§3.3's analysis of `image_size` and the CMOS address, and its 64 KiB
+headroom, were inference from `mkcmos.py` and were never tested. The
+loader that exists (`tools/mkrom.py`) does not change the header, and
+`docs/rom-modules.md` in the private repository gives that as verified
+against the 5.31 sources; treat §3.3 as superseded, pending a boot that
+exercises it.
 
 ---
 
