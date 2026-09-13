@@ -255,6 +255,42 @@ the same artefact with a different trigger, and `run-macos.sh` boots the
 output.  It is a worse developer experience and an identical result.
 Write the splicer as a library either way, so the choice stays cheap.
 
+### 3.7 Only the filing system goes in the ROM
+
+**Decided 13 Sep.** The ROM carries HostFS and its icon-bar filer and
+nothing else. Every other module lives in the share's `$.Modules` and is
+loaded before the desktop by `!Boot.Choices.Boot.PreDesk.HostModules`
+(`hostfs/boot/HostModules,feb`):
+
+    Repeat RMLoad HostFS:$.Modules -Type &FFA -Sort -Continue
+
+§3.1's trap is the module that has to load itself, and only the filing
+system is that module. Once HostFS is in the ROM, everything else is an
+ordinary soft-load from a disc that is already there: added, updated or
+removed by copying a file on the host, with no ROM to re-splice and no
+need to be ROM-safe. `RISCOS_MODULES` stays for experiments and for
+anything that really must exist before a filing system does.
+
+The blitter showed this is more than tidiness. **GVFill spliced into the
+ROM never sees a sprite plot**: it initialises, claims SpriteV, and
+something later in the boot claims the vector in front of it and answers
+the plots itself. `*RMReInit GVFill` at the command line brings them
+back; loaded from PreDesk it sees every one. A module's place on a vector
+is set by when it initialises, and the ROM is the earliest place there is.
+Its fills are unaffected — from ROM or from PreDesk they reach the host,
+and the desktop is pixel-identical to a boot without it.
+
+To use it: copy `HostModules,feb` into the share's
+`!Boot/Choices/Boot/PreDesk/`, and put modules in the share's `Modules/`
+with `,ffa` names. `-Sort` loads them in name order; without it
+`*Repeat` takes them in the order HostFS lists them, which is the host's
+and on APFS not alphabetical (`FSDESIGN-V1.md` §13, edges). `-Continue`
+stops one bad module from keeping the rest out, and leaves its error in
+`X$Error`. Verified 13 Sep on the Mac, booting from the share:
+`GVFill` in `$.Modules` loads into the RMA, and with a non-module
+`Aardvark,ffa` ahead of it, GVFill still loads, `X$Error` reads "Illegal
+header field in module", and the desktop is unchanged.
+
 ---
 
 ## 4. What the boot sequence will demand

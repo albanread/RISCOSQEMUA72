@@ -1105,6 +1105,12 @@ How to do it:
    card's DDE and fails without it.
 2. **Boot it.** `RISCOS_BOOT=hostfs RISCOS_HOSTFS=<share> tools/run-macos.sh`
    (or through `instance.sh`); without a card image, nothing else is booted.
+3. **Modules go on the share, not in the ROM.** Copy
+   `hostfs/boot/HostModules,feb` into the share's
+   `!Boot/Choices/Boot/PreDesk/` and put modules in `$.Modules` as
+   `,ffa` files; they load before the desktop. Only HostFS and
+   HostFSFiler are spliced. `BOOTDESIGN.md` §3.7 has why — GVFill from ROM
+   never sees a sprite plot — and what was verified.
 
 What it took, besides Func 10 (`Run &.!Boot`, as FileCore does for boot
 option 2; Func 27 reports 2 when there is a `!Boot`):
@@ -1172,6 +1178,15 @@ with no zone configured while the host maps datestamps as local time, so a
 file saved from the guest reads an hour old on a Mac in BST. RISC OS
 datestamps are UTC by definition; the right fix is UTC on the wire and the
 zone configured in the guest, not a different offset in the host.
+
+Directory order, found 13 Sep: HostFS lists a directory in the host's
+order — on APFS a hash order, not alphabetical — where FileCore keeps a
+catalogue sorted. `*Cat` shows it, and it reaches the boot: `!Boot`'s
+`BootRun` walks `PreDesk` with an unsorted `*Repeat`, as `Desktop` walks
+`Tasks`, so a share runs them in a different order from the card it was
+copied from. Nothing has broken on it yet. Sorting the listing in
+`VMCH_CMD_CAT`, case-insensitively as FileCore does, would make every
+enumeration match a real disc; `HostModules` uses `*Repeat -Sort` meanwhile.
 
 ### The measurement that went with sprint 1
 

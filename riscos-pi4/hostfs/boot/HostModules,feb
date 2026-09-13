@@ -1,0 +1,6 @@
+| HostModules - load the modules kept on the HostFS share, before the desktop.
+| HostFS itself is in the ROM, so the share is reachable by now; everything
+| else lives in HostFS:$.Modules, where it is easy to add, update or remove.
+| -Sort loads them in name order; -Continue keeps one that fails from
+| stopping the rest (the first error is left in X$Error).
+IfThere HostFS:$.Modules Then Repeat RMLoad HostFS:$.Modules -Type &FFA -Sort -Continue
