@@ -81,6 +81,38 @@ exactly the `BootHostFS` above, which would shadow it anyway.  `--boot
 hostfs` turns it on by itself, since reaching the share needs the module
 in the ROM to get there.
 
+## A farm with no cards
+
+The SD images are being retired, so an instance's share can be the whole
+machine.  Put a tree holding `!Boot` (and, for a dev machine, the DDE)
+in `qemu-farm/<name>/share`, then:
+
+    farm.py up alpha --no-card --boot hostfs
+
+`--boot hostfs` implies `--rom-hostfs`, so the ROM gets HostFS and its
+filer and the CMOS is built with `FileSystem HostFS`, kept on the share
+as `CMOS,ff2` so `*Configure` survives a power-off.  Measured here: a
+clean desktop 33 s after launch with no card attached at all, and `cc`
+compiling a source dropped into the share from the host.
+
+Two things the tree needs, both once, when it is built from a card:
+
+- **`PreDesk.BootDDE` repointed** from `SDFS::0.$` to `HostFS:$`, or the
+  DDE paths point at a card that is not there.
+- **`PreDesk.BootHostFS` removed.**  It is an unconditional `RMLoad` of
+  the card's own HostFS, and `RMLoad` replaces a ROM module of the same
+  name, so leaving it in means the machine runs 1.01 from the card
+  rather than 2.00 from the ROM (FSDESIGN-V1 §13 R2).  With no card it
+  is pointing at nothing anyway.
+
+And one trap when you build such a tree: **`*Copy` onto a Windows share
+stops at the first name the host cannot store** -- `>` and the rest of
+`< > : " / \ | ? *` -- and reports one line, five levels down, having
+abandoned everything after it.  macOS takes those names, so a tree that
+copies cleanly there can arrive 40% short here.  Verify with `*Count` on
+both sides, per directory: the file counts are the only thing that
+catches it.  ROS_PRIVATE#6.
+
 ## macOS: the launch, and the ticker
 
 `run-macos.sh` is the launch line from `../README.md` with `-display
