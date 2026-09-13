@@ -55,7 +55,8 @@ typedef unsigned char  uint8_t;
 #define VMCH_FEATURE_VIRTADDR 0x10u     /* host walks the guest's MMU */
 
 #define VMCH_MAX_ARG 4032   /* 64-byte header + 4032 = one 4 KB page */
-#define VMCH_MAX_OPEN 16                 /* device handle slots (1-based) */
+#define VMCH_MAX_OPEN 255               /* device handle slots, 1-based
+                                         * (FileCore's limit; issue #19) */
 #define VMCH_MAX_NAME 256                /* 255-char leaf + NUL (issue #16) */
 #define VMCH_CAT_ENTRY (20 + VMCH_MAX_NAME)     /* one CAT wire entry */
 #define VMCH_CAT_PER_PAGE (VMCH_MAX_ARG / VMCH_CAT_ENTRY)  /* most per reply */
@@ -114,6 +115,8 @@ struct vmreq {
 #define RC_IOERR    10
 #define RC_BADADDR  11   /* a guest address would not translate */
 #define RC_NOTEMPTY 12   /* a directory that still holds something */
+#define RC_LOCKED   13   /* object locked against change (issue #12) */
+#define RC_OPEN     14   /* object is open (issue #19) */
 
 /* The host marks a directory in the response `type` field with this
  * out-of-band value, not filetype 0, so a real type-&000 file is not
@@ -427,6 +430,15 @@ static _kernel_oserror *rc_to_error(struct hostws *ws, uint32_t rc)
     case RC_NOTEMPTY:
         err_host_buf.errnum = 0x1B4;    /* FileCore's is &B4 */
         (void)str_copy(err_host_buf.errmess, "HostFS: directory not empty");
+        return &err_host_buf;
+    case RC_LOCKED:                     /* FileCore's own numbers and text, */
+        err_host_buf.errnum = 0xC3;     /* so a reference-comparison test */
+        (void)str_copy(err_host_buf.errmess, /* sees the same error (#12) */
+                       "This item is locked to stop changes being made to it");
+        return &err_host_buf;
+    case RC_OPEN:
+        err_host_buf.errnum = 0xC2;     /* FileCore's "already open" (#19) */
+        (void)str_copy(err_host_buf.errmess, "This file is already open");
         return &err_host_buf;
     case RC_NOTDIR:
         err_host_buf.errnum = 0x1EB;

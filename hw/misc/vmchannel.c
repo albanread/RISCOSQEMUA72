@@ -29,6 +29,7 @@
 #include <utime.h>
 #ifndef _WIN32
 #include <sys/statvfs.h>
+#include <sys/xattr.h>
 #endif
 
 /*
@@ -1066,14 +1067,111 @@ static int riscos_type_for(const char *name, const GStatBuf *st)
     return (int)type;
 }
 
-static uint32_t attrs_for(const GStatBuf *st)
-{
-    uint32_t a = 3;                     /* owner read + write */
+/*
+ * The RISC OS attribute byte, stored whole for anything the host mode
+ * cannot express -- the locked bit especially (issue #12; FSDESIGN-V1 §7).
+ * The design's portable default is a .riscos-meta sidecar (§6.3/§13); this
+ * uses an extended attribute instead -- the documented cheaper alternative,
+ * native on the Mac farm and carried across rename() and unlink() by the
+ * host for free -- kept behind these helpers so the store can be swapped in
+ * one place.  Windows, which has no getxattr, falls back to the mode.
+ *
+ * Only the bits chmod cannot hold need it, so an object with default
+ * attributes (and every file copied in from the host) has no xattr and its
+ * attributes are derived from the mode.
+ */
+#define VMCH_ATTR_NAME_LINUX "user.riscos.attr"
 
-    if (!(st->st_mode & S_IWUSR)) {
-        a &= ~(uint32_t)2;
+static bool meta_get_attr(const char *hp, uint32_t *attr)
+{
+    uint8_t b;
+    ssize_t n = -1;
+
+#if defined(__APPLE__)
+    n = getxattr(hp, "riscos.attr", &b, 1, 0, 0);
+#elif !defined(_WIN32)
+    n = getxattr(hp, VMCH_ATTR_NAME_LINUX, &b, 1);
+#endif
+    if (n == 1) {
+        *attr = b;
+        return true;
     }
+    return false;
+}
+
+static void meta_set_attr(const char *hp, uint32_t attr)
+{
+    uint8_t b = (uint8_t)(attr & 0x3F);
+
+#if defined(__APPLE__)
+    (void)setxattr(hp, "riscos.attr", &b, 1, 0, 0);
+#elif !defined(_WIN32)
+    (void)setxattr(hp, VMCH_ATTR_NAME_LINUX, &b, 1, 0);
+#else
+    (void)hp; (void)b;
+#endif
+}
+
+/* Locked (bit 3) is never derivable from the mode, so a file with no stored
+ * attribute byte is not locked. */
+static bool meta_is_locked(const char *hp)
+{
+    uint32_t a;
+
+    return meta_get_attr(hp, &a) && (a & 8);
+}
+
+static uint32_t attrs_for(const GStatBuf *st, const char *hp)
+{
+    uint32_t a;
+
+    /*
+     * A stored byte is authoritative: it round-trips every bit RISC OS set,
+     * including the locked and public-access bits the host mode drops
+     * (issue #12 -- read used to be hard-coded on and everything else
+     * lost).  With none stored, derive what the mode does carry.
+     */
+    if (hp && meta_get_attr(hp, &a)) {
+        return a;
+    }
+    a = 0;
+    if (st->st_mode & S_IRUSR) {
+        a |= 0x01;                      /* owner read */
+    }
+    if (st->st_mode & S_IWUSR) {
+        a |= 0x02;                      /* owner write */
+    }
+    /*
+     * The public-access and locked bits default off for a file with no
+     * stored byte -- RISC OS's own default for a fresh file (&03), and what
+     * this reported before.  A file given public access or a lock has a
+     * stored byte, taken above, that says so.  (Not derived from the host's
+     * group/other mode bits, which g_open leaves set at 0644 and which RISC
+     * OS never meant.)
+     */
     return a;
+}
+
+/* True if `hp` is one of the files the guest currently has open: its
+ * resolved path matches an open slot's.  Used to refuse a delete, rename or
+ * second write-open of an open object (issue #19). */
+static bool path_is_open(VMChannelState *s, const char *hp)
+{
+    char *real = realpath(hp, NULL);
+    bool open = false;
+    int i;
+
+    if (!real) {
+        return false;                   /* cannot exist, so cannot be open */
+    }
+    for (i = 0; i < VMCH_MAX_OPEN; i++) {
+        if (s->open_paths[i] && strcmp(s->open_paths[i], real) == 0) {
+            open = true;
+            break;
+        }
+    }
+    free(real);
+    return open;
 }
 
 static uint64_t date_cs_for(const GStatBuf *st)
@@ -1246,10 +1344,36 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         } else {
             oflags = O_RDONLY | O_BINARY;
         }
+        if (flags & VMCH_OPEN_WRITE) {
+            /* FileCore refuses to open a locked file for update or output
+             * (issue #12), and refuses a second open of one already open
+             * for update (issue #19).  A new file, not yet on disc, is
+             * neither locked nor open, so an OPENOUT that creates still
+             * goes through. */
+            if (meta_is_locked(hp)) {
+                rc = vmch_answer(VMCH_RC_LOCKED);
+                g_free(hp);
+                g_free(path);
+                break;
+            }
+            if (path_is_open(s, hp)) {
+                rc = vmch_answer(VMCH_RC_OPEN);
+                g_free(hp);
+                g_free(path);
+                break;
+            }
+        }
         s->fds[h] = g_open(hp, oflags, 0644);
         if (s->fds[h] < 0) {
             rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
         } else {
+            /* Remember the resolved path so a delete, rename or second
+             * write-open of this file can be refused while it is open
+             * (issue #19). */
+            char *real = realpath(hp, NULL);
+
+            s->open_paths[h] = g_strdup(real ? real : hp);
+            free(real);
             /* handles are 1-based over the wire: 0 means "no file" to
              * a RISC OS FSEntry_Open caller */
             st32(base + VMCH_HDR_HANDLE, (uint32_t)(h + 1));
@@ -1287,6 +1411,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         } else {
             close(s->fds[h]);
             s->fds[h] = -1;
+            g_free(s->open_paths[h]);       /* no longer open (issue #19) */
+            s->open_paths[h] = NULL;
         }
         break;
     }
@@ -1376,7 +1502,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
              * real type-&000 file is not read back as a directory (#13).
              * load/exec above still use the real type. */
             stl_le_p(resp + 4, S_ISDIR(st.st_mode) ? VMCH_TYPE_DIR : type);
-            stl_le_p(resp + 8, attrs_for(&st));
+            stl_le_p(resp + 8, attrs_for(&st, hp));
             stl_le_p(resp + 12, (uint32_t)cs);
             stl_le_p(resp + 16, (uint32_t)(cs >> 32));
             stl_le_p(resp + 20, load);
@@ -1453,7 +1579,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 if (g_stat(one, &st) == 0) {
                     isdir = S_ISDIR(st.st_mode);
                     e->size = (uint32_t)st.st_size;
-                    e->attrs = attrs_for(&st);
+                    e->attrs = attrs_for(&st, one);
                 } else {
                     e->attrs = 3;
                 }
@@ -1563,6 +1689,10 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         if (g_stat(hp, &st) != 0) {
             rc = vmch_answer(VMCH_RC_NOTFOUND);
+        } else if (meta_is_locked(hp)) {
+            rc = vmch_answer(VMCH_RC_LOCKED);   /* locked: refuse (issue #12) */
+        } else if (path_is_open(s, hp)) {
+            rc = vmch_answer(VMCH_RC_OPEN);     /* open: refuse (issue #19) */
         } else if (S_ISDIR(st.st_mode)) {
             /* Every failure here used to be NOTDIR, which the guest could
              * only call "unsupported operation" — for the commonest one,
@@ -1600,13 +1730,24 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             hp1 = host_path(s, both, &rc);
             if (hp1) {
                 hp2 = host_path(s, split + 1, &rc);
+                if (hp2 && meta_is_locked(hp1)) {
+                    rc = vmch_answer(VMCH_RC_LOCKED);   /* issue #12 */
+                    g_free(hp2);
+                    hp2 = NULL;
+                } else if (hp2 && path_is_open(s, hp1)) {
+                    rc = vmch_answer(VMCH_RC_OPEN);     /* issue #19 */
+                    g_free(hp2);
+                    hp2 = NULL;
+                }
                 if (hp2) {
                     GStatBuf st;
 
                     /* The type rides the host name, so a rename has to
                      * carry it across: renaming `logo,ff9` (which RISC OS
                      * calls "logo") to "icon" must land as `icon,ff9`, not
-                     * as an untyped `icon`. */
+                     * as an untyped `icon`.  A rename() also carries the
+                     * stored attribute xattr with the file, so a renamed
+                     * object keeps its locked/public bits. */
                     if (g_stat(hp1, &st) == 0) {
                         uint32_t type = (uint32_t)riscos_type_for(hp1, &st);
                         g_autofree char *dir = g_path_get_dirname(hp2);
@@ -1795,6 +1936,18 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             uint32_t end = attr;        /* R5 here is the end address, not an
                                          * attribute word (see the note) */
 
+            /* Saving over a locked file is refused, as it is for delete and
+             * rename (issue #12).  hp is the resolved existing object here,
+             * before it is renamed to carry the new type. */
+            if (meta_is_locked(hp)) {
+                rc = vmch_answer(VMCH_RC_LOCKED);
+                break;
+            }
+            if (path_is_open(s, hp)) {
+                rc = vmch_answer(VMCH_RC_OPEN);
+                break;
+            }
+
             type = type_of_load(load);
             if (type != 0xFFFFFFFFu) {
                 /* Name it for its type now, rather than creating it and
@@ -1881,16 +2034,36 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             }
 
             if (reason == 1 || reason == 4) {
-                /* RISC OS attributes to host mode: owner write, and the
-                 * locked bit, are the two the host can actually hold. */
-                mode_t m = st.st_mode & ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
-                if ((attr & 2) && !(attr & 8)) {     /* write, not locked */
-                    m |= S_IWUSR;
+                /*
+                 * The whole RISC OS attribute byte is kept host-side so
+                 * every bit round-trips -- the locked and public-access
+                 * bits the mode cannot carry included (issue #12); the
+                 * stored byte, not the mode, is what attrs_for reports.
+                 *
+                 * The owner (the emulator) keeps read+write on the host
+                 * whatever RISC OS says, so it can always update the file
+                 * and its stored byte -- setxattr on an owner-read-only
+                 * file is refused, which would strand a *Access that
+                 * unlocks.  "locked" and owner "read only" are enforced
+                 * explicitly (meta_is_locked), not through the host mode.
+                 * The public bits are reflected, for the host side's sake.
+                 */
+                mode_t m = st.st_mode & ~(mode_t)(S_IRUSR | S_IWUSR |
+                             S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+                m |= S_IRUSR | S_IWUSR;
+                if (attr & 0x10) {                   /* public read */
+                    m |= S_IROTH | S_IRGRP;
+                }
+                if (attr & 0x20) {                   /* public write */
+                    m |= S_IWOTH | S_IWGRP;
                 }
                 if (g_chmod(hp, m) != 0) {
                     rc = vmch_answer(VMCH_RC_ACCESS);
                     break;
                 }
+                /* After the chmod: the file is owner-writable now, so the
+                 * stored byte cannot be refused. */
+                meta_set_attr(hp, attr);
             }
 
             if (reason == 1 || reason == 2 || reason == 3) {
@@ -2225,6 +2398,7 @@ static void vmchannel_realize(DeviceState *dev, Error **errp)
     }
     for (int i = 0; i < VMCH_MAX_OPEN; i++) {
         s->fds[i] = -1;
+        s->open_paths[i] = NULL;
     }
     memory_region_init_io(&s->mr, OBJECT(s), &vmchannel_ops, s,
                           "vmchannel", VMCH_REGION_SIZE);

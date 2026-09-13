@@ -112,6 +112,8 @@
 #define VMCH_RC_IOERR    10
 #define VMCH_RC_BADADDR  11   /* a guest address would not translate */
 #define VMCH_RC_NOTEMPTY 12   /* a directory that still holds something */
+#define VMCH_RC_LOCKED   13   /* object is locked against change (issue #12) */
+#define VMCH_RC_OPEN     14   /* object is open (issue #19) */
 
 /* The `type` field of a FILEARGS/CAT response carries a 12-bit RISC OS
  * filetype (0x000..0xFFF) for a file -- &000 is a real, allocated type --
@@ -156,7 +158,7 @@
  * leafnames reach 255, so the field is VMCH_MAX_NAME and the metadata moved
  * ahead of it. */
 
-#define VMCH_MAX_OPEN 16
+#define VMCH_MAX_OPEN 255                    /* FileCore's limit (issue #19) */
 #define VMCH_MAX_NAME 256                    /* 255-char leaf + NUL */
 #define VMCH_MAX_ARG  4032   /* one page: 64-byte header + 4032 */
 #define VMCH_CAT_ENTRY (20 + VMCH_MAX_NAME)  /* one CAT wire entry, meta+name */
@@ -173,6 +175,10 @@ struct VMChannelState {
     char *root;                     /* host directory, UTF-8; NULL = none */
 
     int fds[VMCH_MAX_OPEN];
+    /* The resolved host path of each open file, so a delete, rename or a
+     * second write-open of an open object can be refused as FileCore does
+     * (issue #19).  NULL where the slot is free. */
+    char *open_paths[VMCH_MAX_OPEN];
 };
 
 #endif /* HW_MISC_VMCHANNEL_H */
