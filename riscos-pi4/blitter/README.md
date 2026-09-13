@@ -22,7 +22,14 @@ shortest byte pattern it repeats at — one byte for an 8bpp plain
 colour, so the device memsets — which also keeps odd widths fillable
 (the device refuses a width the pattern does not divide).
 
-**Sprites — pointed at, unmasked, the screen's own pixel format.**
+**Sprites — pointed at, unmasked, the screen's own pixel format, and
+only while output is the screen.**  `OS_ReadVduVariables` answers for
+whatever VDU output is current, and a boot's first plots go into a
+sprite — so the six mode constants are cached only while output is the
+screen and re-read on every switch (`Service_SwitchingOutputToSprite`,
+whose R4 is the sprite output now goes to, 0 for the screen), and any
+plot attempted while output is a sprite is passed to SpriteExtend:
+it belongs in that sprite, not on the framebuffer.
 The sprite's type must be the one matching the screen (6 for 32bpp, 4
 for 8bpp, 5 for a 5:5:5 16bpp screen — the Pi's 16bpp is 5:6:5, where
 old type-5 sprites genuinely need conversion and are passed up), the
@@ -114,20 +121,36 @@ provides for exactly that purpose.  Anything added should use
 
 ## Running
 
-Two ways in, and the module works identically from either:
+Two ways in, and they are **not equivalent**.  Fills work identically
+from either.  Sprites only work soft-loaded:
 
-- **Soft-loaded** — put `GVFill,ffa` in the HostFS root and load it.
-  The `,ffa` matters: `*RMLoad` checks the filetype is &FFA, and the
-  doorbell maps a `,xxx` suffix to the type while leaving it in the
-  name.
+- **Soft-loaded, from the share's `$.Modules` — the way to run it.**
+  Only HostFS and its filer go in the ROM (decided 13 Sep, BOOTDESIGN
+  §3.7); every other module loads before the desktop by
+  `!Boot.Choices.Boot.PreDesk.HostModules` (`hostfs/boot/HostModules,feb`):
 
   ```
-  *RMLoad hostfs:$.GVFill,ffa
+  Repeat RMLoad HostFS:$.Modules -Type &FFA -Sort -Continue
   ```
+
+  Put `GVFill,ffa` in the share's `Modules/`.  A `*RMLoad hostfs:$.GVFill,ffa`
+  at any moment works too — the `,ffa` matters: `*RMLoad` checks the
+  filetype is &FFA, and the doorbell maps a `,xxx` suffix to the type
+  while leaving it in the name.
 
 - **Spliced into the ROM** (`tools/mkrom.py`, BOOTDESIGN §3) — the
   module initialises from the ROM chain at boot with nothing on any
-  disc.  Its writable state lives in a 168-byte struct claimed from
+  disc, and the fills reach the host from there.  But **it never sees
+  a sprite plot**: something later in the boot claims `SpriteV` in
+  front of it and answers the plots itself.  Killing DitherExtend,
+  GSpriteExtend, SpecialFX, GDraw, ArtworksRenderer, StrongTask,
+  Fat32fs and NetTime in turn changed nothing, so the claimant is
+  none of those; `*RMReInit GVFill` puts it back in front and the
+  plots reach it.  A module's place on a vector is set by when it
+  initialises, and the ROM is the earliest place there is — which is
+  why the share's `$.Modules` is where GVFill belongs.
+
+  Its writable state lives in a 172-byte struct claimed from
   the RMA at init (the `-zM` shape, in assembly: nothing in the module
   image is ever written, which is what makes read-only ROM safe), and
   the private word carries the struct's address to every entry point.

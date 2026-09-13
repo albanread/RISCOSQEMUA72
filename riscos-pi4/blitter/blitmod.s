@@ -74,6 +74,7 @@
     .equ    ModClaim,              6
     .equ    ModFree,               7
     .equ    Service_ModeChange,    0x46
+    .equ    Service_SwitchingOutputToSprite, 0x72
 
 @ ---- the workspace: one struct claimed from the RMA, reached through
 @ the private word -- the -zM shape the DDE gives C modules, written in
@@ -81,7 +82,8 @@
 @ build, so the image can live in read-only ROM.  The RMA is not
 @ guaranteed zeroed, so init zeroes the struct and then sets the one
 @ word that starts non-zero (the mode-constants cache is stale until
-@ first use).
+@ first use).  The offscreen flag also starts 0 -- a module initialises
+@ with output on the screen, and every switch after that is heard.
     .equ    WS_BLITLOG,     0       @ device logical address, 0 if absent
     .equ    WS_OBS,         4       @ FillRectangle count
     .equ    WS_VDUVALS,     8       @ 4 words: line, log2bpp, xwind, ywind
@@ -101,7 +103,8 @@
     .equ    WS_SV_LASTAREA, 112
     .equ    WS_SV_VDUVALS,  116     @ 6 mode constants, 6 window vars
     .equ    WS_SV_MODESTALE,164
-    .equ    WS_END,         168
+    .equ    WS_SV_OFFSCREEN,168     @ output switched to a sprite: nonzero
+    .equ    WS_END,         172
 
     .equ    BENCH_W,      512             @ pixels, one word each
     .equ    BENCH_H,      512
@@ -128,7 +131,7 @@ base:
 title:
     .asciz  "GVFill"
 help:
-    .asciz  "GVFill\t1.02 (12 Sep 2026) ROM-safe: fill and sprite plot, 8/16/32bpp"
+    .asciz  "GVFill\t1.03 (13 Sep 2026) fill and sprite plot, 8/16/32bpp, cache keyed to the screen"
     .balign 4
 modflags:
     .word   1                       @ 32-bit compatible
@@ -536,6 +539,15 @@ sv_handler:
     ADD     r8, r8, #1
     STR     r8, [r12, #WS_SV_N52]
 
+    @ While output is switched to a sprite, OS_ReadVduVariables answers
+    @ with that sprite's geometry and the plot belongs in the sprite, so
+    @ it is SpriteExtend's: pass until the switch back to the screen,
+    @ which sv_service records (a plot taken here would land on the
+    @ framebuffer at coordinates worked out from the sprite's window).
+    LDR     r9, [r12, #WS_SV_OFFSCREEN]
+    TEQ     r9, #0
+    BNE     sv_pass
+
     @ The case worth taking: the sprite pointed at rather than named,
     @ unmasked, already the screen's depth, whole words edge to edge,
     @ plain store, and not really scaling.  A pixel translation table is
@@ -569,7 +581,7 @@ sv_scaled_ok:
     @ Five of these are mode constants and six are not: the graphics
     @ window and origin are set per redraw rectangle, so the Wimp
     @ changes them between one plot and the next.  Read the constants
-    @ only when the mode has changed under us.
+    @ only when the mode or the output has changed under us.
     LDR     r9, [r12, #WS_SV_MODESTALE]
     TEQ     r9, #0
     BEQ     sv_haveconst
@@ -630,11 +642,11 @@ sv_nopal:
     @ OS units to pixels, and the bottom-left origin to the top-left one
     @ the device works in.
     LDR     r8, [r1, #0]            @ XEigFactor
-    LDR     r9, [r1, #36]           @ OrgX
+    LDR     r9, [r1, #40]           @ OrgX
     ADD     r3, r3, r9
     MOV     r3, r3, ASR r8          @ left edge in pixels
     LDR     r8, [r1, #4]            @ YEigFactor
-    LDR     r9, [r1, #40]           @ OrgY
+    LDR     r9, [r1, #44]           @ OrgY
     ADD     r4, r4, r9
     MOV     r4, r4, ASR r8          @ bottom edge, bottom origin
 
@@ -684,7 +696,9 @@ sv_nopal:
     STR     r11, [r10, #BLIT_CLIPX0] @ the window vars start at +24)
     LDR     r11, [r1, #32]          @ GWRCol
     STR     r11, [r10, #BLIT_CLIPX1]
-    SUB     r8, r7, #1              @ yres - 1
+    SUB     r8, r8, #1              @ yres - 1: r8 is the screen's rows,
+                                    @ not the sprite's (r7) -- the clip
+                                    @ bottom must come from the screen
     LDR     r11, [r1, #36]          @ GWTRow
     SUB     r11, r8, r11
     STR     r11, [r10, #BLIT_CLIPY0]
@@ -760,14 +774,24 @@ sv_hit:
 sv_out:
     LDMFD   sp!, {r0-r11, pc}
 
-@ Service handler: the only thing worth hearing is that the mode
-@ changed, which makes the cached constants stale.  Registers are left
-@ exactly as they came in and the call is never claimed.
+@ Service handler.  Neither call is ever claimed, and every register is
+@ left exactly as it came in.  Service_ModeChange means the cached
+@ constants are stale.  Service_SwitchingOutputToSprite is issued after
+@ every output switch -- to a sprite, to a sprite mask, back to the
+@ screen, and on a mode change too -- with R4 holding the R2 the
+@ OS_SpriteOp was called with: the sprite output now goes to, or 0 for
+@ the screen.  A boot's first plots go into a sprite, and the constants
+@ of whichever sprite is then current are not the screen's -- caching
+@ them once left every later plot failing the depth gate, so both the
+@ cache and the is-this-the-screen flag follow every switch.
 sv_service:
     TEQ     r1, #Service_ModeChange
+    TEQNE   r1, #Service_SwitchingOutputToSprite
     MOVNE   pc, lr
     STMFD   sp!, {r0, r2, r12}
     LDR     r12, [r12]
+    TEQ     r1, #Service_SwitchingOutputToSprite
+    STREQ   r4, [r12, #WS_SV_OFFSCREEN]
     MOV     r2, #1
     STR     r2, [r12, #WS_SV_MODESTALE]
     LDMFD   sp!, {r0, r2, r12}
