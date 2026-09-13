@@ -876,6 +876,35 @@ static char *guest_leaf_of(const char *host_leaf, bool is_dir, uint32_t *type)
     return out;
 }
 
+/*
+ * One catalogue entry, collected so a whole directory can be sorted before
+ * it is paged to the guest (VMCH_CMD_CAT).  The name is the guest leaf --
+ * what the user sees and what FileCore would sort by.
+ */
+typedef struct {
+    char    *leaf;
+    uint32_t type, size, attrs, load, exec;
+} caten;
+
+static void caten_free(gpointer p)
+{
+    caten *e = p;
+
+    g_free(e->leaf);
+    g_free(e);
+}
+
+/* Case-insensitive on the guest leafname, the order FileCore keeps and a
+ * deterministic function of the directory, so the guest's page index means
+ * the same on every CAT call for it. */
+static gint caten_cmp(gconstpointer a, gconstpointer b)
+{
+    const caten *x = *(const caten * const *)a;
+    const caten *y = *(const caten * const *)b;
+
+    return g_ascii_strcasecmp(x->leaf, y->leaf);
+}
+
 /* A host leafname without its `,xxx` type suffix, if it has one. */
 static char *host_base_of(const char *host_leaf)
 {
@@ -1310,17 +1339,35 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 g_error_free(gerr);
             }
         } else {
+            /*
+             * The whole directory, sorted, one page at a time.  HANDLE in
+             * carries the continuation index -- how many sorted entries to
+             * skip -- and HANDLE out says whether any remain (issue #8: a
+             * directory over 63 entries, one page, used to stop here with
+             * "directory too big").  The order is the guest leafname folded
+             * case-insensitively, as FileCore keeps a catalogue, so a share
+             * lists like a real disc and the page index is stable from call
+             * to call (issue #4).
+             */
+            uint32_t start = ld32(base + VMCH_HDR_HANDLE);
+            GPtrArray *ents = g_ptr_array_new_with_free_func(caten_free);
+            uint32_t total, i, packed = 0;
+
             while ((name = g_dir_read_name(dir)) != NULL) {
                 char *one = g_build_filename(hp, name, NULL);
                 GStatBuf st = { 0 };
-                uint32_t type = 0xFFF, size = 0, attrs = 3;
+                uint32_t type = 0xFFF;
                 bool isdir = false;
+                caten *e;
                 char *leaf;
 
+                e = g_new0(caten, 1);
                 if (g_stat(one, &st) == 0) {
                     isdir = S_ISDIR(st.st_mode);
-                    size = (uint32_t)st.st_size;
-                    attrs = attrs_for(&st);
+                    e->size = (uint32_t)st.st_size;
+                    e->attrs = attrs_for(&st);
+                } else {
+                    e->attrs = 3;
                 }
                 g_free(one);
                 /* The guest is shown the mapped name, not the host one:
@@ -1330,36 +1377,45 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 leaf = guest_leaf_of(name, isdir, &type);
                 if (strlen(leaf) >= VMCH_MAX_NAME) {
                     g_free(leaf);
+                    g_free(e);
                     continue;
                 }
-                if (used + 64 > limit) {
-                    g_free(leaf);
-                    rc = vmch_answer(VMCH_RC_FULL);      /* more entries than fit */
-                    break;
-                }
-                memset(resp + used, 0, 64);
-                memcpy(resp + used, leaf, strlen(leaf));
-                /* Dated here, in the entry: a catalogue that carried only
-                 * the type made every file in a *Ex listing show
-                 * 01-Jan-1900, because the only other source of a date is
-                 * a FILEARGS per name. */
-                {
-                    uint32_t load, exec;
-                    load_exec_for(type, date_cs_for(&st), &load, &exec);
-                    stl_le_p(resp + used + 40, load);
-                    stl_le_p(resp + used + 44, exec);
-                }
-                stl_le_p(resp + used + 48, type);
-                stl_le_p(resp + used + 52, size);
-                stl_le_p(resp + used + 56, attrs);
-                used += 64;
-                g_free(leaf);
+                e->leaf = leaf;
+                e->type = type;
+                /* Dated in the entry: a catalogue that carried only the
+                 * type made every file in a *Ex listing show 01-Jan-1900,
+                 * the only other date source being a FILEARGS per name. */
+                load_exec_for(type, date_cs_for(&st), &e->load, &e->exec);
+                g_ptr_array_add(ents, e);
             }
             g_dir_close(dir);
+            g_ptr_array_sort(ents, caten_cmp);
+
+            total = ents->len;
+            for (i = start; i < total; i++) {
+                caten *e = g_ptr_array_index(ents, i);
+
+                if (used + 64 > limit) {
+                    break;                          /* this page is full */
+                }
+                memset(resp + used, 0, 64);
+                memcpy(resp + used, e->leaf, strlen(e->leaf));
+                stl_le_p(resp + used + 40, e->load);
+                stl_le_p(resp + used + 44, e->exec);
+                stl_le_p(resp + used + 48, e->type);
+                stl_le_p(resp + used + 52, e->size);
+                stl_le_p(resp + used + 56, e->attrs);
+                used += 64;
+                packed++;
+            }
+            /* HANDLE out: any entries left after this page (the guest pages
+             * on until it is 0), not an error. */
+            st32(base + VMCH_HDR_HANDLE, (start + packed < total) ? 1 : 0);
             if (used) {
                 block_write(base + VMCH_HDR_SIZE, resp, used);
             }
             st32(base + VMCH_HDR_ARGLEN, used);
+            g_ptr_array_free(ents, TRUE);
         }
         g_free(hp);
         g_free(path);

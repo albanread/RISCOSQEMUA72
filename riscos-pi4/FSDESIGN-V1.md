@@ -1292,14 +1292,25 @@ file saved from the guest reads an hour old on a Mac in BST. RISC OS
 datestamps are UTC by definition; the right fix is UTC on the wire and the
 zone configured in the guest, not a different offset in the host.
 
-Directory order, found 13 Sep: HostFS lists a directory in the host's
-order — on APFS a hash order, not alphabetical — where FileCore keeps a
-catalogue sorted. `*Cat` shows it, and it reaches the boot: `!Boot`'s
-`BootRun` walks `PreDesk` with an unsorted `*Repeat`, as `Desktop` walks
-`Tasks`, so a share runs them in a different order from the card it was
-copied from. Nothing has broken on it yet. Sorting the listing in
-`VMCH_CMD_CAT`, case-insensitively as FileCore does, would make every
-enumeration match a real disc; `HostModules` uses `*Repeat -Sort` meanwhile.
+Directory order (issue #4), **fixed 13 Sep**: HostFS listed a directory in
+the host's order — on APFS a hash order, not alphabetical — where FileCore
+keeps a catalogue sorted, so a share ran `!Boot`'s `PreDesk` and `Tasks`
+(both walked with an unsorted `*Repeat`) in a different order from the card
+it was copied from. `VMCH_CMD_CAT` now sorts the whole directory by the
+guest leafname, folded case-insensitively as FileCore does, before it
+pages it out (§8), so every enumeration matches a real disc and the page
+index is a stable function of the directory. `HostModules`'s `*Repeat
+-Sort` is no longer load-bearing, though it does no harm.
+
+Directory size (issue #8), **fixed 13 Sep**: a listing came back in a
+single `VMCH_CMD_CAT` reply, one 4 KiB page, so a directory over 63 entries
+overflowed it and the module reported "directory too big" — `Python`'s
+`lib/python2.7` (334 entries) could not be listed, and `*Count` could not
+check a large copy. CAT now pages: `HANDLE` in is the continuation index,
+`HANDLE` out says whether more remain, and the module (`FSEntry_Func`
+14/15/19) walks the pages into FileSwitch's buffer. Verified: a 200-entry
+directory and the whole `Programming` tree (3,126 files, the 334-entry dir
+among them) list and `*Count` on both sides.
 
 ### The measurement that went with sprint 1
 

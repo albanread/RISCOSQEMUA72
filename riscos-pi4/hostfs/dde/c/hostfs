@@ -1303,22 +1303,28 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
          * moment info-word bit 23 was set.  19 is what OS_GBPB 11 reaches.
          */
         uint32_t reason = (uint32_t)r->r[0];
+        uint32_t more;
 
         off = (uint32_t)r->r[4];
         want = (uint32_t)r->r[3];
         buf = (uint8_t *)r->r[2];
         buflen = (uint32_t)r->r[5];
 
-        /* catalogue the whole directory into the cache */
+        /* One page of the directory, from the continuation index `off`.
+         * The host sorts the whole directory and returns as many entries
+         * from `off` as fit in one reply, and says in the handle whether
+         * more remain: a directory over 63 entries used to overflow the
+         * single reply and come back "directory too big" (issue #8). */
         req->cmd = C_CAT;
-        req->handle = 0;
+        req->handle = off;
         put_path(ws, (const char *)r->r[1]);
         rc = vmch_go(ws);
         if (rc != RC_OK) {
             return rc_to_error(ws, rc);
         }
+        more = req->handle;            /* entries left after this page */
         nbytes = vmch_arglen(ws);
-        n = nbytes >> 6;                /* 64-byte entries */
+        n = nbytes >> 6;                /* 64-byte entries in this page */
         if (n > 128) {
             n = 128;
         }
@@ -1347,11 +1353,14 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
             e->name[39] = 0;
         }
 
-        /* fill the caller's buffer from the continuation offset, never
-         * overflowing it and counting only records written whole */
+        /* Fill the caller's buffer from this page, never overflowing it and
+         * counting only whole records.  `li` walks the page; the absolute
+         * index the guest continues from is off + li. */
         done = 0;
-        while (off < n && done < want) {
-            struct catent *e = &catents[off];
+        {
+        uint32_t li = 0;
+        while (li < n && done < want) {
+            struct catent *e = &catents[li];
 
             namelen = 0;
             while (e->name[namelen]) {
@@ -1410,11 +1419,16 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
             }
             buf += entlen;
             buflen -= entlen;
-            off++;
+            li++;
             done++;
         }
         r->r[3] = (int)done;
-        r->r[4] = (off >= n) ? -1 : (int)off;
+        if (li < n) {
+            r->r[4] = (int)(off + li);      /* stopped mid-page: resume here */
+        } else {
+            r->r[4] = more ? (int)(off + n) : -1;   /* page done; more? */
+        }
+        }
         return NULL;
     }
 
