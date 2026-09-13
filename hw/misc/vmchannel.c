@@ -409,12 +409,28 @@ static char *escape_host_leaf(const char *ideal)
 {
     size_t len = strlen(ideal);
     size_t i = 0, end = len;
+    size_t comma_suffix = (size_t)-1;
     gunichar trail = 0;
     GString *out = g_string_sized_new(len + 8);
 
     if (end > 0 && (ideal[end - 1] == '.' || ideal[end - 1] == ' ')) {
         trail = (unsigned char)ideal[end - 1];      /* Windows drops these */
         end--;
+    }
+    /*
+     * A leaf that itself ends in `,` and three hex digits collides with the
+     * host's typed-file convention: guest_leaf_of() reads `a,ffb` back as
+     * `a` of type &FFB, so a file the guest actually named "a,ffb" could be
+     * written but never reopened by that name (issue #17).  Escape that one
+     * comma into the private-use area like any other unstorable character;
+     * guest_name_of() restores it, and the real type suffix host_leaf_for()
+     * appends afterwards is untouched (it is added past this point).
+     */
+    if (end >= 4 && ideal[end - 4] == ','
+        && g_ascii_isxdigit(ideal[end - 3])
+        && g_ascii_isxdigit(ideal[end - 2])
+        && g_ascii_isxdigit(ideal[end - 1])) {
+        comma_suffix = end - 4;
     }
     if (win32_reserved(ideal, end)) {
         g_string_append_unichar(out, 0xF000 + (unsigned char)ideal[0]);
@@ -423,7 +439,8 @@ static char *escape_host_leaf(const char *ideal)
     for (; i < end; i++) {
         unsigned char c = (unsigned char)ideal[i];
 
-        if (c == '<' || c == '>' || c == '"' || c == '|'
+        if (i == comma_suffix
+            || c == '<' || c == '>' || c == '"' || c == '|'
             || c == '?' || c == '*') {
             g_string_append_unichar(out, 0xF000 + c);
         } else {
@@ -574,6 +591,47 @@ static char *resolve_leaf(const char *dir, const char *want)
     return cand;
 }
 
+/*
+ * True if `path` resolves to somewhere inside `root`.  Symlinks are
+ * resolved by realpath.  A path whose final component does not exist yet --
+ * what a create, mkdir or rename target looks like -- has no realpath of
+ * its own, so the deepest ancestor that does exist is checked instead: a
+ * parent directory that is a symlink out of the share is then caught, which
+ * a realpath of the final object alone missed (issue #20).  `root` itself
+ * always exists, so the walk upward terminates.
+ */
+static bool within_root(const char *path, const char *root)
+{
+    char *rootreal = realpath(root, NULL);
+    char *cur = g_strdup(path);
+    bool ok = false;
+
+    if (rootreal) {
+        size_t rl = strlen(rootreal);
+
+        for (;;) {
+            char *real = realpath(cur, NULL);
+            char *slash;
+
+            if (real) {
+                ok = strncmp(real, rootreal, rl) == 0
+                     && (real[rl] == '\0' || real[rl] == G_DIR_SEPARATOR);
+                free(real);
+                break;
+            }
+            /* Not there: step up and vouch for the parent instead. */
+            slash = strrchr(cur, G_DIR_SEPARATOR);
+            if (!slash || slash == cur) {
+                break;              /* nothing left to check: refuse */
+            }
+            *slash = '\0';
+        }
+    }
+    free(rootreal);
+    g_free(cur);
+    return ok;
+}
+
 static char *host_path(VMChannelState *s, const char *guest, int *rc)
 {
     size_t len = strlen(guest);
@@ -655,26 +713,18 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
 
     /*
      * Whatever the components said, the answer must still be inside the
-     * share: resolve it and check the prefix, so a symlink pointing out
-     * is refused like any other escape.
+     * share.  within_root() resolves symlinks and, for a leaf that does not
+     * exist yet (a create, mkdir or rename target), checks the deepest
+     * ancestor that does -- so a parent directory that is a symlink out of
+     * the share is refused before anything is written through it, not only
+     * a symlink that is read through (issue #20).  The share root is the
+     * only security perimeter, so create, mkdir and rename must honour it
+     * just as OPEN and OS_File 10 already did.
      */
-    {
-        char *real = realpath(cur, NULL);
-        char *rootreal = realpath(s->root, NULL);
-        bool ok = true;
-
-        if (real && rootreal) {
-            size_t rl = strlen(rootreal);
-            ok = strncmp(real, rootreal, rl) == 0 &&
-                 (real[rl] == '\0' || real[rl] == G_DIR_SEPARATOR);
-        }
-        free(real);
-        free(rootreal);
-        if (!ok) {
-            g_free(cur);
-            *rc = vmch_answer(VMCH_RC_BADPATH);
-            return NULL;
-        }
+    if (!within_root(cur, s->root)) {
+        g_free(cur);
+        *rc = vmch_answer(VMCH_RC_BADPATH);
+        return NULL;
     }
     return cur;
 }
@@ -896,13 +946,29 @@ static void caten_free(gpointer p)
 
 /* Case-insensitive on the guest leafname, the order FileCore keeps and a
  * deterministic function of the directory, so the guest's page index means
- * the same on every CAT call for it. */
+ * the same on every CAT call for it.
+ *
+ * FileCore folds to UPPER case, not lower: the characters between 'Z' (&5A)
+ * and 'a' (&61) -- '[ \ ] ^ _ `' -- sort after the letters, not before, so a
+ * name like `_under` lists last.  g_ascii_strcasecmp folds to lower, which
+ * ordered it first and disagreed with a real disc (issue #21); fold each
+ * byte to upper by hand to match. */
 static gint caten_cmp(gconstpointer a, gconstpointer b)
 {
     const caten *x = *(const caten * const *)a;
     const caten *y = *(const caten * const *)b;
+    const unsigned char *p = (const unsigned char *)x->leaf;
+    const unsigned char *q = (const unsigned char *)y->leaf;
 
-    return g_ascii_strcasecmp(x->leaf, y->leaf);
+    for (; *p && *q; p++, q++) {
+        int cp = g_ascii_toupper(*p);
+        int cq = g_ascii_toupper(*q);
+
+        if (cp != cq) {
+            return cp - cq;
+        }
+    }
+    return (int)*p - (int)*q;
 }
 
 /* A host leafname without its `,xxx` type suffix, if it has one. */
@@ -1015,8 +1081,19 @@ static uint64_t date_cs_for(const GStatBuf *st)
      * from the host (VMCH_CMD_TIME, UTC) it was an hour wrong each way in
      * summer time: an object cc wrote at 12:23 UTC reached the host as
      * 12:23 BST, and amu saw it as older than a source edited since.
+     *
+     * st_mtime is signed and can be negative -- a date between 1900 and
+     * 1970, which RISC OS keeps (issue #14).  The offset must be added as
+     * signed, or a negative mtime casts to a huge unsigned value; the sum
+     * is >= 0 for any instant at or after 1900, so it is safe to make it
+     * unsigned then.  Before 1900 is unrepresentable, so clamp to 1900.
      */
-    return ((uint64_t)st->st_mtime + 2208988800ULL) * 100;
+    int64_t secs = (int64_t)st->st_mtime + 2208988800LL;
+
+    if (secs < 0) {
+        secs = 0;
+    }
+    return (uint64_t)secs * 100;
 }
 
 /* Development trace to a file: stderr proved unreliable under the
@@ -1696,8 +1773,22 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 g_autofree char *leaf = g_path_get_basename(hp);
                 g_autofree char *stem = host_base_of(leaf);
                 g_autofree char *want = host_leaf_for(stem, type);
+                g_autofree char *dest = g_build_filename(dir, want, NULL);
+
+                /* The name resolved to an existing host file spelt for
+                 * another type (say `f,ff9`), but this type wants a
+                 * different host spelling (`f,ffd`).  Creating the new one
+                 * would leave the old beside it -- two host files for the
+                 * one RISC OS leaf, and *Load could pick the stale one
+                 * (issue #18).  Remove the old spelling first, so one RISC
+                 * OS name is always one host file. */
+                if (strcmp(dest, hp) != 0
+                    && g_file_test(hp, G_FILE_TEST_EXISTS)
+                    && !g_file_test(hp, G_FILE_TEST_IS_DIR)) {
+                    g_unlink(hp);
+                }
                 g_free(hp);
-                hp = g_build_filename(dir, want, NULL);
+                hp = g_steal_pointer(&dest);
             }
             fd = g_open(hp, O_WRONLY | O_CREAT | O_BINARY | O_TRUNC, 0644);
             if (fd < 0) {
@@ -1818,10 +1909,19 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                  * be read as a date. */
                 if (type != 0xFFFFFFFFu) {
                     cs = ((uint64_t)(load & 0xFF) << 32) | exec;
-                    if (cs > 2208988800ULL * 100) {
+                    /*
+                     * A negative time_t is a date before 1970: legal RISC
+                     * OS (its epoch is 1900) and kept by FileCore, but the
+                     * old `> 1970` guard silently dropped every such stamp,
+                     * so a 1965 date read back as "now" (issue #14).  Only
+                     * an all-zero instant means "no datestamp"; leave that
+                     * alone and apply everything else, signed.
+                     */
+                    if (cs != 0) {
                         struct utimbuf ut;
 
-                        ut.actime = (time_t)(cs / 100 - 2208988800ULL);
+                        ut.actime = (time_t)((int64_t)(cs / 100)
+                                             - 2208988800LL);
                         ut.modtime = ut.actime;
                         (void)g_utime(hp, &ut);
                     }
