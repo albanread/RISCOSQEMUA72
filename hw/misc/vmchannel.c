@@ -1004,23 +1004,19 @@ static uint64_t date_cs_for(const GStatBuf *st)
      * Centiseconds since 1900, the RISC OS 5-byte instant: must stay
      * 64-bit, the value is ~3.9e11 for 2026 dates.
      *
-     * RISC OS keeps local time in a filestamp — there is no zone in the
-     * stamp for the desktop to apply — so the host's UTC offset is added
-     * here.  Without it every file read an hour early under BST, which is
-     * wrong in a way that is easy to miss and annoying to debug later.
-     * g_date_time rather than tm_gmtoff, which the Windows build of this
-     * device does not have; the offset is in microseconds and includes
-     * whatever DST was in force on that date, not today's.
+     * UTC, as the host's mtime is, with no offset either way.  A RISC OS
+     * 5-byte time is UTC (PRM: Territory_ConvertDateAndTime "converts a 5
+     * byte UTC time"); the system clock is UTC and FileSwitch stamps files
+     * from it; the Territory applies the time zone when a date is shown.
+     *
+     * This used to add the host's UTC offset, treating a stamp as local
+     * wall-clock time, which read right on a desktop whose clock was
+     * nobody's and whose zone was unset.  Once HostFS 2.03 set the clock
+     * from the host (VMCH_CMD_TIME, UTC) it was an hour wrong each way in
+     * summer time: an object cc wrote at 12:23 UTC reached the host as
+     * 12:23 BST, and amu saw it as older than a source edited since.
      */
-    gint64 secs = (gint64)st->st_mtime;
-    GDateTime *dt = g_date_time_new_from_unix_local(secs);
-    gint64 off = 0;
-
-    if (dt) {
-        off = g_date_time_get_utc_offset(dt) / G_TIME_SPAN_SECOND;
-        g_date_time_unref(dt);
-    }
-    return (uint64_t)(secs + off + 2208988800LL) * 100;
+    return ((uint64_t)st->st_mtime + 2208988800ULL) * 100;
 }
 
 /* Development trace to a file: stderr proved unreliable under the
@@ -1816,27 +1812,18 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     }
                 }
 
-                /* The 5-byte instant back to a host time.  Only when it
-                 * looks like one: an untyped file's load/exec are real
-                 * addresses and must not be read as a date. */
+                /* The 5-byte instant back to a host time: UTC to UTC, the
+                 * inverse of date_cs_for.  Only when it looks like one: an
+                 * untyped file's load/exec are real addresses and must not
+                 * be read as a date. */
                 if (type != 0xFFFFFFFFu) {
                     cs = ((uint64_t)(load & 0xFF) << 32) | exec;
                     if (cs > 2208988800ULL * 100) {
-                        gint64 secs = (gint64)(cs / 100) - 2208988800LL;
-                        GDateTime *dt = g_date_time_new_from_unix_local(secs);
+                        struct utimbuf ut;
 
-                        if (dt) {
-                            secs -= g_date_time_get_utc_offset(dt)
-                                    / G_TIME_SPAN_SECOND;
-                            g_date_time_unref(dt);
-                        }
-                        {
-                            struct utimbuf ut;
-
-                            ut.actime = (time_t)secs;
-                            ut.modtime = (time_t)secs;
-                            (void)g_utime(hp, &ut);
-                        }
+                        ut.actime = (time_t)(cs / 100 - 2208988800ULL);
+                        ut.modtime = ut.actime;
+                        (void)g_utime(hp, &ut);
                     }
                 }
             }

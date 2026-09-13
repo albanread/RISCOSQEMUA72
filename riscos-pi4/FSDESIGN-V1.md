@@ -1286,11 +1286,23 @@ workload says otherwise.
 Errors on a registered filing system error base (§9) and a real FS number
 from ROOL before anything ships outside the team; `readonly=` (§10);
 several shares selected by disc name; wildcards in `FSEntry_File` 1–4;
-64-bit free space (Func 35/36); and time zones — the guest's clock is UTC
-with no zone configured while the host maps datestamps as local time, so a
-file saved from the guest reads an hour old on a Mac in BST. RISC OS
-datestamps are UTC by definition; the right fix is UTC on the wire and the
-zone configured in the guest, not a different offset in the host.
+64-bit free space (Func 35/36); and the guest's time zone, which is still
+unconfigured, so the desktop shows dates in UTC rather than the host's local
+time (a territory setting in the guest; see below).
+
+Datestamps and the clock, **fixed 13 Sep**: the host mapped datestamps as
+local time — adding the host's UTC offset to an mtime read, taking it off a
+stamp written — while a RISC OS 5-byte time is UTC by definition. With no
+real clock in the guest that went unseen; a machine without a network
+started at 1 January 1970, and `cc`'s objects reached the Mac dated 2
+January 1970. Now HostFS 2.03 sets the clock from the host at start-up
+(`VMCH_CMD_TIME`, host UTC, written with `OS_Word 15,5`; `*HostFSTime` again
+on demand), and the device is UTC both ways, as this section said it should
+be. Verified on the Mac with the host in BST: a host file dated 09:00:00 UTC
+reads 09:00:00 in the guest; a file created in the guest is dated now on the
+host; a guest `*Copy` keeps a date to the second; `cc`'s object and image come
+out newer than a source edited on the host a moment before, which is what
+`amu` needs. The guest clock is within 2 s of the host on eight machines.
 
 Directory order (issue #4), **fixed 13 Sep**: HostFS listed a directory in
 the host's order — on APFS a hash order, not alphabetical — where FileCore
