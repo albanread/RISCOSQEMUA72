@@ -1324,6 +1324,44 @@ check a large copy. CAT now pages: `HANDLE` in is the continuation index,
 directory and the whole `Programming` tree (3,126 files, the 334-entry dir
 among them) list and `*Count` on both sides.
 
+The reference-suite pass (issues #12–#21), **HostFS 2.04, 13 Sep**: the
+`bigmacfarm` HostFS suite runs each test against RAMFS (FileCore, the
+reference) and HostFS and reports the disagreements. Ten were fixed, host
+(`hw/misc/vmchannel.c`) and, where the wire contract or the guest's own
+tables had to move, the module (`dde/c/hostfs`) together:
+
+- **#21** catalogue order folded to **upper** case, as FileCore does, so
+  `_` (&5F) falls after `Z`; **#14** the 5-byte datestamp converts through
+  a *signed* `time_t` both ways, so dates before 1970 keep (a 1965 stamp no
+  longer reads as "now"); **#17** a leafname that itself ends in `,` and
+  three hex digits (`a,ffb`) has that comma escaped into the private-use
+  area, so it is not read back as a type suffix and the file can be saved
+  and reopened; **#18** a save of a new type over an existing file removes
+  the old type's host spelling, so one RISC OS name is one host file;
+  **#20 (security)** containment now resolves the deepest *existing*
+  ancestor, so a create, mkdir or rename through a symlink that leaves the
+  share is refused, not only a symlink read through.
+- **#13** a directory is signalled on the wire by an out-of-band type
+  (`VMCH_TYPE_DIR`, &1000), freeing filetype **&000** to be a real file
+  type (`name,000`) instead of reading back as a directory; **#15** the
+  module forwards R4 so the device can `ftruncate` a `*Create`/`OS_File 11`
+  to the length asked for; **#16** the CAT wire entry is metadata-first
+  with a 256-byte name field, so leafnames of 40 characters or more no
+  longer vanish from listings (the host reports the entry count in a header
+  word so the module needs no runtime divide); **#12** the whole attribute
+  byte is kept host-side (an `xattr`; the sidecar of §6.3/§7 is the
+  portable alternative), so every bit round-trips and a locked object is
+  refused delete, rename and open-for-write with &C3; **#19** the device
+  tracks open host paths, refusing delete, rename and a second write-open
+  of an open file with &C2, and the open-file limit rises from 16 to 255.
+
+Verified in-guest on a HostFS 2.03 share: per-issue BASIC reproducing each
+suite case (attributes round-trip &00/&02/&0B/&13/&33; locked and open
+objects refuse the right operations and accept them once unlocked/closed;
+30 files open at once; 200-character leafnames list; a type-&000 file reads
+as a file of type &000; a symlink out of the share is refused for
+create/mkdir/rename). The farm's own suite re-run is the acceptance gate.
+
 ### The measurement that went with sprint 1
 
 `VMCH_TRACE` a 256 KiB read from BASIC and count `cmd=` lines. Done:
