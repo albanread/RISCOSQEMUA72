@@ -67,7 +67,6 @@ def command_line(args, overlay):
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", args.kernel,
         "-device", f"loader,file={args.cmos},addr=0x510000,force-raw=on",
-        "-drive", f"file={overlay},if=sd,format=qcow2",
         "-netdev", "user,id=n0",
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
@@ -82,6 +81,10 @@ def command_line(args, overlay):
         "-serial", "null",
         "-qmp", "tcp:127.0.0.1:4461,server,nowait",
     ]
+    # No card at all is a real configuration now, not a broken one: a share
+    # can hold !Boot and the DDE and be the whole machine.
+    if overlay:
+        argv += ["-drive", f"file={overlay},if=sd,format=qcow2"]
     if args.snapshot:
         argv += ["-loadvm", args.snapshot]
     if args.hostfs:
@@ -207,6 +210,10 @@ def main():
     ap.add_argument("--modules", nargs="*", default=[], metavar="FILE",
                     help="further modules spliced into the ROM before "
                          "boot, in initialisation order")
+    ap.add_argument("--no-card", action="store_true",
+                    help="attach no SD card at all: the share is the whole "
+                         "machine (needs --hostfs, and --boot hostfs to "
+                         "have anything to boot)")
     args = ap.parse_args()
 
     # A snapshot restores RAM, and the ROM lives in RAM: -kernel is loaded
@@ -232,8 +239,14 @@ def main():
     except rom.RomError as exc:
         raise SystemExit(str(exc))
 
-    overlay = overlay_for(args.image)
-    ensure_overlay(args.qemu_img, args.image, overlay)
+    if args.no_card:
+        if not args.hostfs:
+            raise SystemExit("--no-card leaves nothing to run: give "
+                             "--hostfs a share to be the machine")
+        overlay = None
+    else:
+        overlay = overlay_for(args.image)
+        ensure_overlay(args.qemu_img, args.image, overlay)
 
     argv = command_line(args, overlay)
     print(" ".join(argv), flush=True)

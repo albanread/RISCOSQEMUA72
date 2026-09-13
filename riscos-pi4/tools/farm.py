@@ -210,16 +210,15 @@ def create(args):
 # ---------------------------------------------------------------------- up
 
 
-def command_line(name, port, display, audiodev, kernel, cmos):
+def command_line(name, port, display, audiodev, kernel, cmos, card=True):
     p = paths(name)
-    return [
+    argv = [
         QEMU,
         "-name", f"riscos-{name}",
         "-M", "raspi4b",
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", kernel,
         "-device", f"loader,file={cmos},addr=0x510000,force-raw=on",
-        "-drive", f"file={p['overlay']},if=sd,format=qcow2",
         "-netdev", "user,id=n0",
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
@@ -235,6 +234,11 @@ def command_line(name, port, display, audiodev, kernel, cmos):
         "-qmp", f"tcp:127.0.0.1:{port},server,nowait",
         "-global", f"bcm2838-peripherals.vmchannel-root={p['share']}",
     ]
+    # No card at all: the share is the whole machine.  It needs to hold a
+    # !Boot for that to mean anything -- see tools/README.md.
+    if card:
+        argv += ["-drive", f"file={p['overlay']},if=sd,format=qcow2"]
+    return argv
 
 
 def up(args):
@@ -244,7 +248,7 @@ def up(args):
         port = port_of(name)
         p = paths(name)
 
-        if not os.path.exists(p["overlay"]):
+        if not args.no_card and not os.path.exists(p["overlay"]):
             print(f"{name:<8} no overlay; run: farm.py create")
             failures += 1
             continue
@@ -275,7 +279,7 @@ def up(args):
             continue
 
         argv = command_line(name, port, args.display, args.audiodev,
-                            kernel, cmos)
+                            kernel, cmos, card=not args.no_card)
         log = open(p["log"], "ab", buffering=0)
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"{' '.join(argv)}\n".encode())
@@ -449,6 +453,9 @@ def main():
     p_up.add_argument("--modules", nargs="*", default=[], metavar="FILE",
                       help="further modules spliced into the ROM, in "
                            "initialisation order")
+    p_up.add_argument("--no-card", action="store_true",
+                      help="attach no SD card: the instance's share is the "
+                           "whole machine (it must hold a !Boot)")
     p_up.set_defaults(func=up)
 
     for cmd, fn in (("down", down), ("reset", reset), ("shot", shot)):
