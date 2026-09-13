@@ -111,6 +111,7 @@
 #define VMCH_RC_BADCMD    9
 #define VMCH_RC_IOERR    10
 #define VMCH_RC_BADADDR  11   /* a guest address would not translate */
+#define VMCH_RC_NOTEMPTY 12   /* a directory that still holds something */
 
 /* OPEN: header word at +12 (before handle is filled) is the flags */
 #define VMCH_OPEN_READ    0x1

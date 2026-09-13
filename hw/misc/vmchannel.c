@@ -65,6 +65,10 @@ static ssize_t vmch_pwrite(int fd, const void *buf, size_t len, off_t off)
 #define pwrite(fd, buf, len, off) vmch_pwrite((fd), (buf), (len), (off))
 #endif
 
+/* The most of a GetBytes or PutBytes the host buffers at once; a longer
+ * transfer goes through in pieces of this size, still one doorbell. */
+#define VMCH_XFER_PIECE (16u * 1024 * 1024)
+
 /* ------------------------------------------------------------------ */
 /* Guest RAM access: physical, little-endian, through the system AS   */
 
@@ -1193,8 +1197,19 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         dir = g_dir_open(hp, 0, &gerr);
         if (!dir) {
-            rc = (errno == ENOENT || gerr && gerr->code == G_FILE_ERROR_NOENT)
-                 ? VMCH_RC_NOTFOUND : VMCH_RC_NOTDIR;
+            /* Why, from glib's own code rather than errno, which Windows
+             * does not always set.  Everything but "not found" used to be
+             * NOTDIR, which the guest reported as "unsupported operation"
+             * whether the directory was a file, in use or forbidden
+             * (issue #6). */
+            int why = gerr ? gerr->code : -1;
+
+            rc = (why == G_FILE_ERROR_NOENT || (!gerr && errno == ENOENT))
+                     ? VMCH_RC_NOTFOUND
+               : why == G_FILE_ERROR_NOTDIR ? VMCH_RC_NOTDIR
+               : (why == G_FILE_ERROR_ACCES || why == G_FILE_ERROR_PERM)
+                     ? VMCH_RC_ACCESS
+               : VMCH_RC_IOERR;
             if (gerr) {
                 g_error_free(gerr);
             }
@@ -1298,7 +1313,18 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         if (g_stat(hp, &st) != 0) {
             rc = VMCH_RC_NOTFOUND;
         } else if (S_ISDIR(st.st_mode)) {
-            rc = g_rmdir(hp) == 0 ? VMCH_RC_OK : VMCH_RC_NOTDIR;
+            /* Every failure here used to be NOTDIR, which the guest could
+             * only call "unsupported operation" — for the commonest one,
+             * a directory that still holds something. */
+            if (g_rmdir(hp) == 0) {
+                rc = VMCH_RC_OK;
+            } else if (errno == ENOTEMPTY || errno == EEXIST) {
+                rc = VMCH_RC_NOTEMPTY;
+            } else if (errno == EACCES || errno == EPERM || errno == EBUSY) {
+                rc = VMCH_RC_ACCESS;
+            } else {
+                rc = VMCH_RC_IOERR;
+            }
         } else {
             rc = g_unlink(hp) == 0 ? VMCH_RC_OK : VMCH_RC_ACCESS;
         }
@@ -1672,7 +1698,14 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
          * round trip: R1 handle, R2 guest logical buffer, R3 count, R4
          * file offset.  No exit registers (PRM 2-544).  The offset rides
          * in the request, so there is no seek and no per-page chunking —
-         * the v0 module cost two doorbells per 4 KiB for want of both. */
+         * the v0 module cost two doorbells per 4 KiB for want of both.
+         *
+         * What is bounded is the host's buffer, not the transfer: a count
+         * past VMCH_XFER_PIECE goes through in pieces of that size, still
+         * in the one round trip.  It used to be refused with an I/O error
+         * past 16 MiB, which the guest took for an unmapped buffer, and
+         * FileSwitch hands over a count that size whenever the caller's
+         * buffer is that big (issue #6). */
         bool is_put = (cmd == VMCH_CMD_FS_PUTBYTES);
         uint32_t r1 = ld32(base + VMCH_HDR_REGS + 4);
         uint64_t addr = (uint64_t)ld32(base + VMCH_HDR_REGS + 8);
@@ -1680,7 +1713,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint64_t off = (uint64_t)ld32(base + VMCH_HDR_REGS + 16);
         int h = (int)r1 - 1;
         g_autofree uint8_t *tmp = NULL;
-        ssize_t n;
+        uint32_t done = 0;
 
         if (!s->root) {
             rc = VMCH_RC_NOROOT;
@@ -1690,47 +1723,57 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             rc = VMCH_RC_ACCESS;
             break;
         }
-        if (len > 16 * 1024 * 1024) {
-            rc = VMCH_RC_IOERR;
-            break;
-        }
-        tmp = g_malloc(len ? len : 1);
+        tmp = g_malloc(MAX(MIN(len, VMCH_XFER_PIECE), 1));
 
-        if (is_put) {
-            uint32_t got = guest_rw_counted(addr, tmp, len, false);
+        while (done < len) {
+            uint32_t part = MIN(len - done, VMCH_XFER_PIECE);
+            ssize_t n;
 
-            if (got != len) {
-                st32(base + VMCH_HDR_REGS + 12, got);
-                rc = VMCH_RC_BADADDR;
-                break;
-            }
-            n = pwrite(s->fds[h], tmp, len, (off_t)off);
-            if (n < 0) {
-                rc = VMCH_RC_IOERR;
-            } else if ((uint32_t)n != len) {
-                rc = VMCH_RC_FULL;      /* short write: out of space */
-            }
-        } else {
-            n = pread(s->fds[h], tmp, len, (off_t)off);
-            if (n < 0) {
-                rc = VMCH_RC_IOERR;
-                break;
-            }
-            /* A short read is the normal end of a file: the count is a
-             * multiple of the buffer size, so the last block runs past
-             * the extent.  Zero the tail rather than leave the guest's
-             * buffer holding whatever was there before. */
-            if ((uint32_t)n < len) {
-                memset(tmp + n, 0, len - (uint32_t)n);
-            }
-            {
-                uint32_t put = guest_rw_counted(addr, tmp, len, true);
+            if (is_put) {
+                uint32_t got = guest_rw_counted(addr + done, tmp, part, false);
 
-                st32(base + VMCH_HDR_REGS + 12, put);
-                if (put != len) {
+                if (got != part) {
+                    /* R3: how far the translation got, over the whole
+                     * transfer — the guest faults the rest in and retries */
+                    st32(base + VMCH_HDR_REGS + 12, done + got);
                     rc = VMCH_RC_BADADDR;
+                    break;
+                }
+                n = pwrite(s->fds[h], tmp, part, (off_t)(off + done));
+                if (n < 0) {
+                    rc = VMCH_RC_IOERR;
+                    break;
+                }
+                if ((uint32_t)n != part) {
+                    rc = VMCH_RC_FULL;  /* short write: out of space */
+                    break;
+                }
+            } else {
+                uint32_t put;
+
+                n = pread(s->fds[h], tmp, part, (off_t)(off + done));
+                if (n < 0) {
+                    rc = VMCH_RC_IOERR;
+                    break;
+                }
+                /* A short read is the normal end of a file: the count is a
+                 * multiple of the buffer size, so the last block runs past
+                 * the extent.  Zero the tail rather than leave the guest's
+                 * buffer holding whatever was there before. */
+                if ((uint32_t)n < part) {
+                    memset(tmp + n, 0, part - (uint32_t)n);
+                }
+                put = guest_rw_counted(addr + done, tmp, part, true);
+                if (put != part) {
+                    done += put;
+                    rc = VMCH_RC_BADADDR;
+                    break;
                 }
             }
+            done += part;
+        }
+        if (!is_put && rc != VMCH_RC_IOERR) {
+            st32(base + VMCH_HDR_REGS + 12, done);  /* bytes delivered */
         }
         break;
     }
@@ -1803,9 +1846,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     ld32(base + VMCH_HDR_REGS + 16));
         }
         /* Every host refusal says what the host actually said.  Without
-         * this an unstorable name reads as an I/O error, because
-         * rc_to_error in the guest renders NOTDIR, ISDIR, BADCMD, IOERR
-         * and BADADDR alike as "unsupported operation". */
+         * this an unstorable name reads as an I/O error: HostFS 2.01's
+         * message names the request and the code ("host I/O error
+         * (FS_FILE 8: cmd 261, rc 10)"), and 2.00's said only "unsupported
+         * operation", but neither can say errno, and EINVAL rather than
+         * EIO is the whole diagnosis. */
         if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND && errno != 0) {
             vmch_trace(" errno=%d(%s)", errno, strerror(errno));
         }

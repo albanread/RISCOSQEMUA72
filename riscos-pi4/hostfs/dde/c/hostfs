@@ -109,6 +109,7 @@ struct vmreq {
 #define RC_BADCMD    9
 #define RC_IOERR    10
 #define RC_BADADDR  11   /* a guest address would not translate */
+#define RC_NOTEMPTY 12   /* a directory that still holds something */
 
 #define O_READ   0x1u
 #define O_WRITE  0x2u
@@ -239,6 +240,11 @@ struct hostws {
     uint32_t w_hexec[VMCH_MAX_OPEN];
     _kernel_oserror w_err_func;         /* the errors formatted at run time */
     _kernel_oserror w_err_badaddr;
+    _kernel_oserror w_err_host;
+    uint32_t w_fail_cmd;                /* the last request the host refused, */
+    uint32_t w_fail_r0;                 /* and its R0, for rc_to_error */
+    uint32_t w_xfer_rc;                 /* the host's answer to the last
+                                         * GetBytes or PutBytes */
     struct catent w_catents[128];
     /* The request block must be one whole page, and Norcroft has no
      * aligned attribute: over-allocate and line the block up in init. */
@@ -257,6 +263,7 @@ struct hostws {
 #define hexec            (ws->w_hexec)
 #define err_func_buf     (ws->w_err_func)
 #define err_badaddr_buf  (ws->w_err_badaddr)
+#define err_host_buf     (ws->w_err_host)
 #define catents          (ws->w_catents)
 #define reqstore         (ws->w_reqstore)
 
@@ -322,12 +329,18 @@ static char *str_dec(char *d, uint32_t n)
     return d;
 }
 
-static _kernel_oserror *unsupported_func(struct hostws *ws, uint32_t reason)
+/* An entry reason this module does not do, named with its number.  The
+ * prefix is the whole "HostFS: FSEntry_xxx " literal from the caller: a
+ * literal shared between functions is reached through an absolute address,
+ * which a ROM image cannot hold. */
+static _kernel_oserror *unsupported_reason(struct hostws *ws,
+                                           const char *prefix,
+                                           uint32_t reason)
 {
     char *p;
 
     err_func_buf.errnum = 0x1E8;
-    p = str_copy(err_func_buf.errmess, "HostFS: FSEntry_Func ");
+    p = str_copy(err_func_buf.errmess, prefix);
     p = str_dec(p, reason);
     (void)str_copy(p, " is not supported");
     return &err_func_buf;
@@ -345,26 +358,127 @@ static _kernel_oserror *badaddr_at(struct hostws *ws, uint32_t off)
     return &err_badaddr_buf;
 }
 
-static _kernel_oserror *rc_to_error(uint32_t rc)
+/* The request a failure came back from, spelt as the host's trace spells
+ * it, so that "cmd 258" in a message and "cmd=258" in vmch-trace.txt are
+ * seen to be the same thing. */
+static const char *req_name(uint32_t cmd)
 {
+    switch (cmd) {
+    case C_OPEN:        return "OPEN";
+    case C_CLOSE:       return "CLOSE";
+    case C_READ:        return "READ";
+    case C_WRITE:       return "WRITE";
+    case C_SEEK:        return "SEEK";
+    case C_FILEARGS:    return "FILEARGS";
+    case C_CAT:         return "CAT";
+    case C_CREATE:      return "CREATE";
+    case C_DELETE:      return "DELETE";
+    case C_RENAME:      return "RENAME";
+    case C_SETSIZE:     return "SETSIZE";
+    case C_FS_GETBYTES: return "FS_GETBYTES";
+    case C_FS_PUTBYTES: return "FS_PUTBYTES";
+    case C_FS_ARGS:     return "FS_ARGS";
+    case C_FS_FILE:     return "FS_FILE";
+    case C_FS_FUNC:     return "FS_FUNC";
+    }
+    return "request";
+}
+
+/* A host answer as a RISC OS error.  The ordinary ones keep their fixed
+ * blocks.  The rest used to share one "unsupported operation", so a
+ * recursive *Copy that stopped left no way to tell which call had failed
+ * or why (ROS_PRIVATE issue #6); now each says what the host reported and
+ * which request it reported it for, from vmch_go's record — the failing
+ * request can be followed by a cleanup one before the error is built. */
+static _kernel_oserror *rc_to_error(struct hostws *ws, uint32_t rc)
+{
+    const char *what;
+    char *p;
+
     switch (rc) {
     case RC_OK: return NULL;
     case RC_NOTFOUND: return &err_notfound;
     case RC_ACCESS: case RC_HANDLES: return &err_access;
     case RC_BADPATH: return &err_badpath;
-    case RC_FULL: return &err_full;
+    case RC_FULL:
+        /* The host answers FULL for a directory too long to list and for
+         * a write that ran out of room; the fixed block only says the
+         * first. */
+        if (ws->w_fail_cmd == C_FS_PUTBYTES || ws->w_fail_cmd == C_FS_ARGS) {
+            err_host_buf.errnum = 0x1C6;    /* FileCore's is &C6 */
+            (void)str_copy(err_host_buf.errmess, "HostFS: host disc full");
+            return &err_host_buf;
+        }
+        return &err_full;
     case RC_NOROOT: return &err_nofs;
-    default: return &err_unsupported;
+    case RC_NOTEMPTY:
+        err_host_buf.errnum = 0x1B4;    /* FileCore's is &B4 */
+        (void)str_copy(err_host_buf.errmess, "HostFS: directory not empty");
+        return &err_host_buf;
+    case RC_NOTDIR:
+        err_host_buf.errnum = 0x1EB;
+        what = "HostFS: not a directory";
+        break;
+    case RC_ISDIR:
+        err_host_buf.errnum = 0x1EC;
+        what = "HostFS: is a directory";
+        break;
+    case RC_BADCMD:
+        err_host_buf.errnum = 0x1ED;
+        what = "HostFS: request not known to this emulator";
+        break;
+    case RC_IOERR:
+        err_host_buf.errnum = 0x1EE;
+        what = "HostFS: host I/O error";
+        break;
+    case RC_BADADDR:
+        err_host_buf.errnum = 0x1E9;
+        what = "HostFS: buffer not reachable by the host";
+        break;
+    default:
+        err_host_buf.errnum = 0x1EF;
+        what = "HostFS: unexpected reply from the host";
+        break;
     }
+    p = str_copy(err_host_buf.errmess, what);
+    *p++ = ' ';                         /* as characters: *HostFSStatus has
+                                         * the same two-character literal,
+                                         * and cc pools a literal shared by
+                                         * two functions behind an absolute
+                                         * address */
+    *p++ = '(';
+    p = str_copy(p, req_name(ws->w_fail_cmd));
+    if (ws->w_fail_cmd == C_FS_ARGS || ws->w_fail_cmd == C_FS_FILE ||
+        ws->w_fail_cmd == C_FS_FUNC) {
+        *p++ = ' ';
+        p = str_dec(p, ws->w_fail_r0);
+    }
+    p = str_copy(p, ": cmd ");
+    p = str_dec(p, ws->w_fail_cmd);
+    p = str_copy(p, ", rc ");
+    p = str_dec(p, rc);
+    *p++ = ')';
+    *p = 0;
+    return &err_host_buf;
 }
 
 /* ---- the transport -------------------------------------------------- */
 
 static uint32_t vmch_go(struct hostws *ws)
 {
+    uint32_t cmd = req->cmd, r0 = REQW(0);
+
     req->seq = ++ws->w_seq;
     req->rc = 0xFFFFFFFFu;             /* poison: an unanswered request stays visible */
     vmch_reg(VMCH_CMD / 4) = req_phys; /* the device DMAs physical, not logical */
+    if (req->rc != RC_OK) {
+        /* Taken before the doorbell: the host may write exit registers
+         * over R0.  Only a refusal is kept, so a successful cleanup
+         * request after it (a close after a failed open) cannot overwrite
+         * what rc_to_error will name. */
+        ws->w_fail_cmd = cmd;
+        ws->w_fail_r0 = r0;
+    }
     return req->rc;
 }
 
@@ -544,6 +658,7 @@ static uint32_t xfer_once(struct hostws *ws, uint32_t h, uint32_t ptr,
     {
         uint32_t rc = vmch_go(ws);
 
+        ws->w_xfer_rc = rc;
         if (rc == RC_OK) {
             return n;
         }
@@ -562,11 +677,12 @@ static uint32_t xfer(struct hostws *ws, uint32_t h, uint32_t ptr,
 {
     uint32_t moved = xfer_once(ws, h, ptr, mem, n, is_write);
 
-    if (moved != n) {
+    if (moved != n && ws->w_xfer_rc == RC_BADADDR) {
         /* Short: the tail of the buffer is not mapped yet.  Fault it in
          * and go again.  One retry is enough — after touching, every
          * page of the buffer is present — and the common case never
-         * gets here, so the fast path stays at one doorbell. */
+         * gets here, so the fast path stays at one doorbell.  Any other
+         * refusal would only be refused again. */
         touch_pages(mem, n);
         moved = xfer_once(ws, h, ptr, mem, n, is_write);
     }
@@ -664,7 +780,7 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     put_path(ws, name);
     rc = vmch_go(ws);
     if (rc != RC_OK) {
-        return rc_to_error(rc);
+        return rc_to_error(ws, rc);
     }
     h = req->handle;
     if (h == 0 || h > VMCH_MAX_OPEN) {
@@ -678,7 +794,7 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
         type = 0xFFF;
     } else if (rc != RC_OK) {
         vmch_req_close(ws, h);
-        return rc_to_error(rc);
+        return rc_to_error(ws, rc);
     }
 
     hptr[idx] = 0;
@@ -732,12 +848,15 @@ _kernel_oserror *fsentry_get_handler(_kernel_swi_regs *r, void *pw)
      * way to report a failure is to return an error — and it must be
      * reported.  Reading past the end of the file is NOT this case: the
      * host zero-fills the tail and still delivers the full count, so a
-     * short `moved` means the guest buffer would not translate, and the
-     * bytes the caller can see are not the file's.  Saying nothing here
+     * short `moved` means the guest buffer would not translate or the
+     * host refused the transfer, and the bytes the caller can see are not
+     * the file's.  Which of the two is in w_xfer_rc: an I/O error once
+     * came out as "transfer buffer not mapped at +0" (issue #6).  Saying nothing here
      * once produced "0 bytes not transferred" over a buffer holding 252
      * good bytes and 261892 stale ones. */
     if (moved != n) {
-        return badaddr_at(ws, moved);
+        return (ws->w_xfer_rc == RC_BADADDR) ? badaddr_at(ws, moved)
+                                             : rc_to_error(ws, ws->w_xfer_rc);
     }
     return NULL;
 }
@@ -770,7 +889,8 @@ _kernel_oserror *fsentry_put_handler(_kernel_swi_regs *r, void *pw)
         hext[idx] = hptr[idx];
     }
     if (moved != n) {           /* see fsentry_get_handler */
-        return badaddr_at(ws, moved);
+        return (ws->w_xfer_rc == RC_BADADDR) ? badaddr_at(ws, moved)
+                                             : rc_to_error(ws, ws->w_xfer_rc);
     }
     return NULL;
 }
@@ -856,7 +976,7 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
             uint32_t end = (uint32_t)r->r[2] + (uint32_t)r->r[3];
 
             if (rc != RC_OK) {
-                return rc_to_error(rc);
+                return rc_to_error(ws, rc);
             }
             if (end > hext[idx]) {
                 hext[idx] = end;
@@ -864,7 +984,8 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
         }
         return NULL;
     default:                           /* 11 IOCtl */
-        return &err_unsupported;
+        return unsupported_reason(ws, "HostFS: FSEntry_Args ",
+                                  (uint32_t)r->r[0]);
     }
 }
 
@@ -885,7 +1006,7 @@ _kernel_oserror *fsentry_close_handler(_kernel_swi_regs *r, void *pw)
     if (idx >= 0 && idx < VMCH_MAX_OPEN) {
         hptr[idx] = hext[idx] = 0;
     }
-    return (rc == RC_OK) ? NULL : rc_to_error(rc);
+    return (rc == RC_OK) ? NULL : rc_to_error(ws, rc);
 }
 
 _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
@@ -949,12 +1070,12 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
     case 8:                            /* create directory: the host makes
                                         * it, and leaves one that exists */
         rc = file_on_host(ws, r, name);
-        return (rc == RC_OK) ? NULL : rc_to_error(rc);
+        return (rc == RC_OK) ? NULL : rc_to_error(ws, rc);
 
     case 7:                            /* create empty, of the type in R2 */
         rc = file_on_host(ws, r, name);
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         r->r[0] = 1;
         r->r[2] = r->r[3] = -1;
@@ -972,7 +1093,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
             return NULL;
         }
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         r->r[0] = 1;
         return NULL;
@@ -987,10 +1108,11 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
          * type is a rename (the type rides the host filename), a
          * datestamp is utimes(), attributes are chmod(). */
         rc = file_on_host(ws, r, name);
-        return (rc == RC_OK) ? NULL : rc_to_error(rc);
+        return (rc == RC_OK) ? NULL : rc_to_error(ws, rc);
 
     default:
-        return &err_unsupported;
+        return unsupported_reason(ws, "HostFS: FSEntry_File ",
+                                  (uint32_t)r->r[0]);
     }
 }
 
@@ -1041,7 +1163,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         put_two_paths(ws, (const char *)r->r[1], (const char *)r->r[2]);
         rc = vmch_go(ws);
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         /* PRM2 2-568, on exit: "R1 = 0 if rename performed (≠0
          * otherwise)", and a non-zero R1 makes FileSwitch report "Bad
@@ -1133,7 +1255,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         put_path(ws, (const char *)r->r[1]);
         rc = vmch_go(ws);
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         r->r[0] = (int)REQW(0);         /* free space */
         r->r[1] = (int)REQW(1);         /* biggest object creatable */
@@ -1149,7 +1271,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         put_path(ws, (const char *)r->r[1]);
         rc = vmch_go(ws);
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         r->r[0] = (int)REQW(0);         /* free space, low word */
         r->r[1] = (int)REQW(1);         /* free space, high word */
@@ -1193,7 +1315,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
         put_path(ws, (const char *)r->r[1]);
         rc = vmch_go(ws);
         if (rc != RC_OK) {
-            return rc_to_error(rc);
+            return rc_to_error(ws, rc);
         }
         nbytes = vmch_arglen(ws);
         n = nbytes >> 6;                /* 64-byte entries */
@@ -1297,7 +1419,8 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
     }
 
     default:
-        return unsupported_func(ws, (uint32_t)r->r[0]);
+        return unsupported_reason(ws, "HostFS: FSEntry_Func ",
+                                  (uint32_t)r->r[0]);
     }
 }
 

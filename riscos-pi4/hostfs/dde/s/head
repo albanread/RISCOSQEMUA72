@@ -68,7 +68,7 @@ Module_Base
 Flags   DCD     1                               ; bit 0: 32-bit compatible
 
 Title   =       "HostFS", 0
-Help    =       "HostFS", 9, 9, "2.00 (12 Sep 2026)", 0
+Help    =       "HostFS", 9, 9, "2.01 (13 Sep 2026)", 0
         ALIGN
 
 ; *Command table (PRM 1-205).  Information word: byte 0 minimum parameters,

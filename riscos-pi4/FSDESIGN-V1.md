@@ -821,6 +821,49 @@ Map at least: ENOENT, EACCES, EPERM, ENOSPC, EEXIST, EISDIR, ENOTDIR,
 ENOTEMPTY, EMFILE, ENAMETOOLONG, ELOOP, EROFS, and `VMCH_RC_BADADDR`
 from §3.  The v0 table in `dde/c/hostfs` is deleted, not ported.
 
+**Built 13 Sep, as a step short of that (HostFS 2.01).** Every error now
+names what failed. Until then, one "HostFS: unsupported operation" covered
+a host I/O error, a directory that would not open or delete, and a request
+the emulator did not know, which left a recursive `*Copy` that stopped on
+Windows (ROS_PRIVATE issue #6) with nothing to go on.
+
+- **Ordinary answers keep their fixed blocks:** not found, access denied,
+  bad path, full. A directory that still holds something is now "HostFS:
+  directory not empty" (&1B4). A write that runs out of room is "HostFS:
+  host disc full" (&1C6), no longer "directory too big".
+- **Everything else says what the host reported and for which request**,
+  spelt as the trace spells them: "HostFS: host I/O error (FS_GETBYTES:
+  cmd 257, rc 10)" is the line `vmch: cmd=257 … rc=10`. `vmch_go` keeps the
+  refused request, so a cleanup request after it cannot take its place.
+- **An entry the module does not do names its reason**, for Args and File
+  as it already did for Func: "HostFS: FSEntry_Args 11 is not supported".
+- **A failed GetBytes or PutBytes reports the host's answer.** It used to
+  be taken for an unmapped buffer, retried, and reported as "transfer
+  buffer not mapped at +0" whatever the host had said.
+- **The host's codes are truer.** A directory that will not open is
+  NOTFOUND, NOTDIR, ACCESS or IOERR by glib's own error code, not NOTDIR
+  for everything. A directory that will not go is the new
+  `VMCH_RC_NOTEMPTY` (12), ACCESS or IOERR.
+- **A transfer over 16 MiB is carried in 16 MiB pieces** in the one round
+  trip. It used to be refused with IOERR, and FileSwitch hands a
+  filing system a count that large whenever the caller's buffer is.
+
+Verified on the Mac from a spliced ROM, in three runs:
+
+| run | emulator | module | one 20 MiB OS_GBPB read | `*Delete` of a non-empty directory |
+| --- | --- | --- | --- | --- |
+| old code | before | 2.00 | "transfer buffer not mapped at +0" | "unsupported operation" |
+| new module | before | 2.01 | "host I/O error (FS_GETBYTES: cmd 257, rc 10)" | "not a directory (DELETE: cmd 9, rc 7)" |
+| both new | after | 2.01 | reads, writes back byte-identical, one request each | "directory not empty" |
+
+In the last run, `*Cat` of a directory the host cannot open says "access
+denied". A recursive `*Copy` of 3,126 files makes the same requests as
+before with no error, and both the card boot and the share boot are
+pixel-identical.
+
+The registered error base and the standard strings above are still to
+do.
+
 ---
 
 ## 10. Security
