@@ -49,6 +49,16 @@ static inline uint32_t vmch_answer(uint32_t code)
 }
 
 /*
+ * Set when host_name_of() had to remap a character this host cannot store
+ * (ROS_PRIVATE issue #6): the trace flags such a request, and the first one
+ * warns.  It replaces the EINVAL-gated check of #9, because the names that
+ * matter most produce no errno at all -- an untyped NUL becomes the null
+ * device and a trailing dot or space is silently dropped, both without a
+ * failure -- and this fires exactly when the escaping did something.
+ */
+static bool vmch_remapped;
+
+/*
  * mingw has no pread/pwrite.  The doorbell runs each op synchronously
  * under the BQL, one at a time, so seek-transfer-seek-back is race-free
  * where the POSIX names would be the natural spelling.
@@ -368,10 +378,72 @@ static const gunichar acorn_latin1_80[32] = {
     0x2014, 0x2212, 0x0152, 0x0153, 0x2020, 0x2021, 0xFB01, 0xFB02,
 };
 
+/*
+ * A leafname the guest can hold but a host filing system cannot store,
+ * mapped so both hosts can (ROS_PRIVATE issue #6).  Windows forbids
+ * < > " | ? * in a name, a trailing '.' or ' ', and the device names
+ * (NUL, CON, COM1...); macOS forbids none of these, so a real card tree
+ * copies on a Mac and stops partway on Windows -- StrongED ships a
+ * directory called TRUE>>>1, and '>' is one Windows refuses.
+ *
+ * Each such character becomes 0xF000 + c in the Unicode private-use area,
+ * the WSL/Cygwin spelling of the convention every SMB stack uses for this.
+ * The private-use area is the right home because a code point there cannot
+ * occur in an 8-bit Acorn Latin-1 name, so the map is whole and reversible
+ * with no escape character (undone in guest_name_of by the same range).
+ *
+ * Two of these are worse than a refusal, both silent and both measured on
+ * NTFS: an untyped NUL opens as the null device and swallows the file, and
+ * a trailing '.' or ' ' is dropped -- so RISC OS foo/ (host foo. after the
+ * swap) and foo collide into one host file.  So the map is unconditional,
+ * not gated on the host complaining.  A typed reserved name (NUL,ff9) is an
+ * ordinary file on the host and need not be escaped, but host_name_of does
+ * not know the type here and escaping it anyway only costs a placeholder
+ * glyph in a file manager, so it is escaped like the rest.
+ *
+ * Applied on the leaf, after the dot/slash swap; the guest never sees it.
+ * '/' \\ ':' never reach here -- the swap consumes '/', host_path refuses
+ * the other two -- and a control byte cannot cross the wire.
+ */
+static char *escape_host_leaf(const char *ideal)
+{
+    size_t len = strlen(ideal);
+    size_t i = 0, end = len;
+    gunichar trail = 0;
+    GString *out = g_string_sized_new(len + 8);
+
+    if (end > 0 && (ideal[end - 1] == '.' || ideal[end - 1] == ' ')) {
+        trail = (unsigned char)ideal[end - 1];      /* Windows drops these */
+        end--;
+    }
+    if (win32_reserved(ideal, end)) {
+        g_string_append_unichar(out, 0xF000 + (unsigned char)ideal[0]);
+        i = 1;                                       /* break the device name */
+    }
+    for (; i < end; i++) {
+        unsigned char c = (unsigned char)ideal[i];
+
+        if (c == '<' || c == '>' || c == '"' || c == '|'
+            || c == '?' || c == '*') {
+            g_string_append_unichar(out, 0xF000 + c);
+        } else {
+            g_string_append_c(out, (char)c);         /* ASCII or UTF-8 byte */
+        }
+    }
+    if (trail) {
+        g_string_append_unichar(out, 0xF000 + trail);
+    }
+    if (out->len != len || memcmp(out->str, ideal, len) != 0) {
+        vmch_remapped = true;
+    }
+    return g_string_free(out, FALSE);
+}
+
 /* A RISC OS leafname, as the host spells it. */
 static char *host_name_of(const char *guest)
 {
     GString *out = g_string_sized_new(strlen(guest) + 8);
+    g_autofree char *ideal = NULL;
 
     for (const unsigned char *p = (const unsigned char *)guest; *p; p++) {
         if (*p == '/') {
@@ -385,7 +457,8 @@ static char *host_name_of(const char *guest)
                                                    : (gunichar)*p);
         }
     }
-    return g_string_free(out, FALSE);
+    ideal = g_string_free(out, FALSE);
+    return escape_host_leaf(ideal);
 }
 
 /* The first n bytes of a host leafname, as RISC OS spells them. */
@@ -409,6 +482,9 @@ static char *guest_name_of(const char *host, size_t n)
         } else {
             u = g_utf8_get_char(p);
             p = g_utf8_next_char(p);
+        }
+        if (u >= 0xF000 && u <= 0xF0FF) {
+            u -= 0xF000;                /* undo escape_host_leaf (issue #6) */
         }
         if (u == '.') {
             b = '/';
@@ -557,11 +633,14 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
             e++;
         }
         n = (size_t)(e - c);
-        if (n == 0 || win32_reserved(c, n)) {
-            g_free(cur);                /* "..", empty, or a device name */
+        if (n == 0) {
+            g_free(cur);                /* ".." or an empty component */
             *rc = vmch_answer(VMCH_RC_BADPATH);
             return NULL;
         }
+        /* A device name is no longer refused: host_name_of (via
+         * resolve_leaf) escapes it, like any name the host could not hold,
+         * so it is stored rather than turned away (issue #6). */
         comp = g_strndup(c, n);
         next = resolve_leaf(cur, comp);
         g_free(comp);
@@ -951,49 +1030,32 @@ static void vmch_trace(const char *fmt, ...)
     fflush(f);
 }
 
-/* A RISC OS name the host filing system cannot store at all.  Windows
- * rejects these outright, so an ordinary card tree -- StrongED ships a
- * directory called TRUE>>>1 -- stops copying partway, with an error that
- * says nothing about names.  macOS takes all of them, which is why this
- * only ever bites on one host.  Reported once per run: a failing *Copy
- * meets the same name for everything underneath it. */
-static void vmch_name_check(hwaddr base, uint32_t arglen, int err)
+/* A name this host could not store was remapped into the private-use area
+ * by host_name_of (issue #6).  Reported when the mapping actually fired --
+ * not on EINVAL, which the two worst cases (an untyped NUL, a trailing dot
+ * or space) never raise -- so it catches all of them and no false ones.
+ * The path shows the true RISC OS name; the point is that its host spelling
+ * differs.  Warned once a run: a *Copy meets such a name for a whole subtree. */
+static void vmch_name_remapped(hwaddr base, uint32_t arglen)
 {
     static bool warned;
     char name[VMCH_MAX_ARG + 1];
-    const char *leaf;
     uint32_t i, n = 0;
 
-    /* EINVAL is what an unstorable name produces; anything else failed
-     * for its own reasons and is not ours to explain. */
-    if (err != EINVAL) {
+    vmch_trace(" [name remapped for this host]");
+    if (warned) {
         return;
     }
-
+    warned = true;
     for (i = 0; i < arglen && n < sizeof(name) - 1; i++) {
         name[n++] = (char)ld8(base + VMCH_HDR_SIZE + i);
     }
     name[n] = '\0';
-
-    /* Skip the disc name: a HostFS path always begins ":HostFS.$", and
-     * that colon is not part of any component the host has to store.
-     * Checking the whole path flagged every failure in the log and fired
-     * the warning for causes that had nothing to do with names
-     * (ROS_PRIVATE#9). */
-    leaf = strchr(name, '$');
-    leaf = leaf ? leaf + 1 : name;
-
-    if (strpbrk(leaf, "<>:\"|?*") == NULL) {
-        return;
-    }
-    vmch_trace(" [name unstorable on this host]");
-    if (!warned) {
-        warned = true;
-        warn_report("vmchannel: '%s' holds a character this host's filing "
-                    "system cannot store (< > : \" | ? *), so the transfer "
-                    "stops here. RISC OS allows it and so does APFS, so a "
-                    "tree that copies on a Mac can fail on Windows.", name);
-    }
+    warn_report("vmchannel: '%s' holds a name this host cannot store "
+                "(< > \" | ? *, a trailing '.' or space, or a device name); "
+                "it is kept in the Unicode private-use area, so a file "
+                "manager shows placeholder glyphs but RISC OS sees the real "
+                "name. macOS stores all of these as-is.", name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1008,6 +1070,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
      * only ever sets errno, never clears it on success. */
     errno = 0;
     vmch_errno = 0;
+    vmch_remapped = false;
     uint32_t cmd = ld32(base + VMCH_HDR_CMD);
     uint32_t arglen = ld32(base + VMCH_HDR_ARGLEN);
     uint32_t rc = vmch_answer(VMCH_RC_OK);
@@ -1892,14 +1955,15 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             cmd == VMCH_CMD_FILEARGS || cmd == VMCH_CMD_RENAME) {
             uint32_t i;
             vmch_trace(" path=");
-            /* The whole path: a 64-byte cut hides the leaf, and the leaf
-             * is where an unstorable name is. */
+            /* The whole path, not a 64-byte cut: the leaf is where a name
+             * problem shows, and a 64-byte cut hid StrongED's TRUE>>>1
+             * three characters short of the answer (issue #6). */
             for (i = 0; i < arglen && i < VMCH_MAX_ARG; i++) {
                 int c = ld8(base + VMCH_HDR_SIZE + i);
                 vmch_trace("%c", (c >= 32 && c < 127) ? c : '.');
             }
-            if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND) {
-                vmch_name_check(base, arglen, vmch_errno);
+            if (vmch_remapped) {
+                vmch_name_remapped(base, arglen);
             }
         }
         vmch_trace("\n");

@@ -539,9 +539,74 @@ with hard spaces.  Every name is now translated both ways:
 Host names are compared in NFC. A host name holding what Latin-1 cannot
 (CJK, emoji) shows `_` in its place and still opens, because lookups
 compare the guest's name with each host name mapped the same way: the
-mapping has to be consistent, not reversible. Not yet mapped: host names
-using characters RISC OS gives meaning to (`# * : $ & @ ^ % \ | "`); they
-list, but may not open by name.
+mapping has to be consistent, not reversible. Still not mapped the other
+way: host names using characters RISC OS itself gives meaning to
+(`# $ & @ ^ %`); they list, but the guest's own parser may not open them.
+
+### 6.1.2 Names the host cannot store (built 13 Sep)
+
+RISC OS lets a name hold characters a host filing system forbids. The one
+that bites is Windows: `< > " | ? *`, a trailing `.` or space, and the
+device names (`NUL`, `CON`, `COM1`…) cannot be stored on NTFS, while macOS
+takes all of them. So a real card tree copies on a Mac and stops partway
+on Windows — the DDE card's StrongED ships a directory called `TRUE>>>1`,
+and `>` is one Windows refuses (ROS_PRIVATE issue #6).
+
+Each such character is mapped into the Unicode private-use area, **`0xF000
++ c`**, on the way to the host and back on the way in. This is the
+WSL/Cygwin spelling of a convention every SMB stack uses for the same
+problem — our own, not a form any file manager decodes: macOS/SFM uses a
+different block (0xF020–), so no single spelling renders natively on both,
+and both Finder and Explorer show a placeholder glyph for the mapped
+character. The private-use area is the right home because a code point
+there cannot occur in an 8-bit Acorn Latin-1 name, so the map is total and
+needs no escape character (unlike a percent- or `^`-escape, which then has
+to escape itself, and which triples a component that already answers to
+`MAX_PATH`). `TRUE>>>1` is stored `TRUE`+U+F03E×3+`1`; `NUL` becomes
+U+F04E`UL`; a trailing dot or space becomes U+F02E / U+F020.
+
+Three things make it safe and small:
+
+- **It is a leaf transform**, in `host_name_of` / `guest_name_of`, run
+  after §6.1's dot/slash swap. **Order:** swap `/`→`.` first, then escape;
+  on the way back, unescape first, then `.`→`/`. `/ \ :` never reach it —
+  the swap consumes `/`, `host_path` refuses `\` and `:` as path
+  structure — and a control byte cannot cross the wire (the guest stops
+  building the request at the first byte below 32).
+- **The guest never sees the escaped form.** It sends and is shown
+  `TRUE>>>1`; only the host's own bytes change. So there is no wire change
+  and no guest-module change — HostFS 2.01 is untouched.
+- **One on-disk spelling for both hosts**, so a tree — or a zip of one —
+  built on either OS reads back correctly through HostFS on the other.
+
+The map is **unconditional**, not gated on the host complaining, because
+the two cases that matter most raise no error at all (both measured on
+NTFS): an untyped `NUL` opens as the null device and swallows the file,
+size 0 and undeletable; and a trailing `.` or space is silently dropped,
+so RISC OS `foo/` (host `foo.` after the swap) and `foo` would collide
+into one host file. A typed reserved name (`NUL,ff9`) is an ordinary file
+on the host and would not strictly need mapping, but `host_name_of` does
+not know the type at that point and mapping it anyway costs only a
+placeholder glyph, so it is mapped like the rest.
+
+The old "name unstorable" trace warning (ROS_PRIVATE #9) is gone with it:
+it fired on EINVAL, which neither silent case produces. The trace now
+tags a request `[name remapped for this host]` exactly when the mapping
+fired, and warns once a run — the honest signal that a copied tree's host
+spelling differs from its RISC OS names.
+
+Verified 13 Sep on the Mac from a spliced ROM. Host→guest: escaped
+`TRUE>>>1`, `a<b>c`, `NUL`, `star*q?`, `pipe|x`, a trailing-dot and a
+trailing-space name placed on the share all list under their true RISC OS
+names and open by name. Guest→host: `TRUE>>>1`, `big>name` and `NUL`
+created from the guest land escaped on the host and read back
+byte-for-byte. An ordinary recursive copy is unaffected and a boot from
+the share is pixel-identical. Two corners worth knowing: `<x>` in a name
+the guest opens is expanded by RISC OS's own GSTrans (as `<Var>`) before
+HostFS sees it, exactly as on any filing system, so `a<b>c` opens as `ac`
+while a lone `>` (as in `TRUE>>>1`) is left alone; and a file created
+directly on the host with a literal ASCII `>` lists as `>` but will not
+round-trip a rewrite — harmless, and pre-existing.
 
 ### 6.2 Type inference, on the way in
 
@@ -869,7 +934,12 @@ do.
 ## 10. Security
 
 Keep what `host_path()` does — canonicalise, re-check the root prefix,
-refuse `..` and absolute paths, refuse Windows device names — and add:
+refuse `..` and absolute paths — and add:
+
+Windows device names are no longer *refused* here: §6.1.2 escapes them so
+they are stored, not turned away, which is what a real card tree needs.
+The escape is the safety measure — a literal `NUL` is never created on the
+host — so nothing is lost by not refusing.
 
 - **Resolve symlinks before the containment check**, not after.  A
   symlink inside the share pointing out of it is the obvious escape.
