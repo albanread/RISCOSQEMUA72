@@ -32,6 +32,23 @@
 #endif
 
 /*
+ * errno as it stood when the answer was decided, not when the trace line
+ * is written.  Later calls in the same request set errno too, so reading
+ * it at the end reported a different failure from the one that produced
+ * the answer -- a CAT refused for permissions was logged as errno=2, from
+ * a lookup that ran afterwards (ROS_PRIVATE#9).
+ */
+static int vmch_errno;
+
+static inline uint32_t vmch_answer(uint32_t code)
+{
+    if (code != VMCH_RC_OK && code != VMCH_RC_NOTFOUND) {
+        vmch_errno = errno;
+    }
+    return code;
+}
+
+/*
  * mingw has no pread/pwrite.  The doorbell runs each op synchronously
  * under the BQL, one at a time, so seek-transfer-seek-back is race-free
  * where the POSIX names would be the natural spelling.
@@ -488,7 +505,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
     const char *c;
 
     if (!s->root) {
-        *rc = VMCH_RC_NOROOT;
+        *rc = vmch_answer(VMCH_RC_NOROOT);
         return NULL;
     }
 
@@ -506,7 +523,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         const char *dot = strchr(guest, '.');
 
         if (!dot) {
-            *rc = VMCH_RC_BADPATH;
+            *rc = vmch_answer(VMCH_RC_BADPATH);
             return NULL;
         }
         guest = dot + 1;
@@ -514,7 +531,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
     }
 
     if (len < 1 || guest[0] != '$' || len > VMCH_MAX_ARG) {
-        *rc = VMCH_RC_BADPATH;
+        *rc = vmch_answer(VMCH_RC_BADPATH);
         return NULL;
     }
 
@@ -534,7 +551,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
              * foreign leafname.  Host separators are not. */
             if (*e == '\\' || *e == ':') {
                 g_free(cur);
-                *rc = VMCH_RC_BADPATH;
+                *rc = vmch_answer(VMCH_RC_BADPATH);
                 return NULL;
             }
             e++;
@@ -542,7 +559,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         n = (size_t)(e - c);
         if (n == 0 || win32_reserved(c, n)) {
             g_free(cur);                /* "..", empty, or a device name */
-            *rc = VMCH_RC_BADPATH;
+            *rc = vmch_answer(VMCH_RC_BADPATH);
             return NULL;
         }
         comp = g_strndup(c, n);
@@ -576,7 +593,7 @@ static char *host_path(VMChannelState *s, const char *guest, int *rc)
         free(rootreal);
         if (!ok) {
             g_free(cur);
-            *rc = VMCH_RC_BADPATH;
+            *rc = vmch_answer(VMCH_RC_BADPATH);
             return NULL;
         }
     }
@@ -940,18 +957,33 @@ static void vmch_trace(const char *fmt, ...)
  * says nothing about names.  macOS takes all of them, which is why this
  * only ever bites on one host.  Reported once per run: a failing *Copy
  * meets the same name for everything underneath it. */
-static void vmch_name_check(hwaddr base, uint32_t arglen)
+static void vmch_name_check(hwaddr base, uint32_t arglen, int err)
 {
     static bool warned;
     char name[VMCH_MAX_ARG + 1];
+    const char *leaf;
     uint32_t i, n = 0;
+
+    /* EINVAL is what an unstorable name produces; anything else failed
+     * for its own reasons and is not ours to explain. */
+    if (err != EINVAL) {
+        return;
+    }
 
     for (i = 0; i < arglen && n < sizeof(name) - 1; i++) {
         name[n++] = (char)ld8(base + VMCH_HDR_SIZE + i);
     }
     name[n] = '\0';
 
-    if (strpbrk(name, "<>:\"|?*") == NULL) {
+    /* Skip the disc name: a HostFS path always begins ":HostFS.$", and
+     * that colon is not part of any component the host has to store.
+     * Checking the whole path flagged every failure in the log and fired
+     * the warning for causes that had nothing to do with names
+     * (ROS_PRIVATE#9). */
+    leaf = strchr(name, '$');
+    leaf = leaf ? leaf + 1 : name;
+
+    if (strpbrk(leaf, "<>:\"|?*") == NULL) {
         return;
     }
     vmch_trace(" [name unstorable on this host]");
@@ -975,9 +1007,10 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
      * during THIS request", not a leftover from an earlier one.  libc
      * only ever sets errno, never clears it on success. */
     errno = 0;
+    vmch_errno = 0;
     uint32_t cmd = ld32(base + VMCH_HDR_CMD);
     uint32_t arglen = ld32(base + VMCH_HDR_ARGLEN);
-    uint32_t rc = VMCH_RC_OK;
+    uint32_t rc = vmch_answer(VMCH_RC_OK);
 
     st32(base + VMCH_HDR_RC, VMCH_RC_BADCMD);   /* default: overwritten */
 
@@ -988,7 +1021,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
          * both DMA directions without depending on the arg. */
         uint8_t buf[VMCH_MAX_ARG];
         if (arglen > VMCH_MAX_ARG) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         if (arglen) {
@@ -996,7 +1029,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             block_write(base + VMCH_HDR_SIZE, buf, arglen);
         }
         st32(base + VMCH_HDR_ARG, VMCH_MAGIC_VALUE);
-        rc = VMCH_RC_OK;
+        rc = vmch_answer(VMCH_RC_OK);
         break;
     }
 
@@ -1007,7 +1040,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         int h, oflags = 0;
 
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1017,7 +1050,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         h = alloc_handle(s);
         if (h < 0) {
-            rc = VMCH_RC_HANDLES;
+            rc = vmch_answer(VMCH_RC_HANDLES);
             g_free(hp);
             g_free(path);
             break;
@@ -1038,7 +1071,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         s->fds[h] = g_open(hp, oflags, 0644);
         if (s->fds[h] < 0) {
-            rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+            rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
         } else {
             /* handles are 1-based over the wire: 0 means "no file" to
              * a RISC OS FSEntry_Open caller */
@@ -1055,7 +1088,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         int r = -1;
 
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
             break;
         }
 #ifdef _WIN32
@@ -1064,7 +1097,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         r = ftruncate(s->fds[h], (off_t)ne);
 #endif
         if (r != 0) {
-            rc = VMCH_RC_IOERR;
+            rc = vmch_answer(VMCH_RC_IOERR);
         }
         break;
     }
@@ -1073,7 +1106,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         int h = (int)ld32(base + VMCH_HDR_HANDLE) - 1;
 
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
         } else {
             close(s->fds[h]);
             s->fds[h] = -1;
@@ -1090,11 +1123,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         ssize_t n = -1;
 
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
             break;
         }
         if (len > 16 * 1024 * 1024) {
-            rc = VMCH_RC_IOERR;
+            rc = vmch_answer(VMCH_RC_IOERR);
             break;
         }
         tmp = g_malloc(len ? len : 1);
@@ -1109,7 +1142,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         g_free(tmp);
         if (n < 0) {
-            rc = VMCH_RC_IOERR;
+            rc = vmch_answer(VMCH_RC_IOERR);
         } else {
             st32(base + VMCH_HDR_HANDLE, (uint32_t)n);
         }
@@ -1125,12 +1158,12 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1 ||
             whence < 0 || whence > 2) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
             break;
         }
         r = lseek(s->fds[h], (off_t)off, w[whence]);
         if (r < 0) {
-            rc = VMCH_RC_IOERR;
+            rc = vmch_answer(VMCH_RC_IOERR);
         } else {
             st32(base + VMCH_HDR_HANDLE, (uint32_t)r);
         }
@@ -1144,7 +1177,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint8_t resp[28];
 
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1153,7 +1186,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             break;
         }
         if (g_stat(hp, &st) != 0) {
-            rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+            rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
         } else {
             uint32_t size = (uint32_t)st.st_size;
             uint32_t type = (uint32_t)riscos_type_for(hp, &st);
@@ -1186,7 +1219,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint32_t used = 0, limit = VMCH_MAX_ARG;
 
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1204,12 +1237,12 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
              * (issue #6). */
             int why = gerr ? gerr->code : -1;
 
-            rc = (why == G_FILE_ERROR_NOENT || (!gerr && errno == ENOENT))
+            rc = vmch_answer((why == G_FILE_ERROR_NOENT || (!gerr && errno == ENOENT))
                      ? VMCH_RC_NOTFOUND
                : why == G_FILE_ERROR_NOTDIR ? VMCH_RC_NOTDIR
                : (why == G_FILE_ERROR_ACCES || why == G_FILE_ERROR_PERM)
                      ? VMCH_RC_ACCESS
-               : VMCH_RC_IOERR;
+               : VMCH_RC_IOERR);
             if (gerr) {
                 g_error_free(gerr);
             }
@@ -1238,7 +1271,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 }
                 if (used + 64 > limit) {
                     g_free(leaf);
-                    rc = VMCH_RC_FULL;      /* more entries than fit */
+                    rc = vmch_answer(VMCH_RC_FULL);      /* more entries than fit */
                     break;
                 }
                 memset(resp + used, 0, 64);
@@ -1277,7 +1310,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         int fd;
 
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1287,7 +1320,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         }
         fd = g_open(hp, O_WRONLY | O_CREAT | O_BINARY | O_TRUNC, 0644);
         if (fd < 0) {
-            rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+            rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
         } else {
             close(fd);
         }
@@ -1302,7 +1335,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         GStatBuf st;
 
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1311,22 +1344,22 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             break;
         }
         if (g_stat(hp, &st) != 0) {
-            rc = VMCH_RC_NOTFOUND;
+            rc = vmch_answer(VMCH_RC_NOTFOUND);
         } else if (S_ISDIR(st.st_mode)) {
             /* Every failure here used to be NOTDIR, which the guest could
              * only call "unsupported operation" — for the commonest one,
              * a directory that still holds something. */
             if (g_rmdir(hp) == 0) {
-                rc = VMCH_RC_OK;
+                rc = vmch_answer(VMCH_RC_OK);
             } else if (errno == ENOTEMPTY || errno == EEXIST) {
-                rc = VMCH_RC_NOTEMPTY;
+                rc = vmch_answer(VMCH_RC_NOTEMPTY);
             } else if (errno == EACCES || errno == EPERM || errno == EBUSY) {
-                rc = VMCH_RC_ACCESS;
+                rc = vmch_answer(VMCH_RC_ACCESS);
             } else {
-                rc = VMCH_RC_IOERR;
+                rc = vmch_answer(VMCH_RC_IOERR);
             }
         } else {
-            rc = g_unlink(hp) == 0 ? VMCH_RC_OK : VMCH_RC_ACCESS;
+            rc = vmch_answer(g_unlink(hp) == 0 ? VMCH_RC_OK : VMCH_RC_ACCESS);
         }
         g_free(hp);
         g_free(path);
@@ -1338,12 +1371,12 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         char *split, *hp1, *hp2;
 
         if (!both) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         split = strchr(both, '\n');
         if (!split) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
         } else {
             *split = '\0';
             hp1 = host_path(s, both, &rc);
@@ -1369,8 +1402,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                             hp2 = typed;
                         }
                     }
-                    rc = g_rename(hp1, hp2) == 0 ? VMCH_RC_OK
-                                                 : VMCH_RC_ACCESS;
+                    rc = vmch_answer(g_rename(hp1, hp2) == 0 ? VMCH_RC_OK
+                                                 : VMCH_RC_ACCESS);
                     g_free(hp2);
                 }
                 g_free(hp1);
@@ -1386,7 +1419,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         if (arglen > VMCH_MAX_ARG) {     /* bound check BEFORE the
                                           * allocation: arglen is a raw
                                           * guest value up to 4 GiB */
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         buf = g_malloc(arglen ? arglen : 1);
@@ -1450,11 +1483,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint64_t free_b = 0, total_b = 0;
 
         if (!s->root) {
-            rc = VMCH_RC_NOROOT;
+            rc = vmch_answer(VMCH_RC_NOROOT);
             break;
         }
         if (reason != 30 && reason != 35) {
-            rc = VMCH_RC_BADCMD;
+            rc = vmch_answer(VMCH_RC_BADCMD);
             break;
         }
 #ifndef _WIN32
@@ -1462,7 +1495,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             struct statvfs sv;
 
             if (statvfs(s->root, &sv) != 0) {
-                rc = VMCH_RC_IOERR;
+                rc = vmch_answer(VMCH_RC_IOERR);
                 break;
             }
             free_b = (uint64_t)sv.f_bavail * sv.f_frsize;
@@ -1473,7 +1506,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             ULARGE_INTEGER avail, total, freeb;
 
             if (!GetDiskFreeSpaceExA(s->root, &avail, &total, &freeb)) {
-                rc = VMCH_RC_IOERR;
+                rc = vmch_answer(VMCH_RC_IOERR);
                 break;
             }
             free_b = avail.QuadPart;
@@ -1525,11 +1558,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint32_t type;
 
         if (!s->root) {
-            rc = VMCH_RC_NOROOT;
+            rc = vmch_answer(VMCH_RC_NOROOT);
             break;
         }
         if (!path) {
-            rc = VMCH_RC_BADPATH;
+            rc = vmch_answer(VMCH_RC_BADPATH);
             break;
         }
         hp = host_path(s, path, &rc);
@@ -1553,7 +1586,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             }
             fd = g_open(hp, O_WRONLY | O_CREAT | O_BINARY | O_TRUNC, 0644);
             if (fd < 0) {
-                rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+                rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
             } else {
                 close(fd);
             }
@@ -1573,8 +1606,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             if (errno == EEXIST && g_stat(hp, &st) == 0 && S_ISDIR(st.st_mode)) {
                 break;
             }
-            rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND
-               : (errno == EEXIST) ? VMCH_RC_ACCESS : VMCH_RC_IOERR;
+            rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND
+               : (errno == EEXIST) ? VMCH_RC_ACCESS : VMCH_RC_IOERR);
             break;
         }
 
@@ -1583,7 +1616,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             GStatBuf st;
 
             if (g_stat(hp, &st) != 0) {
-                rc = (errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS;
+                rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
                 break;
             }
 
@@ -1609,7 +1642,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     m |= S_IWUSR;
                 }
                 if (g_chmod(hp, m) != 0) {
-                    rc = VMCH_RC_ACCESS;
+                    rc = vmch_answer(VMCH_RC_ACCESS);
                     break;
                 }
             }
@@ -1658,7 +1691,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                             g_free(hp);
                             hp = g_steal_pointer(&dest);
                         } else {
-                            rc = VMCH_RC_ACCESS;
+                            rc = vmch_answer(VMCH_RC_ACCESS);
                             break;
                         }
                     }
@@ -1716,11 +1749,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint32_t done = 0;
 
         if (!s->root) {
-            rc = VMCH_RC_NOROOT;
+            rc = vmch_answer(VMCH_RC_NOROOT);
             break;
         }
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
             break;
         }
         tmp = g_malloc(MAX(MIN(len, VMCH_XFER_PIECE), 1));
@@ -1736,16 +1769,16 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     /* R3: how far the translation got, over the whole
                      * transfer — the guest faults the rest in and retries */
                     st32(base + VMCH_HDR_REGS + 12, done + got);
-                    rc = VMCH_RC_BADADDR;
+                    rc = vmch_answer(VMCH_RC_BADADDR);
                     break;
                 }
                 n = pwrite(s->fds[h], tmp, part, (off_t)(off + done));
                 if (n < 0) {
-                    rc = VMCH_RC_IOERR;
+                    rc = vmch_answer(VMCH_RC_IOERR);
                     break;
                 }
                 if ((uint32_t)n != part) {
-                    rc = VMCH_RC_FULL;  /* short write: out of space */
+                    rc = vmch_answer(VMCH_RC_FULL);  /* short write: out of space */
                     break;
                 }
             } else {
@@ -1753,7 +1786,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
                 n = pread(s->fds[h], tmp, part, (off_t)(off + done));
                 if (n < 0) {
-                    rc = VMCH_RC_IOERR;
+                    rc = vmch_answer(VMCH_RC_IOERR);
                     break;
                 }
                 /* A short read is the normal end of a file: the count is a
@@ -1766,7 +1799,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 put = guest_rw_counted(addr + done, tmp, part, true);
                 if (put != part) {
                     done += put;
-                    rc = VMCH_RC_BADADDR;
+                    rc = vmch_answer(VMCH_RC_BADADDR);
                     break;
                 }
             }
@@ -1794,15 +1827,15 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         uint32_t count = ld32(base + VMCH_HDR_REGS + 12);
 
         if (!s->root) {
-            rc = VMCH_RC_NOROOT;
+            rc = vmch_answer(VMCH_RC_NOROOT);
             break;
         }
         if (reason != 8) {
-            rc = VMCH_RC_BADCMD;
+            rc = vmch_answer(VMCH_RC_BADCMD);
             break;
         }
         if (h < 0 || h >= VMCH_MAX_OPEN || s->fds[h] == -1) {
-            rc = VMCH_RC_ACCESS;
+            rc = vmch_answer(VMCH_RC_ACCESS);
             break;
         }
         while (count != 0) {
@@ -1810,11 +1843,11 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             ssize_t w = pwrite(s->fds[h], zeros, n, (off_t)off);
 
             if (w < 0) {
-                rc = VMCH_RC_IOERR;
+                rc = vmch_answer(VMCH_RC_IOERR);
                 break;
             }
             if ((size_t)w != n) {
-                rc = VMCH_RC_FULL;
+                rc = vmch_answer(VMCH_RC_FULL);
                 break;
             }
             off += n;
@@ -1824,7 +1857,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
     }
 
     default:
-        rc = VMCH_RC_BADCMD;
+        rc = vmch_answer(VMCH_RC_BADCMD);
         break;
     }
 
@@ -1851,8 +1884,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
          * (FS_FILE 8: cmd 261, rc 10)"), and 2.00's said only "unsupported
          * operation", but neither can say errno, and EINVAL rather than
          * EIO is the whole diagnosis. */
-        if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND && errno != 0) {
-            vmch_trace(" errno=%d(%s)", errno, strerror(errno));
+        if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND && vmch_errno != 0) {
+            vmch_trace(" errno=%d(%s)", vmch_errno, strerror(vmch_errno));
         }
         if (cmd == VMCH_CMD_OPEN || cmd == VMCH_CMD_CREATE ||
             cmd == VMCH_CMD_DELETE || cmd == VMCH_CMD_CAT ||
@@ -1866,7 +1899,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 vmch_trace("%c", (c >= 32 && c < 127) ? c : '.');
             }
             if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND) {
-                vmch_name_check(base, arglen);
+                vmch_name_check(base, arglen, vmch_errno);
             }
         }
         vmch_trace("\n");
