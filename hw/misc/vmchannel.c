@@ -930,12 +930,47 @@ static void vmch_trace(const char *fmt, ...)
     fflush(f);
 }
 
+/* A RISC OS name the host filing system cannot store at all.  Windows
+ * rejects these outright, so an ordinary card tree -- StrongED ships a
+ * directory called TRUE>>>1 -- stops copying partway, with an error that
+ * says nothing about names.  macOS takes all of them, which is why this
+ * only ever bites on one host.  Reported once per run: a failing *Copy
+ * meets the same name for everything underneath it. */
+static void vmch_name_check(hwaddr base, uint32_t arglen)
+{
+    static bool warned;
+    char name[VMCH_MAX_ARG + 1];
+    uint32_t i, n = 0;
+
+    for (i = 0; i < arglen && n < sizeof(name) - 1; i++) {
+        name[n++] = (char)ld8(base + VMCH_HDR_SIZE + i);
+    }
+    name[n] = '\0';
+
+    if (strpbrk(name, "<>:\"|?*") == NULL) {
+        return;
+    }
+    vmch_trace(" [name unstorable on this host]");
+    if (!warned) {
+        warned = true;
+        warn_report("vmchannel: '%s' holds a character this host's filing "
+                    "system cannot store (< > : \" | ? *), so the transfer "
+                    "stops here. RISC OS allows it and so does APFS, so a "
+                    "tree that copies on a Mac can fail on Windows.", name);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Command execution.  base is the request block's guest address.      */
 
 static void vmchannel_do(VMChannelState *s, hwaddr base)
 {
     gint64 started = g_get_monotonic_time();    /* for the trace */
+
+    /* Cleared so the trace's errno= means "what the host last refused
+     * during THIS request", not a leftover from an earlier one.  libc
+     * only ever sets errno, never clears it on success. */
+    errno = 0;
     uint32_t cmd = ld32(base + VMCH_HDR_CMD);
     uint32_t arglen = ld32(base + VMCH_HDR_ARGLEN);
     uint32_t rc = VMCH_RC_OK;
@@ -1767,14 +1802,26 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     ld32(base + VMCH_HDR_REGS + 12),
                     ld32(base + VMCH_HDR_REGS + 16));
         }
+        /* Every host refusal says what the host actually said.  Without
+         * this an unstorable name reads as an I/O error, because
+         * rc_to_error in the guest renders NOTDIR, ISDIR, BADCMD, IOERR
+         * and BADADDR alike as "unsupported operation". */
+        if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND && errno != 0) {
+            vmch_trace(" errno=%d(%s)", errno, strerror(errno));
+        }
         if (cmd == VMCH_CMD_OPEN || cmd == VMCH_CMD_CREATE ||
             cmd == VMCH_CMD_DELETE || cmd == VMCH_CMD_CAT ||
-            cmd == VMCH_CMD_FILEARGS) {
+            cmd == VMCH_CMD_FILEARGS || cmd == VMCH_CMD_RENAME) {
             uint32_t i;
             vmch_trace(" path=");
-            for (i = 0; i < arglen && i < 64; i++) {
+            /* The whole path: a 64-byte cut hides the leaf, and the leaf
+             * is where an unstorable name is. */
+            for (i = 0; i < arglen && i < VMCH_MAX_ARG; i++) {
                 int c = ld8(base + VMCH_HDR_SIZE + i);
                 vmch_trace("%c", (c >= 32 && c < 127) ? c : '.');
+            }
+            if (rc != VMCH_RC_OK && rc != VMCH_RC_NOTFOUND) {
+                vmch_name_check(base, arglen);
             }
         }
         vmch_trace("\n");
