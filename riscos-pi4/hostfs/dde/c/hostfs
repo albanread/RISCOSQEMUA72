@@ -96,6 +96,7 @@ struct vmreq {
 #define C_CREATE   8
 #define C_DELETE   9
 #define C_SETSIZE 18
+#define C_TIME    17   /* response: host UTC, 8 bytes of centiseconds since 1900 */
 
 #define RC_OK        0
 #define RC_NOROOT    1
@@ -122,10 +123,12 @@ struct vmreq {
 #define XOS_NewLine         0x20003
 #define XOS_CLI             0x20005
 #define XOS_Byte            0x20006
+#define XOS_Word            0x20007
 #define XOS_File            0x20008
 #define XOS_Module          0x2001E
 #define XOS_FSControl       0x20029
 #define XOS_Memory          0x20068
+#define XOS_ConvertStandardDateAndTime 0x200C0
 
 /* in s.head: any SWI, as its X form, through OS_CallASWIR12 */
 _kernel_oserror *swix(int swi, const _kernel_swi_regs *in,
@@ -139,14 +142,14 @@ _kernel_oserror *hostfs_register(void *pw);
 struct hostws;
 _kernel_oserror *hostfs_free_register(struct hostws *ws, int deregister);
 
-/* in s.head: the hooks that keep CMOS on the share — op 0 add the start-up
- * callback, 1 remove it, 2 claim ByteV, 3 release it */
+/* in s.head: the start-up callback, and the hook that keeps CMOS on the
+ * share — op 0 add the callback, 1 remove it, 2 claim ByteV, 3 release it */
 _kernel_oserror *hostfs_cmos_hooks(void *pw, int op);
 #define CMOS_CALLBACK_ADD     0
 #define CMOS_CALLBACK_REMOVE  1
 #define CMOS_BYTEV_CLAIM      2
 #define CMOS_BYTEV_RELEASE    3
-void hostfs_cmos_check(void *pw);
+void hostfs_startup(void *pw);
 
 /* in s.head: the constant error blocks, by number, in its table's order */
 _kernel_oserror *hostfs_error(int which);
@@ -375,6 +378,7 @@ static const char *req_name(uint32_t cmd)
     case C_DELETE:      return "DELETE";
     case C_RENAME:      return "RENAME";
     case C_SETSIZE:     return "SETSIZE";
+    case C_TIME:        return "TIME";
     case C_FS_GETBYTES: return "FS_GETBYTES";
     case C_FS_PUTBYTES: return "FS_PUTBYTES";
     case C_FS_ARGS:     return "FS_ARGS";
@@ -1505,25 +1509,80 @@ _kernel_oserror *hostfs_init(const char *cmd_tail, int podule_base, void *pw)
     /* Free space for *ShowFree.  No Free module is no reason to refuse. */
     (void)hostfs_free_register(ws, 0);
 
-    /* Whether to keep CMOS on the share is decided once start-up is over
-     * (hostfs_cmos_check); no callback is no reason to refuse either. */
+    /* The clock and the CMOS are seen to once start-up is over
+     * (hostfs_startup); no callback is no reason to refuse either. */
     (void)hostfs_cmos_hooks(pw, CMOS_CALLBACK_ADD);
     return NULL;
 }
 
 /*
- * The start-up callback.  Keep CMOS on the share when HostFS is the
- * configured filing system and the share holds $.CMOS of type Configuration
- * (or DOS, as SDCMOS also accepts): after that, every CMOS write runs
- * *SaveCMOS HostFS:$.CMOS (s.head, MyByteV).  A share that is not the boot
- * disc is never written to.
+ * Set the RISC OS clock from the host's.
+ *
+ * A Pi has no real-time clock: RISC OS takes the time from the network
+ * (NetTime), and a machine with no network starts at 1 January 1970 and
+ * datestamps everything it writes from there.  The doorbell's TIME request
+ * answers with the host's UTC as centiseconds since 1900 — the RISC OS
+ * 5-byte time, in the low five bytes — and OS_Word 15,5 writes all of the
+ * clock from exactly that (Kernel/s/PMF/osword, OsWord0F_5byte).  One
+ * request and one kernel call: no clock chip is emulated for it.
+ *
+ * On success `when` holds the time that was set.
  */
-void hostfs_cmos_check(void *pw)
+static _kernel_oserror *set_clock_from_host(struct hostws *ws,
+                                            uint8_t *when)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    uint8_t block[6];
+    uint32_t i, rc;
+
+    e = ensure_vmch(ws);
+    if (e != NULL) {
+        return e;
+    }
+    req->cmd = C_TIME;
+    req->handle = 0;
+    req->arglen = 0;
+    rc = vmch_go(ws);
+    if (rc != RC_OK) {
+        return rc_to_error(ws, rc);       /* an emulator without TIME says so */
+    }
+    if (vmch_arglen(ws) != 8u) {
+        return &err_nodev;
+    }
+    block[0] = 5;                        /* OS_Word 15,5: 5-byte UTC time */
+    for (i = 0; i < 5u; i++) {
+        block[1 + i] = req->data[i];
+        when[i] = req->data[i];
+    }
+    r.r[0] = 15;
+    r.r[1] = (int)block;
+    return swix(XOS_Word, &r, &r);
+}
+
+/*
+ * The start-up callback (s.head, StartupCallBack): once, as soon as the
+ * doorbell can be mapped.
+ *
+ * The clock first, before the boot sequence writes anything it would stamp.
+ *
+ * Then the CMOS: keep it on the share when HostFS is the configured filing
+ * system and the share holds $.CMOS of type Configuration (or DOS, as
+ * SDCMOS also accepts): after that, every CMOS write runs *SaveCMOS
+ * HostFS:$.CMOS (s.head, MyByteV).  A share that is not the boot disc is
+ * never written to.
+ */
+void hostfs_startup(void *pw)
 {
     struct hostws *ws = WS_OF(pw);
     _kernel_swi_regs r;
+    uint8_t when[5];
 
-    if (ws == NULL || ws->w_cmos_saving) {
+    if (ws == NULL) {
+        return;
+    }
+    (void)set_clock_from_host(ws, when);  /* no clock is no reason to stop */
+    if (ws->w_cmos_saving) {
         return;
     }
     r.r[0] = 161;                        /* OS_Byte 161: read CMOS */
@@ -1640,7 +1699,28 @@ _kernel_oserror *hostfs_commands(const char *arg_string, int argc,
     (void)argc;
 
     /* cmd_no is the command's position in head.s's table: 0 = HostFSPing,
-     * 1 = HostFSStatus.  Keep the two in step. */
+     * 1 = HostFSStatus, 2 = HostFSTime.  Keep the two in step. */
+    if (cmd_no == 2) {                   /* *HostFSTime */
+        uint8_t when[5];
+        char text[64];
+
+        e = set_clock_from_host(ws, when);
+        if (e != NULL) {
+            return e;
+        }
+        /* Shown as the territory shows a time: in its zone, which is UTC
+         * only while none is configured, so the text claims no zone. */
+        out_str("HostFS: clock set from the host, ");
+        r.r[0] = (int)when;              /* OS_ConvertStandardDateAndTime */
+        r.r[1] = (int)text;
+        r.r[2] = (int)sizeof text;
+        if (swix(XOS_ConvertStandardDateAndTime, &r, &r) == NULL) {
+            out_str(text);
+        }
+        out_nl();
+        return NULL;
+    }
+
     if (cmd_no == 1) {                   /* *HostFSStatus */
         uint32_t mbase = 0, msize = 0, w = (uint32_t)(unsigned long)ws;
 

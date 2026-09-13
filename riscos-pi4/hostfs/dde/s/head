@@ -29,7 +29,7 @@
         IMPORT  fsentry_close_handler
         IMPORT  fsentry_file_handler
         IMPORT  fsentry_func_handler
-        IMPORT  hostfs_cmos_check
+        IMPORT  hostfs_startup
 
         EXPORT  swix
         EXPORT  hostfs_register
@@ -68,7 +68,7 @@ Module_Base
 Flags   DCD     1                               ; bit 0: 32-bit compatible
 
 Title   =       "HostFS", 0
-Help    =       "HostFS", 9, 9, "2.02 (13 Sep 2026)", 0
+Help    =       "HostFS", 9, 9, "2.03 (13 Sep 2026)", 0
         ALIGN
 
 ; *Command table (PRM 1-205).  Information word: byte 0 minimum parameters,
@@ -89,6 +89,13 @@ Commands
         DCD     Status_Syntax - Module_Base
         DCD     Status_Help - Module_Base
 
+        =       "HostFSTime", 0
+        ALIGN
+        DCD     Cmd_Time - Module_Base
+        DCD     0
+        DCD     Time_Syntax - Module_Base
+        DCD     Time_Help - Module_Base
+
         =       0
 
 Ping_Help
@@ -100,6 +107,11 @@ Status_Help
         =       "FileSwitch registration probes", 13, 0
 Status_Syntax
         =       "Syntax:", 9, "*HostFSStatus", 0
+Time_Help
+        =       "*HostFSTime sets the clock from the host's, as HostFS does "
+        =       "once at start-up", 13, 0
+Time_Syntax
+        =       "Syntax:", 9, "*HostFSTime", 0
         ALIGN
 
 ; ---------------------------------------------------------------------------
@@ -133,6 +145,10 @@ Cmd_Ping
 Cmd_Status
         STMFD   sp!, {r4-r11, lr}
         MOV     r2, #1
+        B       Cmd_Common
+Cmd_Time
+        STMFD   sp!, {r4-r11, lr}
+        MOV     r2, #2
 Cmd_Common
         MOV     r3, r12
         BL      hostfs_commands
@@ -360,7 +376,8 @@ Free_Path
 ; has a $.CMOS, every CMOS write is followed by *SaveCMOS to it, and the
 ; launcher boots from that file next time (tools/rom.zsh).
 ;
-;   op 0  OS_AddCallBack the check — it has to wait until after start-up,
+;   op 0  OS_AddCallBack the start-up work — setting the clock from the
+;         host, then this check — which has to wait until after start-up,
 ;         like SDCMOS's, because HostFS cannot map its doorbell during init
 ;   op 1  OS_RemoveCallBack it, in case HostFS is killed first
 ;   op 2  claim ByteV            op 3  release ByteV
@@ -372,7 +389,7 @@ hostfs_cmos_hooks
         STMFD   sp!, {r4-r11, lr}
         MOV     r4, r0
         MOV     r5, r1
-        ADRL    r0, CMOSCallBack
+        ADRL    r0, StartupCallBack
         MOV     r1, r4
         TEQ     r5, #0                          ; branches, not SWIEQ/SWINE:
         BNE     %FT10                           ; a SWI's flags are its own
@@ -394,11 +411,12 @@ hostfs_cmos_hooks
         LDMFD   sp!, {r4-r11, pc}
 
 ; The callback: SVC mode, R12 = the private word pointer; everything
-; preserved.  hostfs_cmos_check(pw) decides whether to claim ByteV.
-CMOSCallBack
+; preserved.  hostfs_startup(pw) sets the clock from the host, then decides
+; whether to claim ByteV.
+StartupCallBack
         STMFD   sp!, {r0-r11, lr}
         MOV     r0, r12
-        BL      hostfs_cmos_check
+        BL      hostfs_startup
         LDMFD   sp!, {r0-r11, pc}
 
 ; ByteV, as SDCMOS's MyByteV: pass OS_Byte 162 on with a return address
