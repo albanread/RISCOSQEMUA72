@@ -112,6 +112,12 @@ struct vmreq {
 #define RC_BADADDR  11   /* a guest address would not translate */
 #define RC_NOTEMPTY 12   /* a directory that still holds something */
 
+/* The host marks a directory in the response `type` field with this
+ * out-of-band value, not filetype 0, so a real type-&000 file is not
+ * mistaken for a directory (issue #13).  Mirrors VMCH_TYPE_DIR in
+ * include/hw/misc/vmchannel.h; 0x1000 is RISC OS's DirType. */
+#define VMCH_TYPE_DIR 0x1000
+
 #define O_READ   0x1u
 #define O_WRITE  0x2u
 #define O_CREATE 0x4u
@@ -557,7 +563,7 @@ static uint32_t objtype_of(uint32_t rc, uint32_t type)
     if (rc != RC_OK) {
         return 0;
     }
-    return type == 0 ? 2 : 1;
+    return type == VMCH_TYPE_DIR ? 2 : 1;
 }
 
 /* FSEntry_File on the host: R0 reason, R2 load, R3 exec, R5 attr, and the
@@ -572,6 +578,8 @@ static uint32_t file_on_host(struct hostws *ws, _kernel_swi_regs *r,
     REQW(0) = (uint32_t)r->r[0];
     REQW(2) = (uint32_t)r->r[2];
     REQW(3) = (uint32_t)r->r[3];
+    REQW(4) = (uint32_t)r->r[4];    /* reason 7: start address; the file's
+                                     * extent is R5-R4 (issue #15) */
     REQW(5) = (uint32_t)r->r[5];
     put_path(ws, name);
     return vmch_go(ws);
@@ -815,10 +823,10 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
      * FileSwitch then drives GetBytes/PutBytes in whole blocks and
      * tracks PTR#/EXT# for us. */
     r->r[0] = (int)((1u << 31) | (1u << 30) |
-                    ((type == 0) ? (1u << 29) : 0u));   /* 29: directory */
+                    ((type == VMCH_TYPE_DIR) ? (1u << 29) : 0u)); /* 29: dir */
     r->r[1] = (int)h;
     r->r[2] = HOSTFS_BUFSIZE;
-    r->r[3] = (int)((type == 0) ? 0 : size);            /* extent */
+    r->r[3] = (int)((type == VMCH_TYPE_DIR) ? 0 : size);   /* extent */
     /* allocated space: must be a multiple of the buffer size */
     r->r[4] = (int)((size + (HOSTFS_BUFSIZE - 1u)) & ~(HOSTFS_BUFSIZE - 1u));
     return NULL;
@@ -1389,7 +1397,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                 uint32_t nameat = (reason == 15) ? 20u : 29u;
                 uint32_t *w = (uint32_t *)buf;
 
-                if (e->type == 0) {
+                if (e->type == VMCH_TYPE_DIR) {
                     load = exec = 0;    /* directories carry neither */
                     e->len = 0;
                     e->attr = 3;
@@ -1401,7 +1409,7 @@ _kernel_oserror *fsentry_func_handler(_kernel_swi_regs *r, void *pw)
                 w[1] = exec;
                 w[2] = e->len;
                 w[3] = e->attr;
-                w[4] = (e->type == 0) ? 2 : 1;   /* object type, not the
+                w[4] = (e->type == VMCH_TYPE_DIR) ? 2 : 1;   /* object type, not the
                                                   * filetype — which rides
                                                   * in load — or files read
                                                   * as directories (DWR/) */

@@ -1002,11 +1002,23 @@ static char *host_base_of(const char *host_leaf)
  * extension is left to speak for itself, so a file copied in as
  * `hello.c` copies out as `hello.c` rather than `hello.c,fff`.
  */
-static char *host_leaf_for(const char *host_base, uint32_t type)
+static char *host_leaf_for(const char *host_base, uint32_t type, bool is_dir)
 {
     const char *dot = strrchr(host_base, '.');
     uint32_t implied = (dot && dot != host_base) ? type_for_ext(dot + 1)
                                                  : 0xFFF;
+
+    /*
+     * A directory carries no type, so its host name is its base name and
+     * nothing more.  This used to be spotted as `type == 0`, but &000 is a
+     * real, allocated filetype, not "no type": a file of type &000 was
+     * written bare and read back as the default &FFF (issue #13).  Only an
+     * actual directory -- told apart by its own flag now -- skips the suffix
+     * on account of being typeless.
+     */
+    if (is_dir) {
+        return g_strdup(host_base);
+    }
 
     /*
      * The name is only decorated when its own spelling would say otherwise,
@@ -1019,8 +1031,8 @@ static char *host_leaf_for(const char *host_base, uint32_t type)
      * it asked for, so every copied file with a type in the table failed
      * with "file not found".
      */
-    if (type == 0 || type == implied) {
-        return g_strdup(host_base);     /* a directory, or already says it */
+    if (type == implied) {
+        return g_strdup(host_base);     /* the name already says it */
     }
     return g_strdup_printf("%s,%03x", host_base, type);
 }
@@ -1360,7 +1372,10 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
             load_exec_for(type, cs, &load, &exec);
             stl_le_p(resp + 0, size);
-            stl_le_p(resp + 4, type);
+            /* A directory is signalled out of band, not as filetype 0, so a
+             * real type-&000 file is not read back as a directory (#13).
+             * load/exec above still use the real type. */
+            stl_le_p(resp + 4, S_ISDIR(st.st_mode) ? VMCH_TYPE_DIR : type);
             stl_le_p(resp + 8, attrs_for(&st));
             stl_le_p(resp + 12, (uint32_t)cs);
             stl_le_p(resp + 16, (uint32_t)(cs >> 32));
@@ -1454,7 +1469,10 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     continue;
                 }
                 e->leaf = leaf;
-                e->type = type;
+                /* A directory is signalled out of band, not as filetype 0,
+                 * so a real type-&000 file is not listed as a directory
+                 * (#13).  load/exec below still use the real type. */
+                e->type = isdir ? VMCH_TYPE_DIR : type;
                 /* Dated in the entry: a catalogue that carried only the
                  * type made every file in a *Ex listing show 01-Jan-1900,
                  * the only other date source being a FILEARGS per name. */
@@ -1586,7 +1604,8 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                         g_autofree char *dir = g_path_get_dirname(hp2);
                         g_autofree char *leaf = g_path_get_basename(hp2);
                         g_autofree char *stem = host_base_of(leaf);
-                        g_autofree char *want = host_leaf_for(stem, type);
+                        g_autofree char *want = host_leaf_for(stem, type,
+                                                    S_ISDIR(st.st_mode));
 
                         if (strcmp(want, leaf) != 0) {
                             char *typed = g_build_filename(dir, want, NULL);
@@ -1764,6 +1783,9 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
 
         if (reason == 7) {              /* create empty, of a given type */
             int fd;
+            uint32_t start = ld32(base + VMCH_HDR_REGS + 16);   /* R4 */
+            uint32_t end = attr;        /* R5 here is the end address, not an
+                                         * attribute word (see the note) */
 
             type = type_of_load(load);
             if (type != 0xFFFFFFFFu) {
@@ -1772,7 +1794,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 g_autofree char *dir = g_path_get_dirname(hp);
                 g_autofree char *leaf = g_path_get_basename(hp);
                 g_autofree char *stem = host_base_of(leaf);
-                g_autofree char *want = host_leaf_for(stem, type);
+                g_autofree char *want = host_leaf_for(stem, type, false);
                 g_autofree char *dest = g_build_filename(dir, want, NULL);
 
                 /* The name resolved to an existing host file spelt for
@@ -1794,6 +1816,16 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             if (fd < 0) {
                 rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
             } else {
+                /* PRM 2-541: reason 7 creates a file whose extent is
+                 * R5-R4.  *Create <len> and OS_File 11 ask for a length
+                 * this way; the file was left empty, so *Create &800 gave 0
+                 * bytes rather than 2048 (issue #15).  The guest forwards R4
+                 * (file_on_host) so the length is exact. */
+                uint32_t want_len = (end >= start) ? (end - start) : 0;
+
+                if (want_len && ftruncate(fd, (off_t)want_len) != 0) {
+                    rc = vmch_answer(VMCH_RC_IOERR);
+                }
                 close(fd);
             }
             break;
@@ -1882,7 +1914,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     g_autofree char *dir = g_path_get_dirname(hp);
                     g_autofree char *leaf = g_path_get_basename(hp);
                     g_autofree char *stem = host_base_of(leaf);
-                    g_autofree char *want = host_leaf_for(stem, type);
+                    g_autofree char *want = host_leaf_for(stem, type, false);
 
                     if (strcmp(want, leaf) != 0) {
                         g_autofree char *dest = g_build_filename(dir, want,

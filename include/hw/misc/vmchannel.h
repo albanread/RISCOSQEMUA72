@@ -113,6 +113,13 @@
 #define VMCH_RC_BADADDR  11   /* a guest address would not translate */
 #define VMCH_RC_NOTEMPTY 12   /* a directory that still holds something */
 
+/* The `type` field of a FILEARGS/CAT response carries a 12-bit RISC OS
+ * filetype (0x000..0xFFF) for a file -- &000 is a real, allocated type --
+ * or this out-of-band sentinel for a directory.  It used to be 0, which
+ * collided with filetype &000: a file of type &000 read back as a directory
+ * (issue #13).  0x1000 is RISC OS's own DirType, outside the 12-bit range. */
+#define VMCH_TYPE_DIR 0x1000
+
 /* OPEN: header word at +12 (before handle is filled) is the flags */
 #define VMCH_OPEN_READ    0x1
 #define VMCH_OPEN_WRITE   0x2
@@ -127,7 +134,7 @@
 
 /* FILEARGS response, inline after the header:
  *   +64 u32 size
- *   +68 u32 type (RISC OS 12-bit type; 0xFFF for plain data, 0 = dir)
+ *   +68 u32 type (RISC OS 12-bit type; 0xFFF plain data, 0x1000 = dir)
  *   +72 u32 attrs (RISC OS-style: bit0 owner-read, 1 write, 2 locked...)
  *   +76 u32 date low, centiseconds since 1900
  *   +80 u32 date high (the instant is 40 bits; 0 = unknown)
