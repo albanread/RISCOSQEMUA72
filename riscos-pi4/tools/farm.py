@@ -290,8 +290,14 @@ def up(args):
             flags = (subprocess.DETACHED_PROCESS
                      | subprocess.CREATE_NEW_PROCESS_GROUP)
 
+        # Its own doorbell trace.  Four machines appending to one file,
+        # with no machine name and no timestamp on a line, cannot be read
+        # afterwards: you cannot tell whose failure you are looking at.
+        env = child_env()
+        env["VMCH_TRACE"] = os.path.join(p["logs"], "vmch-trace.txt")
+
         process = subprocess.Popen(
-            argv, env=child_env(), stdout=log, stderr=log,
+            argv, env=env, stdout=log, stderr=log,
             stdin=subprocess.DEVNULL, creationflags=flags,
             cwd=p["dir"])
 
