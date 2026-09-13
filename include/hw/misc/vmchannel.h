@@ -144,15 +144,22 @@
  * own version special-cased &FFF to all-ones, so every file in a *Ex
  * listing came back untyped and undated. */
 
-/* CAT response: array of 64-byte entries until arglen is exhausted:
- *   +0  40 bytes: name, NUL padded (the name the guest sees: a ,xxx
- *                 suffix consumed, a host dot shown as a slash)
- *   +40 u32 load, +44 u32 exec   ready-made, so a listing is dated
- *   +48 u32 type, +52 u32 size, +56 u32 attrs, +60 u32 pad */
+/* CAT response: an array of fixed VMCH_CAT_ENTRY-byte entries until arglen
+ * is exhausted.  Metadata first, then the name, so the name can be long
+ * without moving the fixed fields:
+ *   +0  u32 load, +4 u32 exec   ready-made, so a listing is dated
+ *   +8  u32 type (0x1000 = directory), +12 u32 size, +16 u32 attrs
+ *   +20 name, NUL-terminated and NUL-padded to the end of the entry (the
+ *       name the guest sees: a ,xxx suffix consumed, a host dot a slash)
+ * The name field was 40 bytes with the metadata after it; a leafname of 40
+ * characters or more was dropped from the listing (issue #16).  RISC OS
+ * leafnames reach 255, so the field is VMCH_MAX_NAME and the metadata moved
+ * ahead of it. */
 
 #define VMCH_MAX_OPEN 16
-#define VMCH_MAX_NAME 40
+#define VMCH_MAX_NAME 256                    /* 255-char leaf + NUL */
 #define VMCH_MAX_ARG  4032   /* one page: 64-byte header + 4032 */
+#define VMCH_CAT_ENTRY (20 + VMCH_MAX_NAME)  /* one CAT wire entry, meta+name */
 
 #define TYPE_VMCHANNEL "vmchannel"
 OBJECT_DECLARE_SIMPLE_TYPE(VMChannelState, VMCHANNEL)

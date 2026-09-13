@@ -1486,22 +1486,30 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             for (i = start; i < total; i++) {
                 caten *e = g_ptr_array_index(ents, i);
 
-                if (used + 64 > limit) {
+                if (used + VMCH_CAT_ENTRY > limit) {
                     break;                          /* this page is full */
                 }
-                memset(resp + used, 0, 64);
-                memcpy(resp + used, e->leaf, strlen(e->leaf));
-                stl_le_p(resp + used + 40, e->load);
-                stl_le_p(resp + used + 44, e->exec);
-                stl_le_p(resp + used + 48, e->type);
-                stl_le_p(resp + used + 52, e->size);
-                stl_le_p(resp + used + 56, e->attrs);
-                used += 64;
+                /* Metadata first, then the name (issue #16): so a leafname
+                 * up to VMCH_MAX_NAME-1 rides in the entry without moving
+                 * the fixed fields.  memset NUL-pads the whole entry, so
+                 * the name is NUL-terminated. */
+                memset(resp + used, 0, VMCH_CAT_ENTRY);
+                stl_le_p(resp + used + 0,  e->load);
+                stl_le_p(resp + used + 4,  e->exec);
+                stl_le_p(resp + used + 8,  e->type);
+                stl_le_p(resp + used + 12, e->size);
+                stl_le_p(resp + used + 16, e->attrs);
+                memcpy(resp + used + 20, e->leaf, strlen(e->leaf));
+                used += VMCH_CAT_ENTRY;
                 packed++;
             }
             /* HANDLE out: any entries left after this page (the guest pages
              * on until it is 0), not an error. */
             st32(base + VMCH_HDR_HANDLE, (start + packed < total) ? 1 : 0);
+            /* The entry count, so the guest need not divide arglen by the
+             * (non-power-of-two) entry size -- a runtime divide the ROM
+             * module cannot link (issue #16). */
+            st32(base + VMCH_HDR_ARG, packed);
             if (used) {
                 block_write(base + VMCH_HDR_SIZE, resp, used);
             }
