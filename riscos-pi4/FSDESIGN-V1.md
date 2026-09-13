@@ -999,9 +999,24 @@ it ran.
   `instance.sh`), puts `hostfs/dde/HostFS,ffa` ahead of `RISCOS_MODULES`
   when `RISCOS_HOSTFS` is set. `RISCOS_HOSTFS_MODULE` names another build,
   or empty for none; a module titled HostFS already in `RISCOS_MODULES`
-  stands instead. The Windows launchers (`run.py`, `farm.py`) are not
-  changed; they boot RAM snapshots, and a snapshot taken without HostFS in
-  ROM restores a machine without it.
+  stands instead.
+- **Done: the Windows launchers do the same, 13 Sep.** `tools/rom.py` is
+  that logic in Python, imported by `run.py` and `farm.py`, driving the
+  same `mkrom.py` and `mkcmos.py`; `--hostfs` splices, `--modules` adds,
+  `--boot hostfs` boots the share. Confirmed on Windows against a stock
+  5.30 ROM: HostFS and HostFSFiler both report 2.00 (12 Sep 2026), the
+  icon is on the icon bar, `*Cat HostFS:` lists the share, and a share
+  holding only a copied `!Boot` reaches a desktop with `Boot$Dir` on
+  `HostFS::HostFS.$` and the card still attached as `:0`.
+  Two traps that cost time here:
+  - **The emulator must be rebuilt, not just pulled.** A 2.00 module on a
+    host binary predating the §6 name work answers `*Cat HostFS:` with
+    `HostFS: bad path` — a guest-side fault by every appearance, and
+    entirely a stale `hw/misc/vmchannel.c`.
+  - **A snapshot decides its own ROM.** `-loadvm` restores RAM and the ROM
+    lives in RAM, so a machine saved without HostFS in ROM comes back
+    without it. `run.py` says so rather than letting you wonder, and
+    refuses `--boot` with `--snapshot`.
 - **Done: first use needs no priming.** After a reset, the very first
   command, `*Cat HostFS:`, lists the share; the doorbell maps on that call.
 - **Open: the cards shadow the ROM.** Checked on the DDE card:

@@ -40,6 +40,8 @@ import subprocess
 import sys
 import time
 
+import rom
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 QEMU = r"F:\RISCOSDEV\qemu\build\qemu-system-aarch64.exe"
@@ -208,15 +210,15 @@ def create(args):
 # ---------------------------------------------------------------------- up
 
 
-def command_line(name, port, display, audiodev):
+def command_line(name, port, display, audiodev, kernel, cmos):
     p = paths(name)
     return [
         QEMU,
         "-name", f"riscos-{name}",
         "-M", "raspi4b",
         "-cpu", "cortex-a72,aarch64=off",
-        "-kernel", KERNEL,
-        "-device", f"loader,file={CMOS},addr=0x510000,force-raw=on",
+        "-kernel", kernel,
+        "-device", f"loader,file={cmos},addr=0x510000,force-raw=on",
         "-drive", f"file={p['overlay']},if=sd,format=qcow2",
         "-netdev", "user,id=n0",
         "-device", "usb-hub,bus=usb-bus.0,port=1",
@@ -251,7 +253,29 @@ def up(args):
             print(f"{name:<8} already up on {port}")
             continue
 
-        argv = command_line(name, port, args.display, args.audiodev)
+        # Which ROM and CMOS this machine boots.  run.py follows the Mac
+        # rule that a share brings HostFS into the ROM; the farm cannot,
+        # because every instance has a share and the base image already
+        # soft-loads its own HostFS from PreDesk -- two versions of one
+        # module in one machine, which nobody has tried.  So here it is
+        # opt-in, and --boot hostfs turns it on because booting off the
+        # share needs the module in the ROM to get there.
+        rom_hostfs = args.rom_hostfs or args.boot == "hostfs"
+        try:
+            kernel = rom.rom_to_boot(
+                KERNEL, args.modules,
+                hostfs=p["share"] if rom_hostfs else None)
+            # Per instance: four machines have four shares, so four CMOS
+            # blobs, and a shared output path would be a race.
+            cmos = rom.cmos_to_boot(CMOS, args.boot, hostfs=p["share"],
+                                    out_dir=p["dir"])
+        except rom.RomError as exc:
+            print(f"{name:<8} {exc}")
+            failures += 1
+            continue
+
+        argv = command_line(name, port, args.display, args.audiodev,
+                            kernel, cmos)
         log = open(p["log"], "ab", buffering=0)
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"{' '.join(argv)}\n".encode())
@@ -415,6 +439,16 @@ def main():
     p_up.add_argument("--audiodev", default="dsound",
                       help="host audio driver (dsound default on Windows, "
                            "coreaudio on macOS, none for a quiet farm)")
+    p_up.add_argument("--boot", choices=("hostfs",), metavar="SOURCE",
+                      help="'hostfs' boots the instance's own share "
+                           "instead of its overlay; implies --rom-hostfs")
+    p_up.add_argument("--rom-hostfs", action="store_true",
+                      help="splice HostFS and its icon-bar filer into the "
+                           "ROM (the base image soft-loads its own from "
+                           "PreDesk, so this is off by default)")
+    p_up.add_argument("--modules", nargs="*", default=[], metavar="FILE",
+                      help="further modules spliced into the ROM, in "
+                           "initialisation order")
     p_up.set_defaults(func=up)
 
     for cmd, fn in (("down", down), ("reset", reset), ("shot", shot)):

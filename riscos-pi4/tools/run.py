@@ -6,6 +6,9 @@
     run.py --snapshot desktop  cold-start from that snapshot (<1s)
     run.py --save desktop      boot, save machine + disc state under that
                                name once the desktop is up, keep running
+    run.py --hostfs DIR --boot hostfs
+                               boot the share's own !Boot instead of the
+                               card's; the card stays on, as SDFS::0
 
 The overlay (<image>-overlay.qcow2) is created on first use beside the
 card image, so a snapshot carries both the machine and the disc.  The
@@ -24,6 +27,8 @@ import socket
 import subprocess
 import sys
 import time
+
+import rom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 QEMU = r"F:\RISCOSDEV\qemu\build\qemu-system-aarch64.exe"
@@ -194,8 +199,38 @@ def main():
     ap.add_argument("--image", default=IMAGE)
     ap.add_argument("--hostfs", metavar="DIR",
                     help="serve this host directory as HostFS:$ through "
-                         "the doorbell device")
+                         "the doorbell device; a share also brings HostFS "
+                         "and its icon-bar filer into the ROM")
+    ap.add_argument("--boot", choices=("hostfs",), metavar="SOURCE",
+                    help="'hostfs' boots the share's own !Boot instead of "
+                         "the card's; the card stays attached as SDFS::0")
+    ap.add_argument("--modules", nargs="*", default=[], metavar="FILE",
+                    help="further modules spliced into the ROM before "
+                         "boot, in initialisation order")
     args = ap.parse_args()
+
+    # A snapshot restores RAM, and the ROM lives in RAM: -kernel is loaded
+    # and then overwritten by the restored image, so what is in ROM was
+    # decided when the snapshot was taken, not here.
+    if args.snapshot:
+        if args.boot:
+            raise SystemExit("--boot chooses what to boot; --snapshot skips "
+                             "the boot entirely. Use one or the other.")
+        if args.hostfs or args.modules:
+            print("note: --snapshot restores the ROM the snapshot was taken "
+                  "with, so a machine saved without HostFS in ROM comes back "
+                  "without it. Re-save from a cold boot to change that.",
+                  flush=True)
+
+    # Which ROM and CMOS this launch boots: the same rules, and the same
+    # two builders, that run-macos.sh gets from rom.zsh.
+    try:
+        args.kernel = rom.rom_to_boot(args.kernel, args.modules,
+                                      hostfs=args.hostfs)
+        args.cmos = rom.cmos_to_boot(args.cmos, args.boot,
+                                     hostfs=args.hostfs)
+    except rom.RomError as exc:
+        raise SystemExit(str(exc))
 
     overlay = overlay_for(args.image)
     ensure_overlay(args.qemu_img, args.image, overlay)

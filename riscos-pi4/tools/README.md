@@ -39,6 +39,48 @@ that state (the qcow2 is fine — the filesystem *inside* the disc is
 what tore; only the guest can see it).  Recovery is to quarantine the
 overlay and let `run.py` mint a fresh one from the pristine image.
 
+## rom.py — which ROM and CMOS a launch boots
+
+The Python half of `rom.zsh`, so a Windows machine and the farm start the
+same way a Mac does, off the same `mkrom.py` and `mkcmos.py`.  `run.py`
+and `farm.py` import it; nothing else needs to know it is there.
+
+    run.py --hostfs DIR              a share brings HostFS and its
+                                     icon-bar filer into the ROM
+    run.py --hostfs DIR --boot hostfs
+                                     boot the share's own !Boot instead
+                                     of the card's; the card stays on,
+                                     reachable as SDFS::0
+    run.py --modules a,ffa b,ffa     further modules, in init order
+
+The spliced image is cached beside the stock ROM under a hash of the ROM
+and every module's contents, so editing a module rebuilds it and a
+relaunch does not.  With nothing to splice, the stock `RISCOS.IMG` boots
+untouched.  A module whose title is already in `--modules` stands instead
+of the default build, so you can test your own HostFS by naming it.
+
+Two things worth knowing before you use it:
+
+- **A snapshot decides its own ROM.** `-loadvm` restores RAM, and the ROM
+  lives in RAM: `-kernel` is loaded and then overwritten.  So a machine
+  saved without HostFS in ROM comes back without it however you launch
+  it, and `run.py` says so rather than letting you wonder.  Re-save from
+  a cold boot to change what a snapshot has.  `--boot` with `--snapshot`
+  is refused outright: one chooses what to boot, the other skips the
+  boot.
+- **A card can shadow the ROM.** `!Boot.Choices.Boot.PreDesk.BootHostFS`
+  is an unconditional `RMLoad`, and `RMLoad` replaces a ROM module of the
+  same name, so a card carrying it ends up on its own older HostFS.
+  FSDESIGN-V1.md §13 R2 has the fix (an `RMEnsure`) and who owns it.
+
+`farm.py up` takes the same `--boot` and `--modules`, and `--rom-hostfs`
+to splice HostFS in.  That one is opt-in on the farm and not on `run.py`,
+because every instance has a share — so the Mac rule "a share brings
+HostFS" would splice into all four — and the farm's base image carries
+exactly the `BootHostFS` above, which would shadow it anyway.  `--boot
+hostfs` turns it on by itself, since reaching the share needs the module
+in the ROM to get there.
+
 ## macOS: the launch, and the ticker
 
 `run-macos.sh` is the launch line from `../README.md` with `-display
