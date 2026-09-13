@@ -62,6 +62,11 @@ KEYS.update({
     "@": ("apostrophe", True),
     "[": ("bracket_left", False),
     "]": ("bracket_right", False),
+    # Redirection needs braces: `*Count x { > HostFS:$.out }` puts the
+    # answer where the host can read it, instead of on a screen someone
+    # has to photograph.
+    "{": ("bracket_left", True),
+    "}": ("bracket_right", True),
     "#": ("backslash", False),          # UK: the key right of apostrophe
     "~": ("backslash", True),
     "\\": ("less", False),              # UK: the key left of Z
