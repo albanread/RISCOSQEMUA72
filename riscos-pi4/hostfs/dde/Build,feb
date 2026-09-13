@@ -3,6 +3,11 @@
 | from the RMA.  Obey halts at the first failing command, so any error
 | below is the one to read.  The o directory must exist already.
 |
+| The output is named HostFS, not HostFS,ffa: link -rmf types it Module
+| itself, which a host share stores as HostFS,ffa.  Named HostFS,ffa on
+| HostFS 2.x, the linker creates it as Data -- HostFS,ffd on the host --
+| and then cannot open the HostFS,ffa it asked for.
+|
 | No cmhg and no C:o.stubs.  cmhg's header imports __RelocCode, and the
 | stubs patch their vectors in place: both write into the module image at
 | initialisation, which from ROM is a data abort (see c.hostfs, s.head).
@@ -12,6 +17,6 @@ Set HostFS$Dir <Obey$Dir>
 Dir <Obey$Dir>
 objasm -o o.head s.head
 cc -c -zps1 -ffah -o o.hostfs c.hostfs
-link -rmf -o HostFS,ffa o.head o.hostfs
+link -rmf -o HostFS o.head o.hostfs
 decaof -r o.head o.hostfs { > o.relocs }
-Echo Built <HostFS$Dir>.HostFS,ffa
+Echo Built <HostFS$Dir>.HostFS
