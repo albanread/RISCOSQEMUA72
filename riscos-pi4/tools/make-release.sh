@@ -185,8 +185,15 @@ print "$disc_files files, $(du -sh "$STAGE/disc" | cut -f1) unpacked, $(du -h "$
 step "bundle"
 cp "$BIN" "$APP/Contents/MacOS/qemu-system-aarch64"
 cp "$ROOT/riscos-pi4/app/launcher.zsh" "$RES/launcher.zsh"
-clang -arch arm64 -mmacosx-version-min=11.0 -O2 -Wall -framework CoreGraphics \
+# The launcher stub is the app's main executable, so it must be the same
+# architecture as the emulator it runs -- take that from the emulator
+# rather than hard-coding it, or an Intel (x86_64) build gets an arm64 main
+# executable the Mac cannot launch (and the reverse on Apple silicon).
+LARCH=$(lipo -archs "$BIN" 2>/dev/null | awk '{print $1}')
+[[ -n "$LARCH" ]] || LARCH=$(uname -m)
+clang -arch "$LARCH" -mmacosx-version-min=11.0 -O2 -Wall -framework CoreGraphics \
     -o "$APP/Contents/MacOS/$NAME" "$ROOT/riscos-pi4/app/launcher.c" || die "the launcher stub did not compile"
+print "launcher and emulator: $LARCH"
 chmod 755 "$APP/Contents/MacOS/$NAME" "$APP/Contents/MacOS/qemu-system-aarch64" "$RES/launcher.zsh"
 cp "$ROOT/riscos-pi4/app/AppIcon.icns" "$ROOT/riscos-pi4/app/RISCOSQEMU.sdef" "$RES/"
 cp "$ROOT/riscos-pi4/app/Info.plist" "$PLIST"
