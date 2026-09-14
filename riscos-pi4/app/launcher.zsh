@@ -1,0 +1,94 @@
+#!/bin/zsh
+#
+# The user launch.  This is Contents/MacOS/<app name> in the release
+# bundle tools/make-release.sh builds.  LaunchServices starts it on a
+# double click and it execs the emulator beside it with the machine's
+# arguments, so the running process is the app itself -- same PID, an
+# executable inside the bundle -- and stays scriptable through the Apple
+# Events surface (SCRIPTING.md).  It opens no QMP socket: this is the
+# user persona of run-app.sh, with the paths settled for an installed app.
+#
+# What it settles, in order:
+#
+#   the disc    ~/RISCOS, unpacked from the app's Disc.zip the first time
+#               and never touched by a later version.  That folder is the
+#               RISC OS disc: HostFS serves it, both ways.
+#               `defaults write <bundle id> disc /some/where` moves it.
+#   the CMOS    the disc's own CMOS,ff2 -- HostFS rewrites it after every
+#               *Configure -- copied under a comma-free name, because the
+#               loader's option syntax splits on commas.  The app's
+#               cmos.bin seeds a disc that has none.
+#   the logs    ~/Library/Logs/<base name>/run.log (QEMU's stdout and
+#               stderr) and metal-debug.txt, which lands in the cwd.
+#   the mode    `defaults write <bundle id> mode 1920x1200` opens the
+#               desktop at that size (README.md: the EDID timing).
+#
+# Anything LaunchServices or `open --args` passes is handed on to QEMU,
+# which is how a developer adds a QMP socket to an installed app.
+#
+set -u
+SELF="${0:A}"
+APPNAME="${SELF:t}"
+CONTENTS="${SELF:h:h}"
+RES="$CONTENTS/Resources"
+BIN="$CONTENTS/MacOS/qemu-system-aarch64"
+ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CONTENTS/Info.plist")"
+BASE="${ID##*.}"                 # com.github.albanread.RISCOSQEA72 -> RISCOSQEA72
+
+pref() { defaults read "$ID" "$1" 2>/dev/null; return 0 }
+q()    { print -r -- "${1//,/,,}" }   # a comma in a QEMU option value is written ,,
+
+LOGS="$HOME/Library/Logs/$BASE"
+STATE="$HOME/Library/Application Support/$BASE"
+mkdir -p "$LOGS" "$STATE" 2>/dev/null
+[[ -e "$LOGS/run.log" ]] && mv -f "$LOGS/run.log" "$LOGS/run-previous.log"
+exec >>"$LOGS/run.log" 2>&1
+cd "$LOGS" 2>/dev/null || cd /   # metal-debug.txt lands in the cwd
+print -r -- "$APPNAME: $(date '+%Y-%m-%d %H:%M:%S') starting"
+
+fail() {
+    print -r -- "$APPNAME: $*"
+    osascript -e "display alert \"$APPNAME\" message \"$*\" as critical" >/dev/null 2>&1
+    exit 1
+}
+
+DISC="$(pref disc)"; DISC="${DISC:-$HOME/RISCOS}"
+MODE="$(pref mode)"
+
+[[ -x "$BIN" ]] || fail "The emulator is missing from the app: $BIN"
+[[ -r "$RES/RISCOS.IMG" ]] || fail "The ROM is missing from the app: $RES/RISCOS.IMG"
+
+if [[ ! -d "$DISC/!Boot" ]]; then
+    [[ -r "$RES/Disc.zip" ]] || fail "There is no RISC OS disc at $DISC, and this app has none to install."
+    mkdir -p "$DISC" || fail "Cannot create the disc folder $DISC"
+    print -r -- "$APPNAME: installing the disc into $DISC"
+    unzip -q -o "$RES/Disc.zip" -d "$DISC" || fail "Unpacking the disc into $DISC failed"
+fi
+[[ -e "$DISC/CMOS,ff2" ]] || cp "$RES/cmos.bin" "$DISC/CMOS,ff2"
+CMOS="$STATE/cmos.bin"
+cp -f "$DISC/CMOS,ff2" "$CMOS" || fail "Cannot copy the CMOS settings to $CMOS"
+
+args=(
+    -M raspi4b -cpu cortex-a72,aarch64=off
+    -kernel "$RES/RISCOS.IMG"
+    -device "loader,file=$(q "$CMOS"),addr=0x510000,force-raw=on"
+    -netdev user,id=n0
+    -device usb-hub,bus=usb-bus.0,port=1
+    -device usb-kbd,bus=usb-bus.0,port=1.1
+    -device usb-tablet,bus=usb-bus.0,port=1.2
+    -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3
+    -audiodev coreaudio,id=snd0
+    -global bcm2835-vchiq.audiodev=snd0
+    -display metal,vsync=30
+    -name "$APPNAME"
+    -global "bcm2838-peripherals.vmchannel-root=$(q "$DISC")"
+)
+if [[ -n "$MODE" ]]; then
+    args+=( -global "bcm2835-property.mode=$MODE" )
+fi
+extra=()
+for a in "$@"; do
+    [[ "$a" == -psn_* ]] || extra+=("$a")   # LaunchServices' process serial number, if it sends one
+done
+print -r -- "$APPNAME: disc $DISC${MODE:+, mode $MODE}"
+exec "$BIN" "${args[@]}" "${extra[@]}"

@@ -141,6 +141,44 @@ counting the system timer's compare-1 expiries over a settled desktop:
 It works on any host with the `log` trace backend, not only macOS, so the
 two platforms' clocks can be compared with the same instrument.
 
+## make-release.sh — the user release, as a Mac app
+
+`make-release.sh` builds the end-user release: one self-contained
+application, `RISCOSQEA72v<N>.app`, and a disk image to hand out. Inside
+the app are the emulator with every Homebrew library it links copied
+into `Contents/Frameworks` and its load commands rewritten (so it runs on
+a Mac with no Homebrew), the stock 5.30 ROM with HostFS and HostFSFiler
+spliced in by `mkrom.py`, the end-user disc as a zip the app unpacks into
+`~/RISCOS` on its first run, and `app/launcher.zsh`, which is what a
+double click starts. It is `run-app.sh`'s user persona — no QMP socket,
+Apple Events the only control channel — with the paths settled for an
+installed app.
+
+    riscos-pi4/tools/make-release.sh 1
+    FS_ZIP=/path/end_user_fs.zip riscos-pi4/tools/make-release.sh 2
+
+The ROM and the disc come from the private repo by default (`ROS_PRIVATE`,
+`ROM` and `FS_ZIP` override). The disc is the end-user zip minus whatever
+`STRIP` names — by default the DDE and the Store, which are taken off the
+Pinboard too — with its CMOS forced to boot from HostFS. Everything lands
+in `build-macos/release/`: the app, the `.dmg` (app, Read Me, Applications
+link) and the cut-down disc as a zip of its own. `RELEASE.txt` inside the
+app records what went in: commit, ROM and disc hashes, module versions,
+minimum macOS, the libraries. Signing is ad-hoc unless `SIGN_ID` names a
+Developer ID, and the minimum macOS is whatever the newest binary demands
+(26.0 with today's Homebrew bottles).
+
+Installed, the app logs to `~/Library/Logs/RISCOSQEA72/` and takes two
+settings from `defaults`:
+
+    defaults write com.github.albanread.RISCOSQEA72 mode 1920x1200
+    defaults write com.github.albanread.RISCOSQEA72 disc ~/Elsewhere
+
+A developer can still reach an installed app over QMP, because the
+launcher passes its arguments on:
+
+    open -n RISCOSQEA72v1.app --args -qmp unix:/tmp/q.sock,server,nowait
+
 ## Boot probe
 
     python probe.py raspi4b RISCOS.IMG 30 -- -cpu cortex-a72,aarch64=off
