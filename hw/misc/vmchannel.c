@@ -601,9 +601,65 @@ static char *resolve_leaf(const char *dir, const char *want)
  * a realpath of the final object alone missed (issue #20).  `root` itself
  * always exists, so the walk upward terminates.
  */
+/*
+ * realpath() for the containment check, which has to be written twice.
+ *
+ * Windows has no realpath().  The shim in scope maps it to _fullpath(),
+ * and that returns NULL here even for a directory that plainly exists --
+ * so within_root() refused everything and HostFS answered "bad path" to
+ * every request, including the share root.  _fullpath() would not be
+ * enough even when it does work: it only tidies the string, and does not
+ * resolve a junction or a symlink.  Resolving those is the whole point of
+ * the check (issue #20), so the Windows side has to be real.
+ *
+ * GetFinalPathNameByHandleW resolves both, and needs an open handle, so
+ * the object must exist; a leaf that does not is already covered by the
+ * caller stepping up to its parent.  FILE_FLAG_BACKUP_SEMANTICS is what
+ * lets a directory be opened at all.  The "\\?\" prefix it returns is
+ * left in place: both sides of the comparison come through here, so they
+ * carry it alike.
+ */
+static char *vmch_realpath(const char *path)
+{
+#ifdef _WIN32
+    wchar_t buf[32768];
+    wchar_t *wide = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    HANDLE h;
+    DWORD n;
+
+    if (!wide) {
+        return NULL;
+    }
+    h = CreateFileW(wide, 0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    g_free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    n = GetFinalPathNameByHandleW(h, buf, G_N_ELEMENTS(buf),
+                                  FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (n == 0 || n >= G_N_ELEMENTS(buf)) {
+        return NULL;
+    }
+    return g_utf16_to_utf8(buf, -1, NULL, NULL, NULL);
+#else
+    char *r = realpath(path, NULL);
+    char *out;
+
+    if (!r) {
+        return NULL;
+    }
+    out = g_strdup(r);            /* one allocator for both hosts */
+    free(r);
+    return out;
+#endif
+}
+
 static bool within_root(const char *path, const char *root)
 {
-    char *rootreal = realpath(root, NULL);
+    char *rootreal = vmch_realpath(root);
     char *cur = g_strdup(path);
     bool ok = false;
 
@@ -611,13 +667,13 @@ static bool within_root(const char *path, const char *root)
         size_t rl = strlen(rootreal);
 
         for (;;) {
-            char *real = realpath(cur, NULL);
+            char *real = vmch_realpath(cur);
             char *slash;
 
             if (real) {
                 ok = strncmp(real, rootreal, rl) == 0
                      && (real[rl] == '\0' || real[rl] == G_DIR_SEPARATOR);
-                free(real);
+                g_free(real);
                 break;
             }
             /* Not there: step up and vouch for the parent instead. */
@@ -628,7 +684,7 @@ static bool within_root(const char *path, const char *root)
             *slash = '\0';
         }
     }
-    free(rootreal);
+    g_free(rootreal);
     g_free(cur);
     return ok;
 }
