@@ -1618,8 +1618,10 @@
 #     image is magnified at least twice (default off).
 #
 # @backdrop: a layer drawn by the host beneath the guest's desktop,
-#     showing through the pixels the guest tags as "below": "off"
-#     (default), "acorn", "acorn-live", or the path of an image file.
+#     showing through the pixels the guest tags as "below".  "off"
+#     (default) gates the feature out, with no Backdrop menu; "none",
+#     "acorn", "acorn-live", "tile:PATH" or "picture:PATH" (or a bare
+#     PATH) turn it on with that scene.
 #
 # Since: 11.1
 ##

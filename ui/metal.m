@@ -102,12 +102,14 @@ enum MetalBackdrop { METAL_BACKDROP_OFF = 0, METAL_BACKDROP_ACORN,
 #define METAL_BACKDROP_KEY   0x00B4C0B7u  /* 0x00BBGGRR: #B7C0B4 */
 #define METAL_ICONBAR_PX     66u          /* guest px, square-pixel modes */
 static struct {
-    int mode;                           /* MetalBackdrop */
+    bool enabled;                       /* the gate: backdrop= other than off */
+    int mode;                           /* MetalBackdrop: the scene, OFF for none */
     id<MTLTexture> image;               /* PICTURE and TILE */
     double image_scale;                 /* 2 for an @2x tile, else 1 */
     NSString *spec;                     /* as given: the menu ticks it */
     CFAbsoluteTime t0;                  /* acorn-live's clock */
-} backdrop = { METAL_BACKDROP_OFF, nil, 1.0, nil, 0 };
+    NSMenuItem *menu_item;              /* Machine > Backdrop, hidden when gated off */
+} backdrop = { false, METAL_BACKDROP_OFF, nil, 1.0, nil, 0, nil };
 
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
@@ -1092,12 +1094,11 @@ static id<MTLTexture> backdrop_load_image(const char *path)
     return tex;
 }
 
-/* -display metal,backdrop=, and the Backdrop menu: off, acorn, acorn-live,
- * tile:<image file> or picture:<image file> (a bare path is a picture).
- * An @2x tile covers a device pixel per image pixel on a Retina screen,
- * any other a point.  Called at init, after the window and the device
- * exist, and from the menu; UI thread only. */
-void metal_glue_backdrop(const char *spec)
+/* The scene: none, acorn, acorn-live, tile:<image file> or picture:<image
+ * file> (a bare path is a picture).  An @2x tile covers a device pixel per
+ * image pixel on a Retina screen, any other a point.  Only ever reached
+ * with the feature gated on; UI thread only. */
+static void backdrop_set_scene(const char *spec)
 {
     int mode = METAL_BACKDROP_OFF;
     const char *path = NULL;
@@ -1105,8 +1106,9 @@ void metal_glue_backdrop(const char *spec)
     [backdrop.image release];
     backdrop.image = nil;
     backdrop.image_scale = 1.0;
-    if (!spec || !*spec || !strcmp(spec, "off")) {
+    if (!spec || !*spec || !strcmp(spec, "none") || !strcmp(spec, "off")) {
         mode = METAL_BACKDROP_OFF;
+        spec = "none";
     } else if (!strcmp(spec, "acorn")) {
         mode = METAL_BACKDROP_ACORN;
     } else if (!strcmp(spec, "acorn-live")) {
@@ -1133,18 +1135,35 @@ void metal_glue_backdrop(const char *spec)
                       (unsigned long)backdrop.image.height);
         } else {
             mode = METAL_BACKDROP_ACORN;
+            spec = "acorn";
             metal_log("backdrop: cannot read %s; using acorn", path);
         }
     }
     [backdrop.spec release];
-    backdrop.spec = [[NSString alloc] initWithUTF8String:
-                     mode == METAL_BACKDROP_ACORN && path ? "acorn" : (spec && *spec ? spec : "off")];
+    backdrop.spec = [[NSString alloc] initWithUTF8String:spec];
     if (mode != backdrop.mode) {
         backdrop.mode = mode;
         fb_release_scale();
     }
     backdrop.t0 = CFAbsoluteTimeGetCurrent();
-    metal_log("backdrop: mode %d", mode);
+    metal_log("backdrop: scene %s (mode %d)", spec, mode);
+}
+
+/* -display metal,backdrop= -- the gate and the first scene, once, at init.
+ * off (the default, and what an absent option means) leaves the feature
+ * out entirely: the decode ignores the transfer byte, nothing is drawn
+ * beneath the desktop, and the Backdrop menu is hidden.  Anything else
+ * turns it on and names the scene; none is on with no scene. */
+void metal_glue_backdrop(const char *spec)
+{
+    backdrop.enabled = spec && *spec && strcmp(spec, "off") != 0;
+    [backdrop.menu_item setHidden:!backdrop.enabled];
+    if (backdrop.enabled) {
+        backdrop_set_scene(spec);
+    } else {
+        backdrop_set_scene("none");
+        metal_log("backdrop: gated off");
+    }
 }
 
 /* Whether RISC OS is painting the below tag in the key colour right now,
@@ -2157,7 +2176,8 @@ static void metal_buttons_release_all(void)
  * None, and Tiles and Pictures submenus listing the images in the
  * backdrops folder -- rebuilt each time it opens, so a file dropped into
  * the folder is there next time.  A choice applies at once and is kept
- * as the backdrop default, which the app's launcher passes next time. */
+ * as the backdrop default, which the app's launcher passes next time.
+ * The menu is there only when backdrop= gates the feature on. */
 static NSMenuItem *backdrop_item(NSString *title, NSString *spec, id target)
 {
     NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title
@@ -2211,7 +2231,7 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
     NSString *dir = backdrop_folder();
     NSMenuItem *sub;
 
-    if (![[menu title] isEqualToString:@"Backdrop"]) {
+    if (![[menu title] isEqualToString:@"Backdrop"] || !backdrop.enabled) {
         return;
     }
     [menu removeAllItems];
@@ -2229,7 +2249,7 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
     }
     [menu addItem:backdrop_item(@"Acorn", @"acorn", self)];
     [menu addItem:backdrop_item(@"Acorn, Moving", @"acorn-live", self)];
-    [menu addItem:backdrop_item(@"None", @"off", self)];
+    [menu addItem:backdrop_item(@"None", @"none", self)];
     [menu addItem:[NSMenuItem separatorItem]];
 
     sub = [[[NSMenuItem alloc] initWithTitle:@"Tiles" action:NULL keyEquivalent:@""] autorelease];
@@ -2260,8 +2280,8 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
 {
     NSString *spec = [sender representedObject];
 
-    if (spec) {
-        metal_glue_backdrop([spec UTF8String]);
+    if (spec && backdrop.enabled) {
+        backdrop_set_scene([spec UTF8String]);
         [[NSUserDefaults standardUserDefaults] setObject:backdrop.spec forKey:@"backdrop"];
     }
 }
@@ -2344,9 +2364,14 @@ static void metal_build_menu(void)
         [bd setDelegate:delegate];
         [bd setAutoenablesItems:NO];
         [bdItem setSubmenu:bd];
+        /* Hidden until -display metal,backdrop= gates the feature on
+         * (metal_glue_backdrop): the options are read after the menu is
+         * built, and an absent option means off.  Kept, not released:
+         * the gate shows or hides it. */
+        [bdItem setHidden:YES];
+        backdrop.menu_item = bdItem;
         [machine addItem:bdItem];
         [bd release];
-        [bdItem release];
     }
     metal_add_item(machine, @"Toggle Full Screen",
                    @selector(fullScreenAction:), @"f",

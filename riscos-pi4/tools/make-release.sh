@@ -44,6 +44,8 @@
 #                 Wimp's -NoIconBoxesInTransWindows, and makes the value
 #                 the app's default (RISCOSBackdrop in Info.plist; a user
 #                 overrides it with `defaults write <id> backdrop ...`).
+#                 off gates the feature out of the app: the disc keeps its
+#                 watermark, and the emulator shows no Backdrop menu.
 #   NOTARY_PROFILE a notarytool keychain profile (xcrun notarytool
 #                 store-credentials <name>, done once by the account
 #                 holder).  With it, and a Developer ID, the app and then
@@ -430,8 +432,9 @@ USING IT
 
 SETTINGS (optional, in Terminal)
   defaults write $ID mode 1920x1200    start the desktop at that size
-  defaults write $ID backdrop acorn-live   a gently moving backdrop;
-                                       or acorn, off, or the path of a picture
+  defaults write $ID backdrop acorn-live   a gently moving backdrop; or acorn,
+                                       none, tile:<picture> or picture:<picture>
+  defaults write $ID backdrop off      no backdrop layer and no Backdrop menu
   defaults write $ID disc ~/Elsewhere  the disc folder, as the dialog sets it
   defaults delete $ID                  forget both; the app asks again
 

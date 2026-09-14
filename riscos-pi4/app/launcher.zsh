@@ -28,9 +28,11 @@
 #   the backdrop  `defaults write <bundle id> backdrop acorn-live` picks
 #               the layer drawn beneath the desktop: acorn (the release's
 #               default, from RISCOSBackdrop in Info.plist), acorn-live,
-#               off, or the path of an image file.  It shows through where
-#               the disc tiles its tagged backdrop sprite (MACOS.md, "The
-#               backdrop layer"); on a disc that does not, it never shows.
+#               none, tile:<image> or picture:<image> -- or off, which
+#               gates the feature out of the emulator, Backdrop menu and
+#               all.  It shows through where the disc tiles its tagged
+#               backdrop sprite (MACOS.md, "The backdrop layer"); on a
+#               disc that does not, it never shows.
 #   the mode    `defaults write <bundle id> mode 1920x1200` opens the
 #               desktop at that size (README.md: the EDID timing).
 #

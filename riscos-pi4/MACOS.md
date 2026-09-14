@@ -370,11 +370,13 @@ window edges blend the way the magnified desktop does. Screenshots run the
 scale pass once more at 1:1 so they hold the composite; QMP `screendump`
 still returns the guest's own pixels.
 
-**What it draws** — `-display metal,backdrop=`:
+**What it draws** — `-display metal,backdrop=`, which is also the
+feature's gate:
 
 | Value | Scene |
 | --- | --- |
-| `off` | nothing (default) |
+| `off` | the default: the feature is gated out — the decode ignores the transfer byte, nothing is drawn beneath the desktop, and there is no Backdrop menu |
+| `none` | the feature on, with nothing drawn: the guest's own pixels show |
 | `acorn` | the Acorn ground and ghost acorn, from `design/art/acorn.svg`'s own curves: it covers all 37,784 pixels of the watermark sprite RISC OS drew, with 48 sub-pixel extras at the edge, centred above the 66-pixel icon bar — crisp at Retina resolution |
 | `acorn-live` | the same, with two slow soft lights and a vignette, dithered against banding |
 | `tile:<file>` | an image repeated from the top left: an image pixel per point, or per device pixel for an `@2x` file |
@@ -384,8 +386,9 @@ Images are anything ImageIO reads, capped at 4096 pixels a side and
 colour-matched to sRGB (the display path is 8-bit sRGB; a wide-gamut image
 loses its extra gamut).
 
-**The Backdrop menu.** Machine › Backdrop offers Acorn, Acorn Moving and
-None, and **Tiles** and **Pictures** submenus listing the images in the
+**The Backdrop menu.** Only when `backdrop=` gates the feature on — the
+item is built hidden and shown by the gate — Machine › Backdrop offers
+Acorn, Acorn Moving and None, and **Tiles** and **Pictures** submenus listing the images in the
 `Tiles` and `Pictures` folders of `~/Pictures/RISC OS Backdrops` (the
 `backdropFolder` default; *Choose Backdrops Folder…* changes it), plus
 macOS's own still wallpapers under Pictures. It is rebuilt each time it
