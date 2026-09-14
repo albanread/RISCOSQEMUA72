@@ -112,7 +112,12 @@ python3 "$HERE/mksdef.py" >/dev/null
 
 # 2. a clean stage
 step "staging $NAME under $OUT"
-rm -rf "$STAGE" "$APP" "$DMG"
+# Rename before removing: Finder drops .DS_Store files into folders it is
+# showing, and an rm -rf racing that fails with "directory not empty".
+for d in "$STAGE" "$APP"; do
+    [[ -e "$d" ]] && mv "$d" "$d.old.$$"
+done
+rm -rf "$STAGE.old.$$" "$APP.old.$$" "$DMG" 2>/dev/null || true
 mkdir -p "$STAGE/disc" "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 RES="$APP/Contents/Resources"
 PLIST="$APP/Contents/Info.plist"
@@ -436,7 +441,7 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
     xcrun stapler validate "$APP" >/dev/null && xcrun stapler validate "$DMG" >/dev/null \
         && print "staples validate" || die "a staple does not validate"
 fi
-rm -rf "$STAGE"
+mv "$STAGE" "$STAGE.old.$$" && rm -rf "$STAGE.old.$$" 2>/dev/null || true
 
 step "Gatekeeper's verdict"
 spctl --assess --type execute -vv "$APP" 2>&1 | sed 's/^/  /' || true
