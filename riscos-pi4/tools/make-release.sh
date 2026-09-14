@@ -402,15 +402,15 @@ print "signature verifies (${SIGN_ID}${signopts:+; hardened runtime, timestamped
 
 # 9b. notarization: the app first, stapled; the disk image after it is made
 notarize() {   # notarize <file>: submit, wait, insist on Accepted
-    local out="$STAGE/notary-${1:t}.json" id status
+    local out="$STAGE/notary-${1:t}.json" id verdict   # not "status": read-only in zsh
     xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait \
         --output-format json >"$out" 2>"$STAGE/notary.err" || {
         cat "$STAGE/notary.err" >&2; die "notarytool submit failed for ${1:t}"
     }
     id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$out")
-    status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$out")
-    print "notarization of ${1:t}: $status (submission $id)"
-    if [[ "$status" != "Accepted" ]]; then
+    verdict=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$out")
+    print "notarization of ${1:t}: $verdict (submission $id)"
+    if [[ "$verdict" != "Accepted" ]]; then
         xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" >&2 || true
         die "Apple did not accept ${1:t}"
     fi
