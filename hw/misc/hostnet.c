@@ -1457,17 +1457,34 @@ static void hn_ring(HostNetState *s, uint64_t base)
     hn_st32(base + HN_HDR_RC, r.rc);
 }
 
+/*
+ * Switched off, the whole window reads zero — not just the feature bits.
+ *
+ * This window used to hold an unimplemented device, and its reading as
+ * zero was load-bearing rather than incidental: EtherGENET reads the GENET
+ * revision register, which is at offset 0, and takes zero to mean an
+ * unknown controller it should decline.  Answering 'HNET' there would give
+ * it a revision it has never heard of on a machine that has not asked for
+ * HostNet at all.
+ *
+ * The stock CMOS unplugs EtherGENET, so nothing reads it today — but that
+ * is luck, not a guarantee, and a machine booted with a different CMOS
+ * would find it.  Off should be indistinguishable from before, so it is.
+ */
 static uint64_t hostnet_read(void *opaque, hwaddr offset, unsigned size)
 {
     HostNetState *s = HOSTNET(opaque);
 
+    if (!s->enabled) {
+        return 0;
+    }
     switch (offset) {
     case HN_MAGIC:
         return HN_MAGIC_VALUE;
     case HN_VERSION:
         return HN_VERSION_VALUE;
     case HN_FEATURES:
-        return s->enabled ? HN_FEATURE_SOCKETS : 0;
+        return HN_FEATURE_SOCKETS;
     default:
         return 0;
     }
@@ -1478,7 +1495,9 @@ static void hostnet_write(void *opaque, hwaddr offset, uint64_t value,
 {
     HostNetState *s = HOSTNET(opaque);
 
-    if (offset == HN_CMD) {
+    /* Switched off, writes go nowhere: a machine that has not asked for
+     * HostNet must not be able to reach it by writing to the window. */
+    if (s->enabled && offset == HN_CMD) {
         hn_ring(s, value);
     }
 }
