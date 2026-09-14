@@ -159,8 +159,11 @@ installed app.
 
 The ROM and the disc come from the private repo by default (`ROS_PRIVATE`,
 `ROM` and `FS_ZIP` override). The disc is the end-user zip minus whatever
-`STRIP` names — by default the DDE and the Store, which are taken off the
-Pinboard too — with its CMOS forced to boot from HostFS. Everything lands
+`STRIP` names — by default the DDE, the Store and PackMan, the Pi's boot
+partition image, Ghostscript, the unused themes, the manuals and the
+games: everything that is not the desktop and its applications, and
+whatever goes is taken off the Pinboard too — with its CMOS forced to
+boot from HostFS. Everything lands
 in `build-macos/release/`: the app, the `.dmg` (app, Read Me, Applications
 link) and the cut-down disc as a zip of its own. `RELEASE.txt` inside the
 app records what went in: commit, ROM and disc hashes, module versions,

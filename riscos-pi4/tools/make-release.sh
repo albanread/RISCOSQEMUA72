@@ -21,13 +21,14 @@
 #   FS_ZIP        the end-user disc (default $ROS_PRIVATE/dist/end_user_fs.zip)
 #   QEMU_BIN      the built emulator (default build-macos/qemu-system-aarch64)
 #   OUT           where the release lands (default build-macos/release)
-#   STRIP         what to leave off the disc, space-separated paths under
-#                 its root.  Default: "Apps/DDE Documents/DDE Apps/!Store
-#                 !Boot/Choices/PlingStore" -- the DDE is licensed to us,
-#                 not ours to hand out, and the Store is not part of this
-#                 product; nothing in !Boot needs either.  Whatever is
-#                 left off is also unpinned from the Pinboard.  STRIP=""
-#                 ships the zip as it is.
+#   STRIP         what to leave off the disc: space-separated paths under
+#                 its root, globs allowed.  The default, STRIP_DEFAULT
+#                 below, cuts the end-user zip down to the desktop and
+#                 its applications: no DDE (licensed to us, not ours to
+#                 hand out), no Store or PackMan, no Pi boot-partition
+#                 image, no Ghostscript, no unused themes, no manuals, no
+#                 games.  Whatever is left off is also unpinned from the
+#                 Pinboard.  STRIP="" ships the zip as it is.
 #   NO_BUILD=1    do not run ninja first
 #   SIGN_ID       the codesign identity (default "-", ad-hoc).  Ad-hoc is
 #                 enough for local use and for testers who use "Open
@@ -54,7 +55,18 @@ FS_ZIP="${FS_ZIP:-$PRIV/dist/end_user_fs.zip}"
 BIN="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 OUT="${OUT:-$ROOT/build-macos/release}"
 SIGN_ID="${SIGN_ID:--}"
-STRIP="${STRIP-Apps/DDE Documents/DDE Apps/!Store !Boot/Choices/PlingStore}"
+STRIP_DEFAULT=(
+    Apps/DDE Documents/DDE                  # the DDE: licensed to us, not ours to hand out
+    Apps/!Store !Boot/Choices/PlingStore    # the Store is not part of this product,
+    Apps/!PackMan                           #   and PackMan is its other half
+    !Boot/Loader,fc8                        # the Pi's boot partition image: QEMU loads the ROM
+    !Boot/Resources/!Ghostscr               # Ghostscript: only !PrintPDF used it
+    !Boot/Resources/!ThemeDefs/Themes/{Iyonix,Sovereign,Raspberry,Ursula,Morris4}   # only Acorn is used
+    Documents/{Books,Manuals,Images,OvationPro,UserGuide,PipeDream,Other,Music}     # Welcome stays: it is pinned
+    Diversions                              # the games
+    Utilities/!DPlngScan                    # drives a scanner
+)
+STRIP="${STRIP-${(j: :)STRIP_DEFAULT}}"
 APP="$OUT/$NAME.app"
 DMG="$OUT/$NAME.dmg"
 STAGE="$OUT/stage"
@@ -107,9 +119,10 @@ unzip -q "$FS_ZIP" -d "$STAGE/disc"
 find "$STAGE/disc" \( -name .DS_Store -o -name __MACOSX -o -name '._*' \) -prune -exec rm -rf {} +
 stripped=""
 for d in ${=STRIP}; do
-    if [[ -e "$STAGE/disc/$d" ]]; then
+    hits=( "$STAGE/disc"/${~d}(N) )
+    if (( ${#hits} )); then
         print "leaving off $d"
-        rm -rf "$STAGE/disc/$d"
+        rm -rf "${hits[@]}"
         stripped="$stripped $d"
     else
         print "STRIP: no $d on this disc"
