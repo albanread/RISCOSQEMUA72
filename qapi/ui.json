@@ -1617,12 +1617,17 @@
 # @scanlines: darken every other output row, CRT flavour, when the
 #     image is magnified at least twice (default off).
 #
+# @backdrop: a layer drawn by the host beneath the guest's desktop,
+#     showing through the pixels the guest tags as "below": "off"
+#     (default), "acorn", "acorn-live", or the path of an image file.
+#
 # Since: 11.1
 ##
 { 'struct'  : 'DisplayMetal',
   'data'    : { '*vsync' : 'int',
                 '*scaling' : 'DisplayMetalScaling',
-                '*scanlines' : 'bool' },
+                '*scanlines' : 'bool',
+                '*backdrop' : 'str' },
   'if'      : 'CONFIG_METAL' }
 
 ##

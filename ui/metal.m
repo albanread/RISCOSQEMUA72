@@ -79,6 +79,32 @@ static struct {
     bool scanlines;
 } video_opts = { METAL_SCALING_SHARP, false };
 
+/* -display metal,backdrop=: a layer the host draws beneath the guest's
+ * desktop (MACOS.md, "The backdrop layer").  The guest opts pixels in
+ * through the transfer byte of a 32bpp pixel -- RISC OS's supremacy
+ * byte, which everything the OS draws leaves at 0:
+ *
+ *   bits 7-6  the layer tag: 10 below (the layer beneath shows through),
+ *             01 above (reserved: a layer drawn over the pixel), 00 and
+ *             11 nothing -- so the &FF some sprite tools write means
+ *             nothing
+ *   bits 5-0  reserved, 0
+ *
+ * A below pixel must also be the backdrop key colour, the Acorn theme's
+ * sage, so an EOR drag box drawn over the backdrop changes the colour,
+ * drops out of the key and stays visible.  The guest paints the tag by
+ * tiling a sprite whose pixels carry it (tools/mkbacktile.py): the
+ * kernel's sprite plot and the Wimp's block copies keep all 32 bits. */
+enum MetalBackdrop { METAL_BACKDROP_OFF = 0, METAL_BACKDROP_ACORN,
+                     METAL_BACKDROP_ACORN_LIVE, METAL_BACKDROP_IMAGE };
+#define METAL_BACKDROP_KEY   0x00B4C0B7u  /* 0x00BBGGRR: #B7C0B4 */
+#define METAL_ICONBAR_PX     66u          /* guest px, square-pixel modes */
+static struct {
+    int mode;                           /* MetalBackdrop */
+    id<MTLTexture> image;               /* METAL_BACKDROP_IMAGE */
+    CFAbsoluteTime t0;                  /* acorn-live's clock */
+} backdrop = { METAL_BACKDROP_OFF, nil, 0 };
+
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
     bool up;
@@ -96,10 +122,24 @@ static struct {
     id<MTLTexture> decoded;             /* linear RGB, xres x yres */
     id<MTLRenderPipelineState> decode;  /* specialised for this bpp */
     id<MTLRenderPipelineState> scale;   /* specialised for the options */
+    id<MTLRenderPipelineState> shot;    /* the scale pass into RGBA8, 1:1 */
 } fb;
 
 static bool fb_failed;
 static uint32_t fb_failed_generation;
+
+/* The scale pass is specialised on the options and the backdrop, so a
+ * change releases it and the next frame builds it again.  (Until 14 Sep
+ * a change only dropped the per-mode pipeline, and the scale pass built
+ * at init -- before -display's own options were read -- was never
+ * rebuilt, so scaling= and scanlines= did not reach the shader.) */
+static void fb_release_scale(void)
+{
+    [fb.scale release];
+    fb.scale = nil;
+    [fb.shot release];
+    fb.shot = nil;
+}
 
 /* The scale pipeline is specialised on the options, so a runtime
  * change drops the pipeline and the next frame rebuilds it -- one
@@ -116,7 +156,7 @@ void metal_glue_video_opts(int scaling, int scanlines)
     if (s != video_opts.scaling || sl != video_opts.scanlines) {
         video_opts.scaling = s;
         video_opts.scanlines = sl;
-        fb.up = false;
+        fb_release_scale();
     }
 }
 
@@ -156,6 +196,7 @@ typedef struct {
     uint32_t dim[4];    /* xres, yres, pitch(bytes), bpp */
     uint32_t misc[4];   /* xoffset(px), yoffset(rows), pixo, unused */
     uint32_t post[4];   /* view w, view h, scaling, scanlines */
+    uint32_t bd[4];     /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */
 } MetalParams;
 
 /* The front end's log: a file next to the process, because a windowed
@@ -505,11 +546,14 @@ static NSString * const SHADER_SRC = @""
 "constant uint BPP       [[function_constant(0)]];\n"
 "constant uint SCALING   [[function_constant(1)]];\n"
 "constant bool SCANLINES [[function_constant(2)]];\n"
+"constant uint BACKDROP  [[function_constant(3)]];\n"
+"constant bool BACKDROP_IMAGE = (BACKDROP == 3);\n"
 "\n"
 "struct Params {\n"
 "    uint4 dim;     /* xres, yres, pitch(bytes), bpp */\n"
 "    uint4 misc;    /* xoffset(px), yoffset(rows), pixo, unused */\n"
 "    uint4 post;    /* view w, view h, scaling, scanlines */\n"
+"    uint4 bd;      /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */\n"
 "};\n"
 "\n"
 "struct VSOut {\n"
@@ -541,10 +585,19 @@ static NSString * const SHADER_SRC = @""
 "    uint r = 0, g = 0, b = 0;\n"
 "\n"
 "    if (BPP == 32) {\n"
+"        uint tag;\n"
 "        r = raw[row + bx * 4 + 0];\n"
 "        g = raw[row + bx * 4 + 1];\n"
 "        b = raw[row + bx * 4 + 2];\n"
+"        tag = raw[row + bx * 4 + 3];\n"
 "        if (P.misc.z == 0) { uint t = r; r = b; b = t; }   /* BGR order */\n"
+"        /* The transfer byte's layer tag, bits 7-6: 10 is below, and a\n"
+"         * below pixel in the backdrop key colour is a hole the layer\n"
+"         * beneath shows through -- transparent, premultiplied. */\n"
+"        if (P.bd.w != 0 && (tag & 0xC0) == 0x80\n"
+"            && (r | (g << 8) | (b << 16)) == P.bd.x) {\n"
+"            return float4(0.0);\n"
+"        }\n"
 "    } else if (BPP == 24) {\n"
 "        r = raw[row + bx * 3 + 0];\n"
 "        g = raw[row + bx * 3 + 1];\n"
@@ -567,36 +620,125 @@ static NSString * const SHADER_SRC = @""
 "    return float4(float(r), float(g), float(b), 255.0) / 255.0;\n"
 "}\n"
 "\n"
+"/* The Acorn mark (design/art/acorn.svg) as a signed distance, in the\n"
+" * SVG's own units about its centre, y down, positive inside.  The mark\n"
+" * is the union of the cap, a quadratic dome, and the nut, a cubic egg,\n"
+" * grown by the half-width of the outline stroke and clipped to the\n"
+" * SVG's 34-unit view box -- which is why the watermark the pinboard\n"
+" * draws has a flat top and a flat bottom.  Distances to the curved\n"
+" * sides are horizontal offsets corrected by the curve's slope. */\n"
+"static float acorn_distance(float2 q)\n"
+"{\n"
+"    const float grow = 0.8;\n"
+"    float ax = abs(q.x);\n"
+"\n"
+"    /* cap: right side (0,-20) Q (16,-20) (15,-7): x = 32t - 17t^2, y = -20 + 13t^2 */\n"
+"    float cy = clamp(q.y, -20.0, -7.0);\n"
+"    float ct = sqrt((cy + 20.0) / 13.0);\n"
+"    float cxb = 32.0 * ct - 17.0 * ct * ct;\n"
+"    float ck = (32.0 - 34.0 * ct) / max(26.0 * ct, 1e-3);\n"
+"    float cap = min((cxb - ax) / sqrt(1.0 + ck * ck), -7.0 - q.y);\n"
+"\n"
+"    /* nut: right side (0,18) C (9,18) (15,7) (13,-7); y falls as t rises */\n"
+"    float ny = clamp(q.y, -7.0, 18.0);\n"
+"    float lo = 0.0, hi = 1.0;\n"
+"    for (int i = 0; i < 18; i++) {\n"
+"        float t = 0.5 * (lo + hi), u = 1.0 - t;\n"
+"        float by = u * u * u * 18.0 + 3.0 * u * u * t * 18.0\n"
+"                 + 3.0 * u * t * t * 7.0 - t * t * t * 7.0;\n"
+"        if (by > ny) { lo = t; } else { hi = t; }\n"
+"    }\n"
+"    float t = 0.5 * (lo + hi), u = 1.0 - t;\n"
+"    float nxb = 3.0 * u * u * t * 9.0 + 3.0 * u * t * t * 15.0 + t * t * t * 13.0;\n"
+"    float ndx = 3.0 * (u * u * 9.0 + 2.0 * u * t * 6.0 - t * t * 2.0);\n"
+"    float ndy = 3.0 * (2.0 * u * t * -11.0 - t * t * 14.0);\n"
+"    float nk = ndx / min(ndy, -1e-3);\n"
+"    float nut = min(min((nxb - ax) / sqrt(1.0 + nk * nk), 18.0 - q.y), q.y + 7.0);\n"
+"\n"
+"    return min(max(cap, nut) + grow, 17.0 - abs(q.y));\n"
+"}\n"
+"\n"
+"/* The layer beneath the desktop, in the same gamma-encoded space as the\n"
+" * guest's pixels.  px is the output pixel, outPx the view, srcPx the\n"
+" * guest screen it stands for. */\n"
+"static float3 backdrop_scene(float2 px, float2 outPx, float2 srcPx,\n"
+"                             constant Params &P)\n"
+"{\n"
+"    const float3 ground = float3(183.0, 192.0, 180.0) / 255.0;   /* #B7C0B4 */\n"
+"    const float3 ghost  = float3(173.0, 183.0, 168.0) / 255.0;   /* #ADB7A8 */\n"
+"    /* view px per guest px, per axis: a window the user has resized\n"
+"     * away from the mode's shape stretches the desktop unevenly */\n"
+"    float2 k = outPx / srcPx;\n"
+"    /* 220 guest px for the SVG's 34 units, centred above the icon bar,\n"
+"     * exactly where *Backdrop -Centre put the watermark sprite; the\n"
+"     * centre follows the stretch, the mark keeps its shape */\n"
+"    const float unitPx = 220.0 / 34.0;\n"
+"    float2 centre = float2(srcPx.x * 0.5, (srcPx.y - float(P.bd.z)) * 0.5) * k;\n"
+"    float d = acorn_distance((px - centre) / (unitPx * k.y));\n"
+"    float cover = clamp(d * unitPx * k.y + 0.5, 0.0, 1.0);\n"
+"    float3 c = mix(ground, ghost, cover);\n"
+"\n"
+"    if (BACKDROP == 2) {\n"
+"        /* acorn-live: two soft lights drifting over the ground, one\n"
+"         * cool and one warm, on a half-hour loop so the float time\n"
+"         * never loses precision; and a faint vignette */\n"
+"        float tau = 6.2831853 * float(P.bd.y) / 1800000.0;\n"
+"        float2 uv = px / outPx;\n"
+"        float aspect = outPx.x / outPx.y;\n"
+"        float2 l1 = float2(0.5 + 0.34 * sin(7.0 * tau), 0.42 + 0.22 * sin(5.0 * tau + 1.3));\n"
+"        float2 l2 = float2(0.5 + 0.34 * sin(11.0 * tau + 2.1), 0.58 + 0.22 * cos(9.0 * tau));\n"
+"        float2 d1 = (uv - l1) * float2(aspect, 1.0);\n"
+"        float2 d2 = (uv - l2) * float2(aspect, 1.0);\n"
+"        c += 0.075 * exp(-dot(d1, d1) * 3.5) * float3(1.0, 1.0, 0.96);\n"
+"        c += 0.05 * exp(-dot(d2, d2) * 4.5) * float3(0.95, 0.72, 0.42);\n"
+"        float2 v = (uv - 0.5) * float2(aspect, 1.0);\n"
+"        c *= 1.0 - 0.07 * dot(v, v);\n"
+"        /* gradients this gentle band in 8 bits: dither them by less\n"
+"         * than a level, with interleaved gradient noise */\n"
+"        float n = fract(52.9829189 * fract(dot(px, float2(0.06711056, 0.00583715))));\n"
+"        c += (n - 0.5) / 255.0;\n"
+"    }\n"
+"    return c;\n"
+"}\n"
+"\n"
 "fragment float4 ps_scale(VSOut v [[stage_in]],\n"
 "                         constant Params &P [[buffer(0)]],\n"
 "                         texture2d<float> src [[texture(0)]],\n"
+"                         texture2d<float> bgimg [[texture(1), function_constant(BACKDROP_IMAGE)]],\n"
 "                         sampler lin [[sampler(0)]])\n"
 "{\n"
-"    float2 outPx = float2(P.post.x, P.post.y);      /* view size */\n"
-"    float2 srcPx = float2(P.dim.x, P.dim.y);        /* decoded size */\n"
-"    float2 st = v.pos.xy / outPx * srcPx;           /* source-pixel coords */\n"
+"    float2 outPx = float2(P.post.x, P.post.y);\n"
+"    float2 srcPx = float2(P.dim.x, P.dim.y);\n"
+"    float2 st = v.pos.xy / outPx * srcPx;\n"
 "    if (SCALING == 1) {\n"
-"        /* Sharp bilinear: within each source texel the bilinear\n"
-"         * transition is narrowed to a 1/ratio-wide band at the texel\n"
-"         * edge, so at 1:1 the image passes through untouched and at 2x+\n"
-"         * it is crisp with just enough filtering to avoid staircases. */\n"
 "        float2 ratio = max(outPx / srcPx, float2(1.0));\n"
-"        float2 halfw = 0.5 - 0.5 / ratio;           /* half the band */\n"
+"        float2 halfw = 0.5 - 0.5 / ratio;\n"
 "        float2 i = floor(st);\n"
-"        float2 f = st - i - 0.5;                    /* -0.5..0.5 in-texel */\n"
+"        float2 f = st - i - 0.5;\n"
 "        st = i + 0.5 + clamp(f, -halfw, halfw);\n"
 "    } else if (SCALING == 2) {\n"
-"        st = floor(st) + 0.5;                       /* nearest */\n"
+"        st = floor(st) + 0.5;\n"
 "    }\n"
 "    float4 c = src.sample(lin, st / srcPx);\n"
 "    if (SCANLINES) {\n"
-"        /* CRT flavour, only when magnified enough for a line to be two */\n"
 "        if (P.post.w != 0 && outPx.y >= srcPx.y * 1.99\n"
 "            && (uint(v.pos.y) & 1) != 0) {\n"
 "            c.rgb *= 0.8;\n"
 "        }\n"
 "    }\n"
-"    return float4(c.rgb, 1.0);\n"
+"    if (BACKDROP == 0) {\n"
+"        return float4(c.rgb, 1.0);\n"
+"    }\n"
+"    float3 bg;\n"
+"    if (BACKDROP_IMAGE) {\n"
+"        float2 isz = float2(bgimg.get_width(), bgimg.get_height());\n"
+"        float s = max(outPx.x / isz.x, outPx.y / isz.y);\n"
+"        float2 uv = (v.pos.xy - 0.5 * outPx) / (s * isz) + 0.5;\n"
+"        bg = bgimg.sample(lin, uv).rgb;\n"
+"    } else {\n"
+"        bg = backdrop_scene(v.pos.xy, outPx, srcPx, P);\n"
+"    }\n"
+"    return float4(c.rgb + bg * (1.0 - c.a), 1.0);\n"
 "}\n"
 "\n"
 "vertex VSOut vs_quad(uint id [[vertex_id]], constant float4 &R [[buffer(0)]])\n"
@@ -840,11 +982,119 @@ static bool fb_build_scale(void)
     uint32_t scaling = (uint32_t)video_opts.scaling;
     bool scanlines = video_opts.scanlines;
 
+    uint32_t bd = (uint32_t)backdrop.mode;
+
     [cv setConstantValue:&scaling type:MTLDataTypeUInt atIndex:1];
     [cv setConstantValue:&scanlines type:MTLDataTypeBool atIndex:2];
+    [cv setConstantValue:&bd type:MTLDataTypeUInt atIndex:3];
     fb.scale = metal_pipeline(@"ps_scale", cv, m.layer.pixelFormat);
     [cv release];
     return fb.scale != nil;
+}
+
+/* The backdrop's share of the shader constants, for a frame or a
+ * screenshot: the key, a clock on the scene's half-hour loop, the icon
+ * bar the acorn is centred above, and whether the layer is on at all. */
+static void backdrop_params(MetalParams *p)
+{
+    p->bd[0] = METAL_BACKDROP_KEY;
+    p->bd[1] = (uint32_t)(fmod(CFAbsoluteTimeGetCurrent() - backdrop.t0,
+                               1800.0) * 1000.0);
+    p->bd[2] = METAL_ICONBAR_PX;
+    p->bd[3] = backdrop.mode != METAL_BACKDROP_OFF;
+}
+
+/* An image for backdrop=<file>: anything ImageIO reads, drawn over the
+ * key colour (so a transparent PNG sits on sage) into an sRGB RGBA8
+ * texture -- the same gamma-encoded space as the guest's pixels. */
+static id<MTLTexture> backdrop_load_image(const char *path)
+{
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
+    CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+    id<MTLTexture> tex = nil;
+    size_t w, h;
+
+    if (src) {
+        CFRelease(src);
+    }
+    if (!img) {
+        return nil;
+    }
+    w = CGImageGetWidth(img);
+    h = CGImageGetHeight(img);
+    if (w > 8192 || h > 8192) {             /* keep inside every GPU's limit */
+        double k = 8192.0 / (double)MAX(w, h);
+        w = MAX((size_t)(w * k), 1);
+        h = MAX((size_t)(h * k), 1);
+    }
+    if (w && h) {
+        uint8_t *buf = calloc(w * h, 4);
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef ctx = buf ? CGBitmapContextCreate(buf, w, h, 8, w * 4, cs,
+                                     kCGImageAlphaPremultipliedLast
+                                     | kCGBitmapByteOrder32Big) : NULL;
+
+        if (ctx) {
+            MTLTextureDescriptor *td;
+
+            CGContextSetRGBFillColor(ctx, 0xB7 / 255.0, 0xC0 / 255.0,
+                                     0xB4 / 255.0, 1.0);
+            CGContextFillRect(ctx, CGRectMake(0, 0, w, h));
+            CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+            CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+            td = [MTLTextureDescriptor
+                  texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                               width:w
+                                              height:h
+                                           mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            tex = [m.device newTextureWithDescriptor:td];
+            [tex replaceRegion:MTLRegionMake2D(0, 0, w, h)
+                   mipmapLevel:0
+                     withBytes:buf
+                   bytesPerRow:w * 4];
+            CGContextRelease(ctx);
+        }
+        CGColorSpaceRelease(cs);
+        free(buf);
+    }
+    CGImageRelease(img);
+    return tex;
+}
+
+/* -display metal,backdrop=off|acorn|acorn-live|<image file>.  Called at
+ * init, after the window and the device exist; UI thread only after. */
+void metal_glue_backdrop(const char *spec)
+{
+    int mode = METAL_BACKDROP_OFF;
+
+    [backdrop.image release];
+    backdrop.image = nil;
+    if (!spec || !*spec || !strcmp(spec, "off")) {
+        mode = METAL_BACKDROP_OFF;
+    } else if (!strcmp(spec, "acorn")) {
+        mode = METAL_BACKDROP_ACORN;
+    } else if (!strcmp(spec, "acorn-live")) {
+        mode = METAL_BACKDROP_ACORN_LIVE;
+    } else {
+        backdrop.image = backdrop_load_image(spec);
+        if (backdrop.image) {
+            mode = METAL_BACKDROP_IMAGE;
+            metal_log("backdrop: %s (%lux%lu)", spec,
+                      (unsigned long)backdrop.image.width,
+                      (unsigned long)backdrop.image.height);
+        } else {
+            mode = METAL_BACKDROP_ACORN;
+            metal_log("backdrop: cannot read %s; using acorn", spec);
+        }
+    }
+    if (mode != backdrop.mode) {
+        backdrop.mode = mode;
+        fb_release_scale();
+    }
+    backdrop.t0 = CFAbsoluteTimeGetCurrent();
+    metal_log("backdrop: mode %d", mode);
 }
 
 /* The pointer pipeline: straight alpha, so the ROM's anti-fringe fill
@@ -1110,6 +1360,7 @@ static bool metal_render_frame(void)
         params.post[1] = (uint32_t)target.height;
         params.post[2] = (uint32_t)video_opts.scaling;
         params.post[3] = video_opts.scanlines ? 1 : 0;
+        backdrop_params(&params);
 
         /* decode pass: raw bytes -> linear RGB */
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1133,10 +1384,16 @@ static bool metal_render_frame(void)
     rp.colorAttachments[0].clearColor = MTLClearColorMake(0.05, 0.05, 0.08, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     enc = [cb renderCommandEncoderWithDescriptor:rp];
+    if (have_fb && !fb.scale && !fb_build_scale()) {
+        have_fb = false;                /* logged by metal_pipeline */
+    }
     if (have_fb && fb.scale) {
         [enc setRenderPipelineState:fb.scale];
         [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
         [enc setFragmentTexture:fb.decoded atIndex:0];
+        if (backdrop.mode == METAL_BACKDROP_IMAGE) {
+            [enc setFragmentTexture:backdrop.image atIndex:1];
+        }
         [enc setFragmentSamplerState:m.linear atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0 vertexCount:3];
@@ -1253,8 +1510,66 @@ static bool metal_screenshot_to(NSString *path)
         return false;
     }
     cb = [m.queue commandBuffer];
+
+    /* With a backdrop the decoded surface has holes in it: run the scale
+     * pass once more, at 1:1 into an RGBA8 texture, so the picture is
+     * the composite a human sees. */
+    id<MTLTexture> source = fb.decoded;
+    id<MTLTexture> composite = nil;
+
+    if (backdrop.mode != METAL_BACKDROP_OFF) {
+        if (!fb.shot) {
+            MTLFunctionConstantValues *scv = [[MTLFunctionConstantValues alloc] init];
+            uint32_t nearest = METAL_SCALING_NEAREST;
+            bool no = false;
+            uint32_t bd = (uint32_t)backdrop.mode;
+
+            [scv setConstantValue:&nearest type:MTLDataTypeUInt atIndex:1];
+            [scv setConstantValue:&no type:MTLDataTypeBool atIndex:2];
+            [scv setConstantValue:&bd type:MTLDataTypeUInt atIndex:3];
+            fb.shot = metal_pipeline(@"ps_scale", scv, MTLPixelFormatRGBA8Unorm);
+            [scv release];
+        }
+        MTLTextureDescriptor *std_ = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:fb.xres
+                                        height:fb.yres
+                                     mipmapped:NO];
+        std_.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        std_.storageMode = MTLStorageModePrivate;
+        composite = fb.shot ? [m.device newTextureWithDescriptor:std_] : nil;
+        if (composite) {
+            MetalParams sp;
+            MTLRenderPassDescriptor *srp = [MTLRenderPassDescriptor renderPassDescriptor];
+            id<MTLRenderCommandEncoder> senc;
+
+            memset(&sp, 0, sizeof(sp));
+            sp.dim[0] = fb.xres;
+            sp.dim[1] = fb.yres;
+            sp.post[0] = fb.xres;
+            sp.post[1] = fb.yres;
+            sp.post[2] = METAL_SCALING_NEAREST;
+            backdrop_params(&sp);
+            srp.colorAttachments[0].texture = composite;
+            srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            srp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            senc = [cb renderCommandEncoderWithDescriptor:srp];
+            [senc setRenderPipelineState:fb.shot];
+            [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
+            [senc setFragmentTexture:fb.decoded atIndex:0];
+            if (backdrop.mode == METAL_BACKDROP_IMAGE) {
+                [senc setFragmentTexture:backdrop.image atIndex:1];
+            }
+            [senc setFragmentSamplerState:m.linear atIndex:0];
+            [senc drawPrimitives:MTLPrimitiveTypeTriangle
+                     vertexStart:0 vertexCount:3];
+            [senc endEncoding];
+            source = composite;
+        }
+    }
+
     blit = [cb blitCommandEncoder];
-    [blit copyFromTexture:fb.decoded
+    [blit copyFromTexture:source
               sourceSlice:0 sourceLevel:0
              sourceOrigin:MTLOriginMake(0, 0, 0)
                sourceSize:MTLSizeMake(fb.xres, fb.yres, 1)
@@ -1265,6 +1580,7 @@ static bool metal_screenshot_to(NSString *path)
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    [composite release];
 
     /* The pointer is composited over the frame, not in it, and a
      * screenshot shows what a human sees: blend the sprite in with the

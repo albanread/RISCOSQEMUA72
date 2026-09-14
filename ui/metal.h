@@ -151,6 +151,11 @@ bool metal_glue_set_vsync_hz(int hz);
  * next frame. */
 void metal_glue_video_opts(int scaling, int scanlines);
 
+/* The layer beneath the guest's desktop: "off", "acorn", "acorn-live"
+ * or an image file (MACOS.md, "The backdrop layer").  After
+ * metal_backend_init; an unreadable image falls back to acorn. */
+void metal_glue_backdrop(const char *spec);
+
 /* UI-side reads for the scripting surface, all UI-thread only like the
  * rest of this side of the boundary. */
 /* Presented frames since the window opened; monotonic per boot. */
