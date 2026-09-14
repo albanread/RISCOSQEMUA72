@@ -591,6 +591,26 @@ void hostnet_c_callback(void)
     }
 }
 
+/*
+ * Refuse to start unless the doorbell is actually there.
+ *
+ * This matters more than the usual "stay dormant" politeness, because this
+ * module is called Internet and claims the Internet module's SWI chunk.
+ * A module that loads and then refuses every call does not sit quietly out
+ * of the way -- it shadows the real Internet module, and the kernel gives
+ * the later claimant of an in-use chunk priority (Kernel/s/ModHand).  On a
+ * real Raspberry Pi that would mean a machine with networking hardware,
+ * a working stack in ROM, and nothing able to reach it.
+ *
+ * So the test is not "can I work?" but "should I exist?", and the answer
+ * is no unless the host is on the other side of that window.  Declining
+ * leaves the SWI chunk unclaimed and the genuine Internet module in
+ * charge, which is exactly right for hardware this was never meant for.
+ */
+static _kernel_oserror err_notemul = {
+    0x1E4, "Internet: HostNet needs the emulator"
+};
+
 int hostnet_init(void *ws)
 {
     (void)ws;
@@ -598,14 +618,14 @@ int hostnet_init(void *ws)
     cb_pending = 0;
 
     hn_base = os_map_io(HN_PHYS, HN_PAGE);
-    if (!hn_base) {
-        return 0;                   /* no device: load, but serve nothing */
-    }
-    if (hn_reg(HN_MAGIC / 4) != HN_MAGIC_VALUE) {
-        return 0;                   /* something else lives there */
+    if (!hn_base || hn_reg(HN_MAGIC / 4) != HN_MAGIC_VALUE) {
+        /* No doorbell: this is not our emulator.  Do not load. */
+        return (int)&err_notemul;
     }
     if (!(hn_reg(HN_FEATURES / 4) & HN_FEATURE_SOCKETS)) {
-        return 0;                   /* present, sockets switched off */
+        /* The emulator is ours but sockets were not asked for.  Same
+         * answer: better no Internet module than a deaf one. */
+        return (int)&err_notemul;
     }
     live = 1;
 
