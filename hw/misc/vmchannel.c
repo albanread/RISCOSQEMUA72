@@ -221,7 +221,7 @@ static void vmch_dump_walk(CPUState *cs, uint64_t addr)
     }
 }
 
-static bool guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
+bool vmch_guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
 {
     CPUState *cpu = current_cpu ? current_cpu : first_cpu;
     uint8_t *p = buf;
@@ -310,7 +310,7 @@ static uint32_t guest_rw_counted(uint64_t addr, uint8_t *buf, uint32_t len,
         if (chunk > len - done) {
             chunk = len - done;
         }
-        if (!guest_rw(addr + done, buf + done, chunk, is_write)) {
+        if (!vmch_guest_rw(addr + done, buf + done, chunk, is_write)) {
             break;
         }
         done += chunk;

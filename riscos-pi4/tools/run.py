@@ -61,20 +61,28 @@ def ensure_overlay(qemu_img, image, overlay):
 
 
 def command_line(args, overlay):
+    # Two ways to reach a network, and never both.  With --hostnet the
+    # guest has no stack to drive a NIC with, so attaching one would be an
+    # emulated card nothing ever opens; without it, slirp and usb-net as
+    # before.  The doorbell is off unless asked for, so a machine that has
+    # not been switched over is untouched.
+    net = (["-global", "hostnet.sockets=on"] if args.hostnet else
+           ["-netdev", "user,id=n0,domainname=lan",
+            # domainname: RISC OS asks for option 15 in its parameter
+            # list.  It does not fix DHCP, but it is one less thing the
+            # guest asked for and did not get.
+            "-device", "usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3"])
+
     argv = [
         args.qemu,
         "-M", "raspi4b",
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", args.kernel,
         "-device", f"loader,file={args.cmos},addr=0x510000,force-raw=on",
-        # domainname: RISC OS asks for option 15 in its parameter list.
-        # It does not fix DHCP here, but it is one less thing the guest
-        # asked for and did not get.
-        "-netdev", "user,id=n0,domainname=lan",
+        *net,
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",
-        "-device", "usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3",
         # Sound needs both halves: a backend, and the vchiq peer told to
         # use it. Without them the guest's sound loop still turns and you
         # simply hear nothing, which reads as sound being unimplemented.
@@ -213,6 +221,11 @@ def main():
     ap.add_argument("--modules", nargs="*", default=[], metavar="FILE",
                     help="further modules spliced into the ROM before "
                          "boot, in initialisation order")
+    ap.add_argument("--hostnet", action="store_true",
+                    help="the guest's sockets are served by the host: splice "
+                         "HostNet, unplug the ROM's own networking, and "
+                         "attach no emulated NIC (ROS_PRIVATE "
+                         "design/HOSTNET.md)")
     ap.add_argument("--no-card", action="store_true",
                     help="attach no SD card at all: the share is the whole "
                          "machine (needs --hostfs, and --boot hostfs to "
@@ -236,9 +249,11 @@ def main():
     # two builders, that run-macos.sh gets from rom.zsh.
     try:
         args.kernel = rom.rom_to_boot(args.kernel, args.modules,
-                                      hostfs=args.hostfs)
+                                      hostfs=args.hostfs,
+                                      hostnet=args.hostnet)
         args.cmos = rom.cmos_to_boot(args.cmos, args.boot,
-                                     hostfs=args.hostfs)
+                                     hostfs=args.hostfs,
+                                     hostnet=args.hostnet)
     except rom.RomError as exc:
         raise SystemExit(str(exc))
 

@@ -38,6 +38,39 @@ DEFAULT_HOSTFS_MODULES = [
 # HostFS's filing system number, from hostfs/dde/s.head.
 HOSTFS_FS_NUMBER = 220
 
+# HostNet: the guest's sockets, served by the host (ROS_PRIVATE
+# design/HOSTNET.md).  It calls itself Internet 6.00 and claims the same
+# SWI chunk, so every `RMEnsure Internet` on the disc is satisfied without
+# an edit -- and the ROM's own networking is unplugged rather than left to
+# race it.  Chain numbers from `mkrom.py --list` on the 5.30 ROM:
+#
+#   98  Internet      the stack
+#  106  EtherGENET    the Pi 4 driver, already unplugged (no MAC modelled)
+#  107  EtherUSB      the driver we were using instead
+#  108  DHCP          the client that never reaches BOUND
+#
+# Two that stay, and both for a reason worth writing down.
+#
+# Resolver (99) does DNS over UDP sockets, which HostNet serves, so it
+# needs no help from us.
+#
+# MbufManager (97) must NOT be unplugged, however pointless it looks with
+# no stack to buffer for.  !Internet's !Run does
+#
+#     RMEnsure MbufManager 0.17 RMLoad System:Modules.Network.MManager
+#     RMEnsure MbufManager 0.17 Error !Internet requires MbufManager 0.17
+#
+# and the only copy on the disc is in !System.310 -- a 26-bit module.  The
+# RMLoad fails with "Module 'MbufManager' is not 32-bit compatible", the
+# Error fires, and !Run stops there: before Choices:Internet.Startup, and
+# so before Choices:Internet.User, which is where Inet$Resolvers is set.
+# The machine still reaches the desktop looking healthy and NetSurf says
+# "No domain name servers are configured".  Left in the ROM it satisfies
+# the RMEnsure, allocates nothing, and costs nothing.
+DEFAULT_HOSTNET_MODULE = os.path.join(RISCOS_PI4, "hostnet", "build",
+                                      "HostNet,ffa")
+HOSTNET_UNPLUG = [98, 106, 107, 108]
+
 # The boot screen.  BootFX keeps three files in ResourceFS, and mkrom.py -r
 # overwrites them in place; app/bootfx holds the Acorn set that replaces
 # ROOL's Raspberry Pi one.  Same defaults as rom.zsh, so a Windows machine
@@ -85,7 +118,7 @@ def bootfx_resources(bootfx):
 
 
 def rom_to_boot(kernel, modules=(), hostfs=None, hostfs_modules=None,
-                out_dir=None, log=print, bootfx=None):
+                out_dir=None, log=print, bootfx=None, hostnet=False):
     """The image to boot: the stock one, or one with modules spliced in.
 
     modules         files spliced into the ROM, in initialisation order
@@ -94,8 +127,18 @@ def rom_to_boot(kernel, modules=(), hostfs=None, hostfs_modules=None,
                     a share and no filing system to reach it
     hostfs_modules  override those builds; [] splices none.  A module whose
                     title is already in `modules` stands instead
+    hostnet         splice HostNet, which serves the guest's sockets from
+                    the host.  It goes last, after HostFS: it is the
+                    Internet module by name and version, and the ROM's own
+                    is unplugged by cmos_to_boot, so nothing else should
+                    still be initialising a network stack behind it
     """
     modules = list(modules)
+    if hostnet:
+        if not os.path.exists(DEFAULT_HOSTNET_MODULE):
+            raise RomError("hostnet: not built; run "
+                           "riscos-pi4/hostnet/build-hostnet.sh")
+        modules = modules + [DEFAULT_HOSTNET_MODULE]
     for path in modules:
         if not os.path.exists(path):
             raise RomError(f"module: missing: {path}")
@@ -151,7 +194,8 @@ def rom_to_boot(kernel, modules=(), hostfs=None, hostfs_modules=None,
     return out
 
 
-def cmos_to_boot(cmos, boot=None, hostfs=None, out_dir=None, log=print):
+def cmos_to_boot(cmos, boot=None, hostfs=None, out_dir=None, log=print,
+                 hostnet=False):
     """The CMOS blob to load: the stock one, or one that boots the share.
 
     boot    "hostfs" boots from the share; None boots as `cmos` says.  A
@@ -162,33 +206,47 @@ def cmos_to_boot(cmos, boot=None, hostfs=None, out_dir=None, log=print):
     from `cmos`, and the share is seeded with it.  Either way FileSystem
     HostFS is forced into it, so the launch option always wins.
     """
-    if not boot:
+    if not boot and not hostnet:
         return cmos
-    if boot != "hostfs":
+    if boot and boot != "hostfs":
         raise RomError(f"boot: {boot!r} is not a boot source "
                        "(hostfs, or unset)")
-    if not hostfs:
+    if boot and not hostfs:
         raise RomError("boot=hostfs: a share is needed to boot from one")
 
+    # The share keeps its own CMOS once it has one, as a card does; the
+    # stock blob only seeds the first boot.  With no share (hostnet alone)
+    # there is nowhere to keep it, so the stock one is the base every time.
     saved = None
-    for name in ("CMOS,ff2", "CMOS,fe4"):
-        candidate = os.path.join(hostfs, name)
-        if os.path.exists(candidate):
-            saved = candidate
-            break
+    if hostfs:
+        for name in ("CMOS,ff2", "CMOS,fe4"):
+            candidate = os.path.join(hostfs, name)
+            if os.path.exists(candidate):
+                saved = candidate
+                break
 
     out_dir = out_dir or os.path.dirname(os.path.abspath(cmos))
     out = os.path.join(out_dir, "cmos-hostfs.bin")
+    argv = [sys.executable, os.path.join(HERE, "mkcmos.py"),
+            "--symbols", os.path.join(HERE, "cmos-symbols-530.json"),
+            "--base", saved or cmos, "-o", out]
+    if boot:
+        argv += ["--filesystem", str(HOSTFS_FS_NUMBER)]
+    if hostnet:
+        # The ROM stack does not get to start.  Not tidiness: MbufManager
+        # and the Internet module would claim the same SWI chunk and the
+        # DCI drivers would go looking for hardware that is not there.
+        for chunk in HOSTNET_UNPLUG:
+            argv += ["--unplug", str(chunk)]
     # Remade every launch: it is cheap, and the share may have changed.
-    _run([sys.executable, os.path.join(HERE, "mkcmos.py"),
-          "--symbols", os.path.join(HERE, "cmos-symbols-530.json"),
-          "--base", saved or cmos,
-          "--filesystem", str(HOSTFS_FS_NUMBER),
-          "-o", out])
+    _run(argv)
 
+    if hostnet:
+        log("cmos: ROM networking unplugged (" +
+            ", ".join(str(c) for c in HOSTNET_UNPLUG) + "); HostNet serves")
     if saved:
         log(f"cmos: from the share's {os.path.basename(saved)}")
-    else:
+    elif boot:
         shutil.copyfile(out, os.path.join(hostfs, "CMOS,ff2"))
         log("cmos: FileSystem HostFS; the share now keeps it, as CMOS,ff2")
     return out

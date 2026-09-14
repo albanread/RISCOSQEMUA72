@@ -206,19 +206,23 @@ static void bcm2838_peripherals_realize(DeviceState *dev, Error **errp)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pcie), 0), -1000);
 
     /*
-     * The GENET Ethernet MAC is not modelled either. RISC OS's HAL registers
-     * it as a device regardless, and EtherGENET reads its revision register
-     * first thing; against unmapped memory that is an external abort. An
-     * unimplemented device reads as zero, which the driver takes as an
-     * unknown controller and declines.
+     * The GENET Ethernet MAC is not modelled, and with HostNet it never
+     * will be: the guest does no networking below the socket layer, so
+     * there is no link for a MAC to drive and EtherGENET is unplugged.
+     * What stood here was an unimplemented device present only so that
+     * EtherGENET's revision read returned zero rather than taking an
+     * external abort.  Its window is now HostNet's doorbell, same
+     * address, same size.  Low peripheral window (0xFD580000 to the
+     * guest) because RISC OS maps that on request with OS_Memory 13,
+     * the way the HostFS doorbell at 0xFD400000 is reached; a page in
+     * the FE00 section aborts unless the HAL asked for that exact page.
      */
-    object_initialize_child(OBJECT(s), "bcm2711-genet", &s->genet,
-                            TYPE_UNIMPLEMENTED_DEVICE);
-    qdev_prop_set_string(DEVICE(&s->genet), "name", "bcm2711-genet");
-    qdev_prop_set_uint64(DEVICE(&s->genet), "size", BCM2711_GENET_SIZE);
-    sysbus_realize(SYS_BUS_DEVICE(&s->genet), &error_fatal);
+    object_initialize_child(OBJECT(s), "hostnet", &s->hostnet, TYPE_HOSTNET);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->hostnet), errp)) {
+        return;
+    }
     memory_region_add_subregion_overlap(&s->peri_low_mr, BCM2711_GENET_OFFSET,
-            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->genet), 0), -1000);
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->hostnet), 0), -1000);
 
     /*
      * The HostFS doorbell (riscos-pi4/FSDESIGN.md) at 0xfd400000: a hole

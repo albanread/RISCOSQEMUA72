@@ -163,6 +163,18 @@
 #define VMCH_MAX_ARG  4032   /* one page: 64-byte header + 4032 */
 #define VMCH_CAT_ENTRY (20 + VMCH_MAX_NAME)  /* one CAT wire entry, meta+name */
 
+/*
+ * Read or write guest memory by its *logical* address, walking the
+ * guest MMU a page at a time.  Exported because HostNet (hw/misc/
+ * hostnet.c) needs exactly this and for exactly the same reason: the
+ * addresses in a request block are the ones the application passed,
+ * so a socket buffer is read where it lies.  It will not fault a page
+ * in — an address not mapped right now fails rather than being
+ * invented.  Call only from a doorbell handler, where current_cpu is
+ * the vCPU that rang and the BQL is held.
+ */
+bool vmch_guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write);
+
 #define TYPE_VMCHANNEL "vmchannel"
 OBJECT_DECLARE_SIMPLE_TYPE(VMChannelState, VMCHANNEL)
 

@@ -14,6 +14,7 @@
 #include "hw/gpio/bcm2838_gpio.h"
 #include "hw/intc/bcm2838_ic.h"
 #include "hw/misc/vmchannel.h"
+#include "hw/misc/hostnet.h"
 #include "hw/misc/riscos_blitter.h"
 
 /* SPI */
@@ -110,7 +111,10 @@ struct BCM2838PeripheralState {
     MemoryRegion mphi_mr_alias;
 
     UnimplementedDeviceState pcie;
-    UnimplementedDeviceState genet;
+    /* The GENET MAC is not modelled and never will be: with HostNet
+     * serving the guest sockets there is no link layer to drive, and
+     * EtherGENET is unplugged.  Its window is HostNet's doorbell. */
+    HostNetState hostnet;
 
     /* The HostFS doorbell, mapped at VMCHANNEL_OFFSET in both windows:
      * the low alias directly, the high one through vmchannel_mr_alias

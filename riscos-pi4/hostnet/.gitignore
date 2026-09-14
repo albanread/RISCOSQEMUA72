@@ -1,0 +1,5 @@
+# Build products: the module and everything that makes it.  HostNet,ffa is
+# rebuilt by build-hostnet.sh, and rom.py splices it from here.
+build/
+# Generated from swis.txt at build time, so it cannot drift from the list.
+hostnet_swis.inc
