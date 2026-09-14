@@ -32,7 +32,9 @@ runs without.
 
 import argparse
 import fnmatch
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -158,6 +160,74 @@ def build_disc(fs_zip, dest, strip):
     return n, b
 
 
+
+# ---------------------------------------------------------------- network
+
+# The guest side of slirp, fixed.  slirp is always 10.0.2.0/24 with the host
+# at .2, so there is nothing for DHCP to discover -- and RISC OS rejects
+# slirp's offer anyway: it retries four times over 20 seconds, then falls
+# back to a 169.254 link-local address with no gateway and no resolver,
+# which is why name lookups failed.  Configuring the interface directly
+# removes the wait and the fallback both.  Measured: 49s to the desktop
+# before, 28s after, and no DHCP packet on the wire at all.
+GUEST_IP, GUEST_MASK, GUEST_GW = "10.0.2.15", "255.255.255.0", "10.0.2.2"
+GUEST_DNS = "208.67.222.222 208.67.220.220"      # OpenDNS
+GUEST_DOMAIN = "lan"
+
+
+def configure_network(disc):
+    """Point Choices:Internet at slirp, statically."""
+    step("disc: network, static against slirp")
+    ch = os.path.join(disc, "!Boot", "Choices", "Internet")
+    startup = os.path.join(ch, "Startup,feb")
+    user = os.path.join(ch, "User,feb")
+    if not os.path.exists(startup):
+        log("   no Internet choices in this disc, skipped")
+        return
+
+    text = io.open(startup, encoding="latin-1", newline="").read()
+    if "DHCPExecute" in text:
+        text = text.replace("Set Inet$EtherIPAddr dhcp",
+                            f"Set Inet$EtherIPAddr {GUEST_IP}")
+        text = text.replace("Set Inet$EtherIPMask default",
+                            f"Set Inet$EtherIPMask {GUEST_MASK}")
+        old = ('IF "<Wimp$State>" = "commands" THEN Echo Contacting DHCP '
+               'server for Ethernet over USB interface\n'
+               'DHCPExecute -e -b -w -p ej0\n'
+               'CheckError\n'
+               'If "<Inet$Gateway>" <> "" Then do /Inet:bin.route -e add '
+               'default <Inet$Gateway>\n'
+               'CheckError\n')
+        new = (f'IfConfig -e ej0 {GUEST_IP} netmask {GUEST_MASK}\n'
+               'CheckError\n'
+               f'Set Inet$Gateway {GUEST_GW}\n'
+               f'do /Inet:bin.route -e add default {GUEST_GW}\n'
+               'CheckError\n')
+        if old in text:
+            text = text.replace(old, new, 1)
+            io.open(startup, "w", encoding="latin-1", newline="").write(text)
+            log(f"   {GUEST_IP}/{GUEST_MASK} via {GUEST_GW}, no DHCP")
+        else:
+            log("   WARNING: DHCP block not in the expected form, left alone")
+    else:
+        log("   already static")
+
+    u = io.open(user, encoding="latin-1", newline="").read()
+    if "Inet$Resolvers" in u:
+        u = re.sub(r"Set Inet\$Resolvers .*",
+                   f"Set Inet$Resolvers {GUEST_DNS}", u, count=1)
+    else:
+        anchor = "Set Inet$ResolverRetries 3\n"
+        if anchor not in u:
+            log("   WARNING: could not place the resolver setting")
+            return
+        u = u.replace(anchor, anchor +
+                      f"Set Inet$Resolvers {GUEST_DNS}\n"
+                      f"Set Inet$LocalDomain {GUEST_DOMAIN}\n", 1)
+    io.open(user, "w", encoding="latin-1", newline="").write(u)
+    log(f"   resolvers {GUEST_DNS}")
+
+
 # ------------------------------------------------------------------- app
 
 def build_app(args, app_dir):
@@ -260,6 +330,7 @@ def main():
     build_launcher(app_dir, args.name)
     files, size = build_disc(args.fs_zip, disc_dir,
                              [] if args.no_strip else STRIP_DEFAULT)
+    configure_network(disc_dir)
 
     if args.stage_only:
         step("staged, not packaged (--stage-only)")
