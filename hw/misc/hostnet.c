@@ -26,6 +26,17 @@
 #include "migration/vmstate.h"
 
 /*
+ * poll() and its POLL* flags live in <poll.h>, which qemu/osdep.h does not
+ * pull in on macOS; and a socket is closed with closesocket() only on
+ * Windows (WinSock) — on POSIX it is plain close().  qemu/osdep.h already
+ * declares close() (via <unistd.h>).
+ */
+#ifndef _WIN32
+#include <poll.h>
+#define closesocket close
+#endif
+
+/*
  * RISC OS's errno values are 4.4BSD's (Lib/TCPIPLibs/headers/sys/h/errno,
  * and the name table in the Internet module's riscos/c/module).  The
  * host's are the host's: native on macOS, and on Windows the C runtime's,
