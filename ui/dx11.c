@@ -315,6 +315,34 @@ void dx11_glue_load_snapshot(void)
     qemu_bh_schedule(dx11_loadvm_bh);
 }
 
+/*
+ * The picture on the display, for screendump: the window's composited
+ * frame copied into a pixman image.  BGRA in memory is x8r8g8b8 on a
+ * little-endian host, and the alpha the compositor leaves behind is not
+ * ours to interpret, so it is dropped.  NULL means the window has no
+ * frame yet, and the caller falls back to the guest's framebuffer.
+ *
+ * Thread: the QEMU main loop, inside screendump.  The window's frame loop
+ * is held out of the buffer between get and done, so this is a plain copy
+ * and the wait is bounded by one frame.
+ */
+static pixman_image_t *dx11_composite_image(void)
+{
+    const void *pixels;
+    uint32_t w = 0, h = 0;
+    pixman_image_t *image;
+
+    if (!dx11_glue_composite_get(&w, &h, &pixels, 200)) {
+        return NULL;
+    }
+    image = pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h, NULL, 0);
+    if (image) {
+        memcpy(pixman_image_get_data(image), pixels, (size_t)w * h * 4);
+    }
+    dx11_glue_composite_done();
+    return image;
+}
+
 static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)
 {
     Dx11FbView prime;
@@ -361,6 +389,15 @@ static void dx11_display_init(DisplayState *ds, DisplayOptions *opts)
         dx11_glue_video_opts(scaling, opts->u.dx11.has_scanlines
                                      && opts->u.dx11.scanlines);
     }
+
+    /* The backdrop beneath the desktop.  Parsed by the window, which owns
+     * the shader it feeds; unset means no backdrop and no compositing. */
+    dx11_glue_backdrop(opts->u.dx11.backdrop);
+
+    /* screendump takes the composited frame from here rather than the
+     * guest's framebuffer: what is on the display, not what was drawn. */
+    qemu_ui_set_composite(dx11_composite_image);
+
     /* The hand-off: system/main.c sees this set after qemu_init and runs
      * the QEMU main loop on its own thread, giving the UI the main one. */
     qemu_main = dx11_backend_main;

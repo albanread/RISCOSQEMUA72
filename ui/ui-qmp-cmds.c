@@ -356,13 +356,24 @@ qmp_screendump(const char *filename, const char *device,
      * further graphic update are possible until it is released.  Take
      * an image ref before that.
      */
-    surface = qemu_console_surface(con);
-    if (!surface) {
-        error_setg(errp, "no surface");
-        object_unref(con);
-        return;
+    /*
+     * With no device named, the dump is the picture on the display: a
+     * front end that composites the screen itself is asked for its frame
+     * first.  Naming a device asks that device what it drew, which is
+     * the only way to get the guest's own framebuffer back.
+     */
+    image = device ? NULL : qemu_ui_composite();
+    if (!image) {
+        /* No compositing front end, or it has not drawn a frame yet:
+         * the guest's own framebuffer, as before. */
+        surface = qemu_console_surface(con);
+        if (!surface) {
+            error_setg(errp, "no surface");
+            object_unref(con);
+            return;
+        }
+        image = pixman_image_ref(surface->image);
     }
-    image = pixman_image_ref(surface->image);
     object_unref(con);
 
     fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);

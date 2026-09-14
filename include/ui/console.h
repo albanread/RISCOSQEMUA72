@@ -374,6 +374,19 @@ void qemu_console_set_window_id(QemuConsole *con, int window_id);
 
 void qemu_console_resize(QemuConsole *con, int width, int height);
 DisplaySurface *qemu_console_surface(QemuConsole *con);
+
+/*
+ * A front end that composites the guest's screen itself -- scaling it to
+ * the window, drawing a layer beneath it, the pointer over it -- can
+ * offer the picture the user is actually looking at.  screendump takes
+ * that in preference to the console's surface, which holds what the guest
+ * drew rather than what the display shows.  The function returns a new
+ * reference the caller unrefs, or NULL when there is no frame to give.
+ */
+typedef pixman_image_t *(*QemuUiComposite)(void);
+void qemu_ui_set_composite(QemuUiComposite fn);
+pixman_image_t *qemu_ui_composite(void);
+
 void coroutine_fn qemu_console_co_wait_update(QemuConsole *con);
 
 /* console-gl.c */

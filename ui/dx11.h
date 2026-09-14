@@ -125,6 +125,27 @@ int dx11_glue_guest_frame(uint64_t *seq, int *settled);
  * compiled. */
 void dx11_glue_video_opts(int scaling, int scanlines);
 
+/* The backdrop drawn beneath the guest's desktop, from the display
+ * option: "off" (the feature gated out), "none", "acorn", "acorn-live",
+ * "tile:PATH", "picture:PATH", or a bare path, which is a picture.  Set
+ * once at display init, before any shader is compiled, like the video
+ * options above; the window's own Backdrop menu changes it after. */
+void dx11_glue_backdrop(const char *spec);
+
+/*
+ * The composited frame: the guest's desktop scaled into the client area,
+ * the backdrop showing through underneath and the pointer over the top --
+ * the picture on the display rather than the one in the guest's
+ * framebuffer.  Asks the window for a fresh one and waits up to wait_ms
+ * for the frame loop to take it; returns 0 if none arrived, and otherwise
+ * BGRA pixels of w * h * 4 that stay valid, and hold the window's frame
+ * loop out of them, until dx11_glue_composite_done().
+ * Thread: any but the UI thread.
+ */
+int dx11_glue_composite_get(uint32_t *w, uint32_t *h, const void **pixels,
+                            int wait_ms);
+void dx11_glue_composite_done(void);
+
 /* Reload the named-by-convention snapshot ("desktop") from the window's
  * system menu; the load itself runs as a bottom half on the main loop. */
 void dx11_glue_load_snapshot(void);

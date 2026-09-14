@@ -180,6 +180,13 @@
 #     parameter is missing, the primary display will be used.
 #     (Since 2.12)
 #
+#     With no device named, a front end that composites the screen
+#     itself (dx11) is asked for the picture on the display -- the
+#     guest's screen scaled to the window, with whatever the front end
+#     draws under and over it.  Naming a device asks that device what
+#     it drew, which is the way to get the guest's own framebuffer, at
+#     the mode's own size.
+#
 # @head: head to use in case the device supports multiple heads.  If
 #     this parameter is missing, head #0 will be used.  Also note that
 #     the head can only be specified in conjunction with the device
@@ -1574,12 +1581,19 @@
 # @scanlines: darken every other output row, CRT flavour, when the
 #     image is magnified at least twice (default off).
 #
+# @backdrop: a layer drawn by the host beneath the guest's desktop,
+#     showing through the pixels the guest tags as "below".  "off"
+#     (default) gates the feature out, with no Backdrop menu; "none",
+#     "acorn", "acorn-live", "tile:PATH" or "picture:PATH" (or a bare
+#     PATH) turn it on with that scene.
+#
 # Since: 11.1
 ##
 { 'struct'  : 'DisplayDx11',
   'data'    : { '*vsync' : 'int',
                 '*scaling' : 'DisplayDx11Scaling',
-                '*scanlines' : 'bool' },
+                '*scanlines' : 'bool',
+                '*backdrop' : 'str' },
   'if'      : 'CONFIG_DX11' }
 
 ##

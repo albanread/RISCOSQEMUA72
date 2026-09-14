@@ -25,6 +25,8 @@
 #include <dxgi.h>
 #include <dxgi1_3.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>
+#include <shellapi.h>
 #include <zlib.h>
 
 #include <cstdarg>
@@ -106,6 +108,7 @@ static struct {
     ID3D11PixelShader *scale_ps;
     ID3D11Buffer *cbuf;
     ID3D11SamplerState *linear;
+    ID3D11SamplerState *wrap;      /* backdrop tiles repeat */
     bool up;
 } fb;
 
@@ -155,7 +158,16 @@ static void dx11_log(const char *fmt, ...)
     fclose(f);
 }
 
-void dx11_screenshot(void);     /* PrintScreen: decoded surface to a PNG */
+void dx11_screenshot(void);     /* PrintScreen: ask for the composited frame */
+static void comp_capture(void);  /* ... which the frame loop answers */
+static void comp_init(void);
+
+/* The Backdrop submenu, defined with the rest of the backdrop below;
+ * the window procedure above it opens and answers the menu. */
+static void backdrop_build_menu(void);
+static bool backdrop_command(UINT id);
+static void backdrop_attach_menu(void);
+static HMENU backdrop_menu_handle(void);
 
 /* ------------------------------------------------------------------ */
 /* Grab: the guest owns the keyboard and the pointer until Ctrl+Alt+G  */
@@ -421,9 +433,20 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_MOUSEWHEEL:
         dx11_glue_mouse_wheel(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA);
         return 0;
+    case WM_INITMENUPOPUP:
+        /* The Backdrop submenu is read from the folder each time it opens,
+         * so an image dropped in there is listed without a restart. */
+        if ((HMENU)w == backdrop_menu_handle()) {
+            backdrop_build_menu();
+            return 0;
+        }
+        return DefWindowProcW(h, msg, w, l);
     case WM_SYSCOMMAND:
         if ((w & 0xfff0) == DX11_SC_LOADSNAP) {
             dx11_glue_load_snapshot();
+            return 0;
+        }
+        if (backdrop_command((UINT)(w & 0xfff0))) {
             return 0;
         }
         return DefWindowProcW(h, msg, w, l);
@@ -613,6 +636,560 @@ static bool dx11_acquire_target(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* The backdrop layer                                                   */
+
+/*
+ * -display dx11,backdrop=: a layer the host draws beneath the guest's
+ * desktop (ROS_PRIVATE docs/hostnet.md's sibling, MACOS.md "The backdrop
+ * layer").  The guest opts pixels in through the transfer byte of a 32bpp
+ * pixel -- RISC OS's supremacy byte, which everything the OS draws leaves
+ * at zero:
+ *
+ *   bits 7-6  the layer tag: 10 below (the layer beneath shows through),
+ *             01 above (reserved: a layer drawn over the pixel), 00 and
+ *             11 nothing, so the &FF some sprite tools write means nothing
+ *   bits 5-0  reserved, zero
+ *
+ * A below pixel must also be the backdrop key colour, the Acorn theme's
+ * sage, so an EOR drag box drawn over the backdrop changes the colour,
+ * drops out of the key and stays visible.  The guest paints the tag by
+ * tiling a sprite whose pixels carry it (riscos-pi4/tools/mkbacktile.py);
+ * no RISC OS code changes.
+ *
+ * This is the Windows half of the Metal front end's feature, drawing the
+ * same scene from the same numbers.
+ */
+enum Dx11Backdrop { DX11_BACKDROP_OFF = 0, DX11_BACKDROP_ACORN,
+                    DX11_BACKDROP_ACORN_LIVE, DX11_BACKDROP_PICTURE,
+                    DX11_BACKDROP_TILE };
+#define DX11_BACKDROP_KEY   0x00B4C0B7u  /* 0x00BBGGRR: #B7C0B4 */
+#define DX11_ICONBAR_PX     66u          /* guest px, square-pixel modes */
+
+/* The shader constants, in the shape ui/dx11.cpp's HLSL `Params` reads. */
+struct Dx11Params {
+    uint32_t dim[4];
+    uint32_t misc[4];
+    uint32_t post[4];
+    uint32_t bd[4];     /* backdrop: key 0x00BBGGRR, time ms, icon bar, mode */
+    uint32_t bx[4];     /* backdrop: output px per tile px x1000, unused */
+};
+
+static struct {
+    bool enabled;                   /* the gate: backdrop= other than off */
+    int mode;                       /* which scene, Dx11Backdrop */
+    ID3D11Texture2D *image;         /* tile or picture, if any */
+    ID3D11ShaderResourceView *image_srv;
+    double image_scale;             /* 2 for an @2x tile, else 1 */
+    ULONGLONG t0;                   /* the live scene's clock origin, ms */
+    char spec[512];
+} backdrop = { false, DX11_BACKDROP_OFF, nullptr, nullptr, 1.0, 0, "off" };
+
+/*
+ * The backdrop's share of the shader constants: the key, a clock on the
+ * scene's half-hour loop, the icon bar the acorn is centred above, and
+ * which scene.  The loop keeps the float time small enough that the live
+ * scene's sines do not lose precision after a long session.
+ */
+static void backdrop_params(Dx11Params *p)
+{
+    p->bd[0] = DX11_BACKDROP_KEY;
+    p->bd[1] = (uint32_t)((GetTickCount64() - backdrop.t0) % 1800000ULL);
+    p->bd[2] = DX11_ICONBAR_PX;
+    p->bd[3] = (uint32_t)backdrop.mode;
+    /* An output pixel per image pixel, or half of one for an @2x tile. */
+    p->bx[0] = (uint32_t)(1000.0 / backdrop.image_scale + 0.5);
+}
+
+/*
+ * An image for backdrop=<file>: anything WIC reads, converted to straight
+ * BGRA8 and drawn over the key colour, so a transparent PNG sits on sage
+ * rather than on black.  Capped at 4096 a side, as the Metal side caps it.
+ * Returns false and leaves the texture null if the file cannot be read.
+ */
+#define DX11_BACKDROP_MAXPX 4096
+
+static bool backdrop_load_image(const char *path)
+{
+    IWICImagingFactory *fac = nullptr;
+    IWICBitmapDecoder *dec = nullptr;
+    IWICBitmapFrameDecode *frame = nullptr;
+    IWICFormatConverter *conv = nullptr;
+    wchar_t wpath[MAX_PATH];
+    UINT w = 0, h = 0;
+    uint8_t *pix = nullptr;
+    bool ok = false;
+    HRESULT hr;
+
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0) {
+        return false;
+    }
+    /* The UI thread may or may not have COM up; either answer is fine, and
+     * a second initialise is balanced by the uninitialise below. */
+    HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&fac));
+    if (SUCCEEDED(hr)) {
+        hr = fac->CreateDecoderFromFilename(wpath, nullptr, GENERIC_READ,
+                                            WICDecodeMetadataCacheOnDemand,
+                                            &dec);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = dec->GetFrame(0, &frame);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = frame->GetSize(&w, &h);
+    }
+    if (SUCCEEDED(hr) && (w == 0 || h == 0 ||
+                          w > DX11_BACKDROP_MAXPX || h > DX11_BACKDROP_MAXPX)) {
+        dx11_log("backdrop: %s is %ux%u, past the %u limit", path, w, h,
+                 DX11_BACKDROP_MAXPX);
+        hr = E_FAIL;
+    }
+    if (SUCCEEDED(hr)) {
+        hr = fac->CreateFormatConverter(&conv);
+    }
+    if (SUCCEEDED(hr)) {
+        /* Straight (not premultiplied) BGRA: the shader composites the
+         * image as opaque colour, and the fill below removes any alpha. */
+        hr = conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                              WICBitmapDitherTypeNone, nullptr, 0.0,
+                              WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(hr)) {
+        pix = (uint8_t *)malloc((size_t)w * h * 4);
+        hr = pix ? conv->CopyPixels(nullptr, w * 4, w * h * 4, pix) : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
+        /* Over the key colour, so transparency lands on sage. */
+        for (size_t i = 0, n = (size_t)w * h; i < n; i++) {
+            uint8_t *q = pix + i * 4;
+            unsigned a = q[3];
+            q[0] = (uint8_t)((q[0] * a + 0xB4 * (255 - a)) / 255);
+            q[1] = (uint8_t)((q[1] * a + 0xC0 * (255 - a)) / 255);
+            q[2] = (uint8_t)((q[2] * a + 0xB7 * (255 - a)) / 255);
+            q[3] = 0xff;
+        }
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd = { pix, w * 4, 0 };
+        hr = dx11.device->CreateTexture2D(&td, &sd, &backdrop.image);
+        if (SUCCEEDED(hr)) {
+            hr = dx11.device->CreateShaderResourceView(backdrop.image, nullptr,
+                                                       &backdrop.image_srv);
+        }
+        if (SUCCEEDED(hr)) {
+            dx11_log("backdrop: image %s (%ux%u)", path, w, h);
+            ok = true;
+        }
+    }
+    free(pix);
+    if (conv) conv->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    if (fac) fac->Release();
+    if (SUCCEEDED(co)) {
+        CoUninitialize();
+    }
+    if (!ok) {
+        if (backdrop.image_srv) { backdrop.image_srv->Release(); }
+        if (backdrop.image) { backdrop.image->Release(); }
+        backdrop.image_srv = nullptr;
+        backdrop.image = nullptr;
+    }
+    return ok;
+}
+
+/*
+ * backdrop=off | none | acorn | acorn-live | tile:<file> | picture:<file>
+ * | <file> (a bare path is a picture).  A tile whose name carries @2x
+ * covers half an output pixel per image pixel.  An unreadable image falls
+ * back to the acorn rather than to nothing, so the window is never a
+ * mystery black.
+ */
+static void backdrop_set_scene(const char *spec)
+{
+    int mode = DX11_BACKDROP_OFF;
+    const char *path = nullptr;
+
+    if (backdrop.image_srv) { backdrop.image_srv->Release(); }
+    if (backdrop.image) { backdrop.image->Release(); }
+    backdrop.image_srv = nullptr;
+    backdrop.image = nullptr;
+    backdrop.image_scale = 1.0;
+
+    if (!spec || !*spec || !strcmp(spec, "none") || !strcmp(spec, "off")) {
+        mode = DX11_BACKDROP_OFF;
+        spec = "none";
+    } else if (!strcmp(spec, "acorn")) {
+        mode = DX11_BACKDROP_ACORN;
+    } else if (!strcmp(spec, "acorn-live")) {
+        mode = DX11_BACKDROP_ACORN_LIVE;
+    } else if (!strncmp(spec, "tile:", 5)) {
+        mode = DX11_BACKDROP_TILE;
+        path = spec + 5;
+    } else if (!strncmp(spec, "picture:", 8)) {
+        mode = DX11_BACKDROP_PICTURE;
+        path = spec + 8;
+    } else {
+        mode = DX11_BACKDROP_PICTURE;
+        path = spec;
+    }
+    if (path) {
+        if (backdrop_load_image(path)) {
+            if (mode == DX11_BACKDROP_TILE && strstr(path, "@2x")) {
+                backdrop.image_scale = 2.0;
+            }
+        } else {
+            mode = DX11_BACKDROP_ACORN;
+            spec = "acorn";
+            dx11_log("backdrop: cannot read %s; using acorn", path);
+        }
+    }
+    backdrop.mode = mode;
+    snprintf(backdrop.spec, sizeof(backdrop.spec), "%s", spec);
+}
+
+/*
+ * The gate, from -display dx11,backdrop=.  "off" leaves the feature out
+ * entirely: the decode ignores the transfer byte, nothing is drawn beneath
+ * the desktop, and the Backdrop menu is not built.
+ */
+extern "C" void dx11_glue_backdrop(const char *spec)
+{
+    backdrop.t0 = GetTickCount64();
+    if (!spec || !*spec || !strcmp(spec, "off")) {
+        backdrop.enabled = false;
+        backdrop.mode = DX11_BACKDROP_OFF;
+        snprintf(backdrop.spec, sizeof(backdrop.spec), "off");
+        return;
+    }
+    backdrop.enabled = true;
+    backdrop_set_scene(spec);
+    backdrop_attach_menu();
+    dx11_log("backdrop: %s", backdrop.spec);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* The Backdrop menu                                                    */
+
+/*
+ * The window menu's Backdrop submenu, the Metal front end's twin (its
+ * menuNeedsUpdate): the Acorn scenes, None, and Tiles and Pictures
+ * listing the images in the backdrops folder -- rebuilt each time it
+ * opens, so a file dropped into the folder is there next time.  A choice
+ * applies at once.
+ *
+ * Items in a window menu report through WM_SYSCOMMAND, whose low four
+ * bits the system reserves, so every identifier here is a multiple of 16.
+ */
+#define DX11_SC_BD_ACORN  0x0200
+#define DX11_SC_BD_LIVE   0x0210
+#define DX11_SC_BD_NONE   0x0220
+#define DX11_SC_BD_OPEN   0x0230
+#define DX11_SC_BD_IMG0   0x0300        /* one per listed image, step 16 */
+#define DX11_SC_BD_IMGS   200           /* as many as the Metal menu lists */
+
+static HMENU backdrop_menu;                       /* the submenu, if built */
+
+static HMENU backdrop_menu_handle(void)
+{
+    return backdrop_menu;
+}
+
+/*
+ * Hang the submenu on the window menu.  Called from dx11_glue_backdrop,
+ * because the window is created before the display options are read and
+ * this is the first moment we know the feature is wanted at all.
+ */
+static void backdrop_attach_menu(void)
+{
+    HMENU sm = dx11.hwnd ? GetSystemMenu(dx11.hwnd, FALSE) : nullptr;
+
+    if (sm && !backdrop_menu) {
+        backdrop_menu = CreatePopupMenu();
+        AppendMenuW(sm, MF_POPUP, (UINT_PTR)backdrop_menu, L"Backdrop");
+    }
+}
+
+static char *backdrop_menu_spec[DX11_SC_BD_IMGS]; /* what each item selects */
+
+/* The folder the menu lists, Tiles and Pictures inside it. */
+static void backdrop_folder(wchar_t *out, size_t n)
+{
+    wchar_t home[MAX_PATH];
+
+    if (GetEnvironmentVariableW(L"QEMU_BACKDROPS", out, (DWORD)n)) {
+        return;
+    }
+    if (!GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) {
+        home[0] = 0;
+    }
+    _snwprintf(out, n, L"%ls\\Pictures\\RISC OS Backdrops", home);
+}
+
+/* Explorer's own order: digits as numbers, case ignored. */
+static bool backdrop_name_before(const wchar_t *a, const wchar_t *b)
+{
+    int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT,
+                            SORT_DIGITSASNUMBERS | NORM_IGNORECASE,
+                            a, -1, b, -1, nullptr, nullptr, 0);
+
+    return r == CSTR_LESS_THAN;
+}
+
+static bool backdrop_is_image(const wchar_t *name)
+{
+    static const wchar_t *ext[] = { L".png", L".jpg", L".jpeg", L".tif",
+                                    L".tiff", L".gif", L".bmp", L".heic",
+                                    L".heif", L".webp" };
+    const wchar_t *dot = wcsrchr(name, L'.');
+
+    if (!dot) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(ext) / sizeof(ext[0]); i++) {
+        if (!_wcsicmp(dot, ext[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Fill `menu` with the images in `dir`, each selecting "<kind>:<path>".
+ * `next` is the identifier to hand out, moved on as they are used, so the
+ * two lists share one run of identifiers.
+ */
+static void backdrop_list(HMENU menu, const wchar_t *dir, const char *kind,
+                          const wchar_t *title, UINT *next)
+{
+    wchar_t pattern[MAX_PATH];
+    wchar_t (*names)[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int n = 0;
+
+    names = (wchar_t (*)[MAX_PATH])calloc(DX11_SC_BD_IMGS, sizeof(*names));
+    if (!names) {
+        return;
+    }
+    _snwprintf(pattern, MAX_PATH, L"%ls\\*", dir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                && fd.cFileName[0] != L'.'
+                && backdrop_is_image(fd.cFileName)
+                && n < DX11_SC_BD_IMGS) {
+                wcsncpy(names[n], fd.cFileName, MAX_PATH - 1);
+                n++;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    /* few enough that an insertion sort is the whole story */
+    for (int i = 1; i < n; i++) {
+        wchar_t tmp[MAX_PATH];
+        int j = i;
+
+        wcsncpy(tmp, names[i], MAX_PATH);
+        while (j > 0 && backdrop_name_before(tmp, names[j - 1])) {
+            wcsncpy(names[j], names[j - 1], MAX_PATH);
+            j--;
+        }
+        wcsncpy(names[j], tmp, MAX_PATH);
+    }
+
+    for (int i = 0; i < n && *next < DX11_SC_BD_IMG0 + DX11_SC_BD_IMGS * 16;
+         i++) {
+        wchar_t path[MAX_PATH], label[MAX_PATH];
+        char spec[MAX_PATH * 2];
+        size_t used;
+        int slot = (int)((*next - DX11_SC_BD_IMG0) / 16);
+        wchar_t *dot;
+
+        _snwprintf(path, MAX_PATH, L"%ls\\%ls", dir, names[i]);
+        _snprintf(spec, sizeof(spec), "%s:", kind);
+        used = strlen(spec);
+        if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, spec + used,
+                                 (int)(sizeof(spec) - used), nullptr, nullptr)) {
+            continue;                   /* a path we could not carry */
+        }
+        free(backdrop_menu_spec[slot]);
+        backdrop_menu_spec[slot] = _strdup(spec);
+
+        wcsncpy(label, names[i], MAX_PATH - 1);
+        label[MAX_PATH - 1] = 0;
+        dot = wcsrchr(label, L'.');
+        if (dot) {
+            *dot = 0;                   /* the name, not the file name */
+        }
+        AppendMenuW(menu, MF_STRING, *next, label);
+        if (backdrop_menu_spec[slot]
+            && !strcmp(backdrop_menu_spec[slot], backdrop.spec)) {
+            CheckMenuItem(menu, *next, MF_BYCOMMAND | MF_CHECKED);
+        }
+        *next += 16;
+    }
+    if (n == 0) {
+        wchar_t note[160];
+
+        _snwprintf(note, 160, L"No images in the %ls folder", title);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, note);
+    }
+    free(names);
+}
+
+/*
+ * Whether RISC OS is painting the below tag in the key colour right now,
+ * for the menu's hint: 1 yes, 0 no, -1 not a 32bpp mode, -2 no frame yet.
+ * Sampled on a coarse grid from the guest's own bytes, as the Metal front
+ * end samples its newest uploaded frame.
+ */
+static int backdrop_guest_state(void)
+{
+    Dx11FbView v;
+
+    if (!fb.up || !dx11_glue_fb_view(&v) || !v.fb) {
+        return -2;
+    }
+    if (v.bpp != 32) {
+        return -1;
+    }
+    for (uint32_t y = 0; y < v.yres && y + v.yoffset < v.rows; y += 7) {
+        const uint8_t *row = (const uint8_t *)v.fb
+                           + (size_t)(y + v.yoffset) * v.pitch;
+
+        for (uint32_t x = 0; x < v.xres; x += 7) {
+            const uint8_t *px = row + (size_t)(x + v.xoffset) * 4;
+            uint32_t rgb = v.pixo ? (px[0] | px[1] << 8 | px[2] << 16)
+                                  : (px[2] | px[1] << 8 | px[0] << 16);
+
+            if ((px[3] & 0xC0) == 0x80 && rgb == DX11_BACKDROP_KEY) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* One scene item, ticked when it is the scene in force. */
+static void backdrop_scene_item(HMENU menu, const wchar_t *label,
+                                const char *spec, UINT id)
+{
+    AppendMenuW(menu, MF_STRING, id, label);
+    if (!strcmp(spec, backdrop.spec)) {
+        CheckMenuItem(menu, id, MF_BYCOMMAND | MF_CHECKED);
+    }
+}
+
+/* Rebuilt each time the submenu opens, so the folder is read afresh. */
+static void backdrop_build_menu(void)
+{
+    wchar_t dir[MAX_PATH], sub[MAX_PATH];
+    HMENU tiles, pictures;
+    UINT next = DX11_SC_BD_IMG0;
+
+    if (!backdrop_menu) {
+        return;
+    }
+    while (DeleteMenu(backdrop_menu, 0, MF_BYPOSITION)) {
+        /* emptied from the top */
+    }
+    switch (backdrop_guest_state()) {
+    case 0:
+        AppendMenuW(backdrop_menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0,
+                    L"RISC OS is not drawing a backdrop to show through");
+        AppendMenuW(backdrop_menu, MF_SEPARATOR, 0, nullptr);
+        break;
+    case -1:
+        AppendMenuW(backdrop_menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0,
+                    L"Backdrops need a 16 million colour screen mode");
+        AppendMenuW(backdrop_menu, MF_SEPARATOR, 0, nullptr);
+        break;
+    default:
+        break;
+    }
+    backdrop_scene_item(backdrop_menu, L"Acorn", "acorn", DX11_SC_BD_ACORN);
+    backdrop_scene_item(backdrop_menu, L"Acorn, Moving", "acorn-live",
+                        DX11_SC_BD_LIVE);
+    backdrop_scene_item(backdrop_menu, L"None", "none", DX11_SC_BD_NONE);
+    AppendMenuW(backdrop_menu, MF_SEPARATOR, 0, nullptr);
+
+    backdrop_folder(dir, MAX_PATH);
+    tiles = CreatePopupMenu();
+    _snwprintf(sub, MAX_PATH, L"%ls\\Tiles", dir);
+    backdrop_list(tiles, sub, "tile", L"Tiles", &next);
+    AppendMenuW(backdrop_menu, MF_POPUP, (UINT_PTR)tiles, L"Tiles");
+
+    pictures = CreatePopupMenu();
+    _snwprintf(sub, MAX_PATH, L"%ls\\Pictures", dir);
+    backdrop_list(pictures, sub, "picture", L"Pictures", &next);
+    AppendMenuW(backdrop_menu, MF_POPUP, (UINT_PTR)pictures, L"Pictures");
+
+    AppendMenuW(backdrop_menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(backdrop_menu, MF_STRING, DX11_SC_BD_OPEN,
+                L"Open Backdrops Folder");
+}
+
+/*
+ * A choice from the menu: apply it at once.  Returns false for anything
+ * that is not ours, so the window procedure passes it on.
+ */
+static bool backdrop_command(UINT id)
+{
+    if (!backdrop.enabled) {
+        return false;
+    }
+    switch (id) {
+    case DX11_SC_BD_ACORN:
+        backdrop_set_scene("acorn");
+        return true;
+    case DX11_SC_BD_LIVE:
+        backdrop_set_scene("acorn-live");
+        return true;
+    case DX11_SC_BD_NONE:
+        backdrop_set_scene("none");
+        return true;
+    case DX11_SC_BD_OPEN: {
+        wchar_t dir[MAX_PATH], sub[MAX_PATH];
+
+        /* The folder is the invitation: make it, with the two folders the
+         * menu lists, rather than opening something that is not there. */
+        backdrop_folder(dir, MAX_PATH);
+        CreateDirectoryW(dir, nullptr);
+        _snwprintf(sub, MAX_PATH, L"%ls\\Tiles", dir);
+        CreateDirectoryW(sub, nullptr);
+        _snwprintf(sub, MAX_PATH, L"%ls\\Pictures", dir);
+        CreateDirectoryW(sub, nullptr);
+        ShellExecuteW(nullptr, L"open", dir, nullptr, nullptr, SW_SHOWNORMAL);
+        return true;
+    }
+    default:
+        break;
+    }
+    if (id >= DX11_SC_BD_IMG0 && id < DX11_SC_BD_IMG0 + DX11_SC_BD_IMGS * 16
+        && (id - DX11_SC_BD_IMG0) % 16 == 0) {
+        char *spec = backdrop_menu_spec[(id - DX11_SC_BD_IMG0) / 16];
+
+        if (spec) {
+            backdrop_set_scene(spec);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Shaders: one source, one decode variant per format                  */
 
 static const char SHADER_SRC[] = R"xxx(
@@ -621,6 +1198,8 @@ struct Params {
     uint4 dim;     /* xres, yres, pitch(bytes), bpp */
     uint4 misc;    /* xoffset(px), yoffset(rows), pixo, unused */
     uint4 post;    /* client w, client h, scaling, scanlines */
+    uint4 bd;      /* backdrop: key 0x00BBGGRR, time ms, icon bar px, mode */
+    uint4 bx;      /* backdrop: output px per tile px x1000, unused */
 };
 
 struct VSOut {
@@ -698,6 +1277,15 @@ float4 ps_main(VSOut v) : SV_Target
     g = (w >> 8) & 0xff;
     b = (w >> 16) & 0xff;
     if (P.misc.z == 0) { uint t = r; r = b; b = t; }   /* BGR order */
+
+    /* The transfer byte's layer tag, bits 7-6: 10 is below, and a below
+     * pixel in the backdrop key colour is a hole the layer beneath shows
+     * through -- transparent, premultiplied, so the scale pass's filter
+     * blends the edge the way it blends everything else. */
+    if (P.bd.w != 0 && ((w >> 24) & 0xC0) == 0x80
+        && (r | (g << 8) | (b << 16)) == P.bd.x) {
+        return float4(0, 0, 0, 0);
+    }
 #elif BPP == 24
     /* three bytes from a possibly unaligned offset; the per-byte
      * helper loads its own aligned word, and the compiler merges the
@@ -727,9 +1315,99 @@ float4 ps_main(VSOut v) : SV_Target
 #else /* the scale pass: decoded surface over the whole client area */
 
 Texture2D<float4> src : register(t0);
+Texture2D<float4> bgimg : register(t1);      /* backdrop image, if any */
 SamplerState lin : register(s0);
+SamplerState rep : register(s1);             /* wrapping, for tiles */
 
 cbuffer params : register(b0) { Params P; }
+
+/* The Acorn mark (design/art/acorn.svg) as a signed distance, in the
+ * SVG's own units about its centre, y down, positive inside.  The mark is
+ * the union of the cap, a quadratic dome, and the nut, a cubic egg, grown
+ * by the half-width of the outline stroke and clipped to the SVG's
+ * 34-unit view box -- which is why the watermark the pinboard draws has a
+ * flat top and a flat bottom.  Distances to the curved sides are
+ * horizontal offsets corrected by the curve's slope.
+ *
+ * Ported from the Metal front end (ui/metal.m); the maths is the same
+ * scene, so the two displays draw the same acorn. */
+static float acorn_distance(float2 q)
+{
+    const float grow = 0.8;
+    float ax = abs(q.x);
+
+    /* Nothing of the mark reaches past 16 units across or 17 down, so a
+     * pixel a unit clear of that box is plainly outside: say so, and skip
+     * the curve solve below, which is most of the scene's cost. */
+    float outside = max(ax - 16.0, abs(q.y) - 17.0);
+    if (outside > 1.0) {
+        return -outside;
+    }
+
+    /* cap: right side (0,-20) Q (16,-20) (15,-7): x = 32t - 17t^2, y = -20 + 13t^2 */
+    float cy = clamp(q.y, -20.0, -7.0);
+    float ct = sqrt((cy + 20.0) / 13.0);
+    float cxb = 32.0 * ct - 17.0 * ct * ct;
+    float ck = (32.0 - 34.0 * ct) / max(26.0 * ct, 1e-3);
+    float cap = min((cxb - ax) / sqrt(1.0 + ck * ck), -7.0 - q.y);
+
+    /* nut: right side (0,18) C (9,18) (15,7) (13,-7); y falls as t rises */
+    float ny = clamp(q.y, -7.0, 18.0);
+    float lo = 0.0, hi = 1.0;
+    for (int i = 0; i < 18; i++) {
+        float tt = 0.5 * (lo + hi), uu = 1.0 - tt;
+        float by = uu * uu * uu * 18.0 + 3.0 * uu * uu * tt * 18.0
+                 + 3.0 * uu * tt * tt * 7.0 - tt * tt * tt * 7.0;
+        if (by > ny) { lo = tt; } else { hi = tt; }
+    }
+    float t = 0.5 * (lo + hi), u = 1.0 - t;
+    float nxb = 3.0 * u * u * t * 9.0 + 3.0 * u * t * t * 15.0 + t * t * t * 13.0;
+    float ndx = 3.0 * (u * u * 9.0 + 2.0 * u * t * 6.0 - t * t * 2.0);
+    float ndy = 3.0 * (2.0 * u * t * -11.0 - t * t * 14.0);
+    float nk = ndx / min(ndy, -1e-3);
+    float nut = min(min((nxb - ax) / sqrt(1.0 + nk * nk), 18.0 - q.y), q.y + 7.0);
+
+    return min(max(cap, nut) + grow, 17.0 - abs(q.y));
+}
+
+static float3 backdrop_scene(float2 px, float2 outPx, float2 srcPx)
+{
+    const float3 ground = float3(183.0, 192.0, 180.0) / 255.0;   /* #B7C0B4 */
+    const float3 ghost  = float3(173.0, 183.0, 168.0) / 255.0;   /* #ADB7A8 */
+    /* view px per guest px, per axis: a window the user has resized away
+     * from the mode's shape stretches the desktop unevenly */
+    float2 k = outPx / srcPx;
+    /* 220 guest px for the SVG's 34 units, centred above the icon bar,
+     * exactly where *Backdrop -Centre put the watermark sprite; the
+     * centre follows the stretch, the mark keeps its shape */
+    const float unitPx = 220.0 / 34.0;
+    float2 centre = float2(srcPx.x * 0.5, (srcPx.y - float(P.bd.z)) * 0.5) * k;
+    float d = acorn_distance((px - centre) / (unitPx * k.y));
+    float cover = clamp(d * unitPx * k.y + 0.5, 0.0, 1.0);
+    float3 c = lerp(ground, ghost, cover);
+
+    if (P.bd.w == 2) {
+        /* acorn-live: two soft lights drifting over the ground, one cool
+         * and one warm, on a half-hour loop so the float time never loses
+         * precision; and a faint vignette */
+        float tau = 6.2831853 * float(P.bd.y) / 1800000.0;
+        float2 uv = px / outPx;
+        float aspect = outPx.x / outPx.y;
+        float2 l1 = float2(0.5 + 0.34 * sin(7.0 * tau), 0.42 + 0.22 * sin(5.0 * tau + 1.3));
+        float2 l2 = float2(0.5 + 0.34 * sin(11.0 * tau + 2.1), 0.58 + 0.22 * cos(9.0 * tau));
+        float2 d1 = (uv - l1) * float2(aspect, 1.0);
+        float2 d2 = (uv - l2) * float2(aspect, 1.0);
+        c += 0.075 * exp(-dot(d1, d1) * 3.5) * float3(1.0, 1.0, 0.96);
+        c += 0.05 * exp(-dot(d2, d2) * 4.5) * float3(0.95, 0.72, 0.42);
+        float2 v = (uv - 0.5) * float2(aspect, 1.0);
+        c *= 1.0 - 0.07 * dot(v, v);
+        /* gradients this gentle band in 8 bits: dither them by less than
+         * a level, with interleaved gradient noise */
+        float n = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
+        c += (n - 0.5) / 255.0;
+    }
+    return c;
+}
 
 float4 ps_main(VSOut v) : SV_Target
 {
@@ -758,7 +1436,34 @@ float4 ps_main(VSOut v) : SV_Target
         }
     }
 #endif
-    return float4(c.rgb, 1);
+    if (P.bd.w == 0) {
+        return float4(c.rgb, 1);          /* no layer: the guest's pixels */
+    }
+
+    float3 bg;
+    if (P.bd.w >= 3) {
+        float iw, ih;
+        bgimg.GetDimensions(iw, ih);
+        float2 isz = float2(iw, ih);
+        if (P.bd.w == 4) {
+            /* tile: from the top left, each image pixel covering an
+             * output pixel (half of one for an @2x tile) -- repeated by
+             * the sampler, so the seams filter like the rest */
+            float2 uv = v.pos.xy / (isz * float(P.bx.x) / 1000.0);
+            bg = bgimg.Sample(rep, uv).rgb;
+        } else {
+            /* picture: fill the view, centred, cropping the overhang */
+            float s = max(outPx.x / isz.x, outPx.y / isz.y);
+            float2 uv = (v.pos.xy - 0.5 * outPx) / (s * isz) + 0.5;
+            bg = bgimg.Sample(lin, uv).rgb;
+        }
+    } else {
+        bg = backdrop_scene(v.pos.xy, outPx, srcPx);
+    }
+    /* The decoded texel is premultiplied, so this is "over": where the
+     * guest tagged a hole its alpha is 0 and the layer shows whole, and
+     * at a filtered edge it shows in proportion. */
+    return float4(c.rgb + bg * (1.0 - c.a), 1);
 }
 
 #endif
@@ -1197,11 +1902,14 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     /* constant buffer: dim/misc per config; the post-transform half
      * (client size and the scaling options) is refreshed every frame in
      * dx11_render_frame, because the client size moves with resizes */
-    struct { uint32_t dim[4]; uint32_t misc[4]; uint32_t post[4]; } cb = {
+    Dx11Params cb = {
         { v->xres, v->yres, v->pitch, v->bpp },
         { v->xoffset, v->yoffset, v->pixo, 0 },
         { 0, 0, (uint32_t)video_opts.scaling, video_opts.scanlines ? 1u : 0u },
+        { 0, 0, 0, 0 },
+        { 0, 0, 0, 0 },
     };
+    backdrop_params(&cb);
     if (fb.cbuf) {
         dx11.context->UpdateSubresource(fb.cbuf, 0, nullptr, &cb, 0, 0);
     } else {
@@ -1228,6 +1936,14 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         hr = dx11.device->CreateSamplerState(&sd, &fb.linear);
         if (FAILED(hr)) {
             dx11_log("sampler failed: %#x", (unsigned)hr);
+            return false;
+        }
+        /* The same filtering, wrapping: a backdrop tile repeats from the
+         * top left, and its seams should filter like everything else. */
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        hr = dx11.device->CreateSamplerState(&sd, &fb.wrap);
+        if (FAILED(hr)) {
+            dx11_log("wrap sampler failed: %#x", (unsigned)hr);
             return false;
         }
     }
@@ -1564,8 +2280,8 @@ static void dx11_draw_pointer(const Dx11FbView *v)
     dx11.context->OMSetBlendState(ptr.blend, nullptr, 0xffffffff);
     dx11.context->Draw(3, 0);
     dx11.context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-    ID3D11ShaderResourceView *none = nullptr;
-    dx11.context->PSSetShaderResources(0, 1, &none);
+    ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
+    dx11.context->PSSetShaderResources(0, 2, none);
     ID3D11Buffer *nobuf = nullptr;
     dx11.context->VSSetConstantBuffers(1, 1, &nobuf);
     dx11.context->PSSetConstantBuffers(1, 1, &nobuf);
@@ -1702,21 +2418,29 @@ static bool dx11_render_frame(void)
     /* scale pass: decoded surface over the whole client area */
     ID3D11ShaderResourceView *dec = fb.dec_srv;
     dx11.context->OMSetRenderTargets(1, &dx11.rtv, nullptr);
-    dx11.context->PSSetShaderResources(0, 1, &dec);
+    /* t0 the decoded guest screen, t1 the backdrop image if there is one;
+     * the shader only reads t1 when the mode says to, but an unbound slot
+     * would still be a warning under the debug layer. */
+    ID3D11ShaderResourceView *ssrv[2] = { dec, backdrop.image_srv };
+    dx11.context->PSSetShaderResources(0, 2, ssrv);
     dx11.context->PSSetShader(fb.scale_ps, nullptr, 0);
-    dx11.context->PSSetSamplers(0, 1, &fb.linear);
+    ID3D11SamplerState *samp[2] = { fb.linear, fb.wrap };
+    dx11.context->PSSetSamplers(0, 2, samp);
     RECT client;
     GetClientRect(dx11.hwnd, &client);
     if (fb.cbuf) {
         /* the post-transform half of the constants: the client size the
          * scaler maps onto, refreshed here because resizes move it */
-        struct { uint32_t dim[4]; uint32_t misc[4]; uint32_t post[4]; } cb = {
+        Dx11Params cb = {
             { v.xres, v.yres, v.pitch, v.bpp },
             { v.xoffset, v.yoffset, v.pixo, 0 },
             { (uint32_t)(client.right - client.left),
               (uint32_t)(client.bottom - client.top),
               (uint32_t)video_opts.scaling, video_opts.scanlines ? 1u : 0u },
+            { 0, 0, 0, 0 },
+            { 0, 0, 0, 0 },
         };
+        backdrop_params(&cb);
         dx11.context->UpdateSubresource(fb.cbuf, 0, nullptr, &cb, 0, 0);
     }
     D3D11_VIEWPORT vp2 = { 0, 0,
@@ -1758,73 +2482,225 @@ static void png_write_chunk(FILE *f, const char tag[4], const void *data,
     fwrite(tail, 1, 4, f);
 }
 
-void dx11_screenshot(void)
+/* ------------------------------------------------------------------ */
+/* The composited frame                                                 */
+
+/*
+ * What is actually on the screen: the guest's desktop scaled into the
+ * client area, the backdrop showing through underneath it and the
+ * pointer over the top.  That picture only exists in the swap chain's
+ * back buffer, and the flip model leaves it undefined after Present, so
+ * the copy has to be taken inside the frame -- after the last draw and
+ * before the flip.
+ *
+ * Two callers want one.  PrintScreen writes it straight out as a PNG.
+ * QMP's screendump wants the pixels, and asks from the QEMU thread; both
+ * set `want` and wait for the frame loop to answer.  Before this the two
+ * captured the decoded guest buffer, which is what the guest drew rather
+ * than what the display shows -- no backdrop, no pointer, and always the
+ * mode's own size rather than the window's.
+ */
+static struct {
+    CRITICAL_SECTION lock;      /* over the buffer; held while a reader has it */
+    CRITICAL_SECTION turn;      /* one reader at a time */
+    HANDLE ready;               /* set when a copy has landed */
+    ID3D11Texture2D *staging;
+    uint8_t *pixels;            /* BGRA, w * h * 4 */
+    uint32_t w, h;
+    size_t cap;
+    bool want;                  /* a copy has been asked for */
+    bool png;                   /* ... and PrintScreen wants a file of it */
+    bool up;
+} comp;
+
+static void comp_init(void)
 {
-    if (!fb.up || !fb.decoded) {
+    if (comp.up) {
         return;
     }
+    InitializeCriticalSection(&comp.lock);
+    InitializeCriticalSection(&comp.turn);
+    comp.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);  /* manual reset */
+    comp.up = true;
+}
 
-    D3D11_TEXTURE2D_DESC sd = {};
-    fb.decoded->GetDesc(&sd);
-    D3D11_TEXTURE2D_DESC staging = sd;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.BindFlags = 0;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D *tex = nullptr;
-    if (FAILED(dx11.device->CreateTexture2D(&staging, nullptr, &tex))) {
-        return;
-    }
-    dx11.context->CopyResource(tex, fb.decoded);
-
-    D3D11_MAPPED_SUBRESOURCE map;
-    if (FAILED(dx11.context->Map(tex, 0, D3D11_MAP_READ, 0, &map))) {
-        tex->Release();
-        return;
-    }
-
+/* The PNG the window writes for PrintScreen, from the mapped back buffer
+ * (B,G,R,A in memory, so the channels come out reversed). */
+static void comp_write_png(const uint8_t *src, uint32_t pitch,
+                           uint32_t w, uint32_t h)
+{
     static int shot;
     char name[64];
-    snprintf(name, sizeof(name), "dx11-screenshot-%03d.png", ++shot);
-    FILE *f = fopen(name, "wb");
-    if (f) {
-        uint8_t ihdr[13] = {
-            (uint8_t)(sd.Width >> 24), (uint8_t)(sd.Width >> 16),
-            (uint8_t)(sd.Width >> 8), (uint8_t)sd.Width,
-            (uint8_t)(sd.Height >> 24), (uint8_t)(sd.Height >> 16),
-            (uint8_t)(sd.Height >> 8), (uint8_t)sd.Height,
-            8, 2, 0, 0, 0,             /* 8-bit truecolour RGB */
-        };
-        fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
-        png_write_chunk(f, "IHDR", ihdr, 13);
+    FILE *f;
 
-        /* filter byte 0 (none) + RGB rows, deflated into one IDAT */
-        uint32_t row = sd.Width * 3 + 1;
-        uint8_t *raw_rows = (uint8_t *)malloc((size_t)row * sd.Height);
-        for (uint32_t y = 0; y < sd.Height; y++) {
-            const uint8_t *src =
-                (const uint8_t *)map.pData + (size_t)y * map.RowPitch;
+    snprintf(name, sizeof(name), "dx11-screenshot-%03d.png", ++shot);
+    f = fopen(name, "wb");
+    if (!f) {
+        return;
+    }
+    uint8_t ihdr[13] = {
+        (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h,
+        8, 2, 0, 0, 0,                 /* 8-bit truecolour RGB */
+    };
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    png_write_chunk(f, "IHDR", ihdr, 13);
+
+    /* filter byte 0 (none) + RGB rows, deflated into one IDAT */
+    uint32_t row = w * 3 + 1;
+    uint8_t *raw_rows = (uint8_t *)malloc((size_t)row * h);
+    if (raw_rows) {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *s = src + (size_t)y * pitch;
             uint8_t *dst = raw_rows + (size_t)y * row;
+
             dst[0] = 0;
-            for (uint32_t x = 0; x < sd.Width; x++) {
-                dst[1 + x * 3 + 0] = src[x * 4 + 0];
-                dst[1 + x * 3 + 1] = src[x * 4 + 1];
-                dst[1 + x * 3 + 2] = src[x * 4 + 2];
+            for (uint32_t x = 0; x < w; x++) {
+                dst[1 + x * 3 + 0] = s[x * 4 + 2];
+                dst[1 + x * 3 + 1] = s[x * 4 + 1];
+                dst[1 + x * 3 + 2] = s[x * 4 + 0];
             }
         }
-        uLongf zlen = compressBound((uLong)row * sd.Height);
+        uLongf zlen = compressBound((uLong)row * h);
         uint8_t *zbuf = (uint8_t *)malloc(zlen);
-        if (zbuf && compress2(zbuf, &zlen, raw_rows,
-                              (uLong)row * sd.Height, 6) == Z_OK) {
+        if (zbuf && compress2(zbuf, &zlen, raw_rows, (uLong)row * h, 6) == Z_OK) {
             png_write_chunk(f, "IDAT", zbuf, (uint32_t)zlen);
         }
         free(zbuf);
         free(raw_rows);
-        png_write_chunk(f, "IEND", nullptr, 0);
-        fclose(f);
     }
+    png_write_chunk(f, "IEND", nullptr, 0);
+    fclose(f);
+    dx11_log("screenshot: %s (%ux%u, composited)", name, w, h);
+}
 
-    dx11.context->Unmap(tex, 0);
-    tex->Release();
+/*
+ * Take the copy, if anyone asked for one.  On the UI thread, between the
+ * frame's last draw and Present.
+ */
+static void comp_capture(void)
+{
+    ID3D11Texture2D *back = nullptr;
+    D3D11_TEXTURE2D_DESC bd;
+    D3D11_MAPPED_SUBRESOURCE map;
+    bool png;
+
+    if (!comp.up || !comp.want || !dx11.swap) {
+        return;
+    }
+    if (FAILED(dx11.swap->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                    (void **)&back))) {
+        return;
+    }
+    back->GetDesc(&bd);
+
+    /* One staging texture, rebuilt only when the window changes size. */
+    if (comp.staging) {
+        D3D11_TEXTURE2D_DESC sd;
+
+        comp.staging->GetDesc(&sd);
+        if (sd.Width != bd.Width || sd.Height != bd.Height
+            || sd.Format != bd.Format) {
+            comp.staging->Release();
+            comp.staging = nullptr;
+        }
+    }
+    if (!comp.staging) {
+        D3D11_TEXTURE2D_DESC sd = bd;
+
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.MiscFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(dx11.device->CreateTexture2D(&sd, nullptr, &comp.staging))) {
+            back->Release();
+            return;
+        }
+    }
+    dx11.context->CopyResource(comp.staging, back);
+    back->Release();
+
+    if (FAILED(dx11.context->Map(comp.staging, 0, D3D11_MAP_READ, 0, &map))) {
+        return;
+    }
+    EnterCriticalSection(&comp.lock);
+    png = comp.png;
+    comp.png = false;
+    comp.want = false;
+    if (comp.cap < (size_t)bd.Width * bd.Height * 4) {
+        free(comp.pixels);
+        comp.cap = (size_t)bd.Width * bd.Height * 4;
+        comp.pixels = (uint8_t *)malloc(comp.cap);
+    }
+    if (comp.pixels) {
+        for (uint32_t y = 0; y < bd.Height; y++) {
+            memcpy(comp.pixels + (size_t)y * bd.Width * 4,
+                   (const uint8_t *)map.pData + (size_t)y * map.RowPitch,
+                   (size_t)bd.Width * 4);
+        }
+        comp.w = bd.Width;
+        comp.h = bd.Height;
+    }
+    LeaveCriticalSection(&comp.lock);
+    SetEvent(comp.ready);
+
+    if (png) {
+        comp_write_png((const uint8_t *)map.pData, map.RowPitch,
+                       bd.Width, bd.Height);
+    }
+    dx11.context->Unmap(comp.staging, 0);
+}
+
+/* PrintScreen: ask the frame loop for the next composited frame. */
+void dx11_screenshot(void)
+{
+    if (!comp.up) {
+        return;
+    }
+    EnterCriticalSection(&comp.lock);
+    comp.png = true;
+    comp.want = true;
+    LeaveCriticalSection(&comp.lock);
+}
+
+/*
+ * screendump's half of it: wait for a fresh composited frame and hand the
+ * pixels over.  The lock is held until dx11_glue_composite_done, so the
+ * frame loop cannot overwrite them while they are being read.
+ */
+extern "C" int dx11_glue_composite_get(uint32_t *w, uint32_t *h,
+                                       const void **pixels, int wait_ms)
+{
+    if (!comp.up) {
+        return 0;
+    }
+    EnterCriticalSection(&comp.turn);
+    EnterCriticalSection(&comp.lock);
+    ResetEvent(comp.ready);
+    comp.want = true;
+    LeaveCriticalSection(&comp.lock);
+
+    WaitForSingleObject(comp.ready, wait_ms < 0 ? 0 : (DWORD)wait_ms);
+
+    EnterCriticalSection(&comp.lock);
+    if (!comp.pixels || !comp.w || !comp.h) {
+        LeaveCriticalSection(&comp.lock);
+        LeaveCriticalSection(&comp.turn);
+        return 0;                   /* no frame yet: the caller falls back */
+    }
+    *w = comp.w;
+    *h = comp.h;
+    *pixels = comp.pixels;
+    return 1;
+}
+
+extern "C" void dx11_glue_composite_done(void)
+{
+    if (!comp.up) {
+        return;
+    }
+    LeaveCriticalSection(&comp.lock);
+    LeaveCriticalSection(&comp.turn);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1855,6 +2731,7 @@ extern "C" int dx11_backend_init(void)
         }
     }
 
+    comp_init();
     if (!dx11_create_window()) {
         return -1;
     }
@@ -1917,6 +2794,9 @@ extern "C" int dx11_backend_main(void)
             if (!dx11_render_frame()) {
                 dx11.context->ClearRenderTargetView(dx11.rtv, clear);
             }
+            /* The screen as it will appear, while the back buffer still
+             * holds it: the flip leaves its contents undefined. */
+            comp_capture();
             HRESULT hr = dx11.swap->Present(1 /* vsync */, 0);
             if (FAILED(hr)) {
                 dx11_log("present failed hr=%08lx", (unsigned long)hr);
@@ -1934,6 +2814,7 @@ extern "C" int dx11_backend_main(void)
     ptr_release();
     if (fb.cbuf) fb.cbuf->Release();
     if (fb.linear) fb.linear->Release();
+    if (fb.wrap) fb.wrap->Release();
     if (fb.vs) fb.vs->Release();
     if (fb.scale_ps) fb.scale_ps->Release();
     for (size_t i = 0; i < sizeof(fb_ps_all) / sizeof(fb_ps_all[0]); i++) {

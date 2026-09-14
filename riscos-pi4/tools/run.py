@@ -79,16 +79,19 @@ def command_line(args, overlay):
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", args.kernel,
         "-device", f"loader,file={args.cmos},addr=0x510000,force-raw=on",
-        *net,
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",
+        # After the hub: a device on port 1.3 needs the hub to exist
+        # first, or QEMU stops with "usb port 1.3 not found".
+        *net,
         # Sound needs both halves: a backend, and the vchiq peer told to
         # use it. Without them the guest's sound loop still turns and you
         # simply hear nothing, which reads as sound being unimplemented.
         "-audiodev", f"{args.audiodev},id=snd0",
         "-global", "bcm2835-vchiq.audiodev=snd0",
-        "-display", "dx11",
+        "-display", "dx11" + (",backdrop=" + args.backdrop
+                              if args.backdrop else ""),
         "-serial", "null",
         "-qmp", "tcp:127.0.0.1:4461,server,nowait",
     ]
@@ -146,6 +149,24 @@ def post_escape():
                          lp | (1 << 30) | (1 << 31))
 
 
+def frames_alike(a, b, step=97, tol=8, allow=0.005):
+    """Whether two screendumps show the same picture.
+
+    Sampled, and tolerant of a level or two, because a screendump is now
+    the composited display rather than the guest's framebuffer: a moving
+    backdrop (backdrop=acorn-live) changes almost every pixel slightly on
+    every frame without the guest having drawn anything at all, and an
+    exact comparison would never call the screen settled."""
+    if b is None or len(a) != len(b):
+        return False
+    n = bad = 0
+    for i in range(0, len(a), step):
+        n += 1
+        if abs(a[i] - b[i]) > tol:
+            bad += 1
+    return bool(n) and bad <= allow * n
+
+
 def wait_for_desktop(qemu_path, deadline_s=300):
     """The real desktop, not the first lit pixel: the window's log must
     show a pipeline heartbeat for the desktop mode (800x600 32bpp), and
@@ -167,7 +188,9 @@ def wait_for_desktop(qemu_path, deadline_s=300):
             time.sleep(0.5)
             continue
 
-        if any(body[:48000]):
+        # Brighter than the window's own clear colour (13,13,20), which
+        # is what the composited dump shows before the first guest frame.
+        if max(body[:48000]) > 40:
             if not escaped:
                 escaped = True
                 post_escape()          # skip the DHCP wait, once
@@ -177,7 +200,7 @@ def wait_for_desktop(qemu_path, deadline_s=300):
             time.sleep(0.5)
             continue
 
-        if body == prev:
+        if frames_alike(body, prev):
             if stable_since is None:
                 stable_since = time.time()
             if time.time() - stable_since >= 2.0:
@@ -226,6 +249,11 @@ def main():
                          "HostNet, unplug the ROM's own networking, and "
                          "attach no emulated NIC (ROS_PRIVATE "
                          "design/HOSTNET.md)")
+    ap.add_argument("--backdrop", metavar="SCENE",
+                    help="a layer the host draws beneath the desktop, "
+                         "showing through the pixels the guest tags "
+                         "'below': acorn, acorn-live, tile:FILE, "
+                         "picture:FILE, or none.  Off unless given")
     ap.add_argument("--no-card", action="store_true",
                     help="attach no SD card at all: the share is the whole "
                          "machine (needs --hostfs, and --boot hostfs to "

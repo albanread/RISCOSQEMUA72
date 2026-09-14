@@ -1224,8 +1224,16 @@ if host_os == 'windows'
   d3d11 = cc.find_library('d3d11', required: get_option('dx11'))
   dxgi = cc.find_library('dxgi', required: get_option('dx11'))
   d3dc = cc.find_library('d3dcompiler_47', required: get_option('dx11'))
+  # windowscodecs (WIC) reads the backdrop images, and wants ole32 for
+  # CoCreateInstance; the Metal side takes ImageIO and CoreGraphics for
+  # exactly the same job.
+  wic = cc.find_library('windowscodecs', required: get_option('dx11'))
+  ole32 = cc.find_library('ole32', required: get_option('dx11'))
+  # shell32: the Backdrop menu opens the backdrops folder in Explorer.
+  shell32 = cc.find_library('shell32', required: get_option('dx11'))
   if d3d11.found() and dxgi.found() and d3dc.found()
-    dx11 = declare_dependency(dependencies: [d3d11, dxgi, d3dc])
+    dx11 = declare_dependency(dependencies: [d3d11, dxgi, d3dc, wic, ole32,
+                                             shell32])
   elif get_option('dx11').enabled()
     error('dx11 requires d3d11, dxgi and d3dcompiler_47')
   endif

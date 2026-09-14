@@ -1382,6 +1382,25 @@ DisplaySurface *qemu_console_surface(QemuConsole *console)
     }
 }
 
+/*
+ * The composited picture, offered by a front end that scales the guest's
+ * screen into its window and draws its own layers around it (ui/dx11.cpp
+ * sets this; a front end that does not leaves it unset).  screendump
+ * prefers it, because the console's surface holds what the guest drew
+ * rather than what is on the display.
+ */
+static QemuUiComposite ui_composite_fn;
+
+void qemu_ui_set_composite(QemuUiComposite fn)
+{
+    ui_composite_fn = fn;
+}
+
+pixman_image_t *qemu_ui_composite(void)
+{
+    return ui_composite_fn ? ui_composite_fn() : NULL;
+}
+
 static QemuDisplay *dpys[DISPLAY_TYPE__MAX];
 
 void qemu_display_register(QemuDisplay *ui)
