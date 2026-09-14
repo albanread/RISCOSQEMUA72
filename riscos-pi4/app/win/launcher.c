@@ -129,7 +129,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         L"\"%ls\" -M raspi4b -cpu cortex-a72,aarch64=off "
         L"-kernel \"%ls\" "
         L"-device \"loader,file=%ls,addr=0x510000,force-raw=on\" "
-        L"-netdev user,id=n0 "
+        L"-netdev user,id=n0,domainname=lan "
         L"-device usb-hub,bus=usb-bus.0,port=1 "
         L"-device usb-kbd,bus=usb-bus.0,port=1.1 "
         L"-device usb-tablet,bus=usb-bus.0,port=1.2 "

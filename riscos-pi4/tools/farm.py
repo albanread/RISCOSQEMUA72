@@ -219,7 +219,7 @@ def command_line(name, port, display, audiodev, kernel, cmos, card=True):
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", kernel,
         "-device", f"loader,file={cmos},addr=0x510000,force-raw=on",
-        "-netdev", "user,id=n0",
+        "-netdev", "user,id=n0,domainname=lan",
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",

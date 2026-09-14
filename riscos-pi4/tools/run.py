@@ -67,7 +67,10 @@ def command_line(args, overlay):
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", args.kernel,
         "-device", f"loader,file={args.cmos},addr=0x510000,force-raw=on",
-        "-netdev", "user,id=n0",
+        # domainname: RISC OS asks for option 15 in its parameter list.
+        # It does not fix DHCP here, but it is one less thing the guest
+        # asked for and did not get.
+        "-netdev", "user,id=n0,domainname=lan",
         "-device", "usb-hub,bus=usb-bus.0,port=1",
         "-device", "usb-kbd,bus=usb-bus.0,port=1.1",
         "-device", "usb-tablet,bus=usb-bus.0,port=1.2",
