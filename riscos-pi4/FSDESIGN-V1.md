@@ -1352,8 +1352,10 @@ tables had to move, the module (`dde/c/hostfs`) together:
   byte is kept host-side (an `xattr`; the sidecar of §6.3/§7 is the
   portable alternative), so every bit round-trips and a locked object is
   refused delete, rename and open-for-write with &C3; **#19** the device
-  tracks open host paths, refusing delete, rename and a second write-open
-  of an open file with &C2, and the open-file limit rises from 16 to 255.
+  tracks open host paths and each handle's mode, refusing delete, rename and
+  any open that conflicts as FileCore does (a write-open of an open file; a
+  read-open of one open for update -- two readers stay fine) with &C2, and
+  the open-file limit rises from 16 to 255.
 
 Verified in-guest on a HostFS 2.03 share: per-issue BASIC reproducing each
 suite case (attributes round-trip &00/&02/&0B/&13/&33; locked and open

@@ -176,9 +176,12 @@ struct VMChannelState {
 
     int fds[VMCH_MAX_OPEN];
     /* The resolved host path of each open file, so a delete, rename or a
-     * second write-open of an open object can be refused as FileCore does
+     * conflicting open of an object can be refused as FileCore does
      * (issue #19).  NULL where the slot is free. */
     char *open_paths[VMCH_MAX_OPEN];
+    /* Whether that handle is open for update/output (write), so a read-open
+     * conflicts only with a write-open, not with another reader. */
+    bool open_write[VMCH_MAX_OPEN];
 };
 
 #endif /* HW_MISC_VMCHANNEL_H */

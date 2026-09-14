@@ -1155,7 +1155,7 @@ static uint32_t attrs_for(const GStatBuf *st, const char *hp)
 /* True if `hp` is one of the files the guest currently has open: its
  * resolved path matches an open slot's.  Used to refuse a delete, rename or
  * second write-open of an open object (issue #19). */
-static bool path_is_open(VMChannelState *s, const char *hp)
+static bool path_is_open(VMChannelState *s, const char *hp, bool write_only)
 {
     char *real = realpath(hp, NULL);
     bool open = false;
@@ -1165,7 +1165,8 @@ static bool path_is_open(VMChannelState *s, const char *hp)
         return false;                   /* cannot exist, so cannot be open */
     }
     for (i = 0; i < VMCH_MAX_OPEN; i++) {
-        if (s->open_paths[i] && strcmp(s->open_paths[i], real) == 0) {
+        if (s->open_paths[i] && strcmp(s->open_paths[i], real) == 0
+            && (!write_only || s->open_write[i])) {
             open = true;
             break;
         }
@@ -1344,39 +1345,46 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
         } else {
             oflags = O_RDONLY | O_BINARY;
         }
-        if (flags & VMCH_OPEN_WRITE) {
+        {
+            bool want_write = (flags & VMCH_OPEN_WRITE) != 0;
+
             /* FileCore refuses to open a locked file for update or output
-             * (issue #12), and refuses a second open of one already open
-             * for update (issue #19).  A new file, not yet on disc, is
-             * neither locked nor open, so an OPENOUT that creates still
-             * goes through. */
-            if (meta_is_locked(hp)) {
+             * (issue #12).  It also refuses a conflicting open of one
+             * already open (issue #19): a write-open (OPENUP/OPENOUT)
+             * conflicts with any open handle; a read-open (OPENIN)
+             * conflicts only with a handle open for update, so two readers
+             * are fine but OPENUP-then-OPENIN is not.  A new file, not yet
+             * on disc, is neither locked nor open, so an OPENOUT that
+             * creates still goes through. */
+            if (want_write && meta_is_locked(hp)) {
                 rc = vmch_answer(VMCH_RC_LOCKED);
                 g_free(hp);
                 g_free(path);
                 break;
             }
-            if (path_is_open(s, hp)) {
+            if (path_is_open(s, hp, !want_write)) {
                 rc = vmch_answer(VMCH_RC_OPEN);
                 g_free(hp);
                 g_free(path);
                 break;
             }
-        }
-        s->fds[h] = g_open(hp, oflags, 0644);
-        if (s->fds[h] < 0) {
-            rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND : VMCH_RC_ACCESS);
-        } else {
-            /* Remember the resolved path so a delete, rename or second
-             * write-open of this file can be refused while it is open
-             * (issue #19). */
-            char *real = realpath(hp, NULL);
+            s->fds[h] = g_open(hp, oflags, 0644);
+            if (s->fds[h] < 0) {
+                rc = vmch_answer((errno == ENOENT) ? VMCH_RC_NOTFOUND
+                                                   : VMCH_RC_ACCESS);
+            } else {
+                /* Remember the resolved path and the mode so a delete,
+                 * rename or conflicting open can be refused while it is
+                 * open (issue #19). */
+                char *real = realpath(hp, NULL);
 
-            s->open_paths[h] = g_strdup(real ? real : hp);
-            free(real);
-            /* handles are 1-based over the wire: 0 means "no file" to
-             * a RISC OS FSEntry_Open caller */
-            st32(base + VMCH_HDR_HANDLE, (uint32_t)(h + 1));
+                s->open_paths[h] = g_strdup(real ? real : hp);
+                s->open_write[h] = want_write;
+                free(real);
+                /* handles are 1-based over the wire: 0 means "no file" to
+                 * a RISC OS FSEntry_Open caller */
+                st32(base + VMCH_HDR_HANDLE, (uint32_t)(h + 1));
+            }
         }
         g_free(hp);
         g_free(path);
@@ -1413,6 +1421,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             s->fds[h] = -1;
             g_free(s->open_paths[h]);       /* no longer open (issue #19) */
             s->open_paths[h] = NULL;
+            s->open_write[h] = false;
         }
         break;
     }
@@ -1691,7 +1700,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
             rc = vmch_answer(VMCH_RC_NOTFOUND);
         } else if (meta_is_locked(hp)) {
             rc = vmch_answer(VMCH_RC_LOCKED);   /* locked: refuse (issue #12) */
-        } else if (path_is_open(s, hp)) {
+        } else if (path_is_open(s, hp, false)) {
             rc = vmch_answer(VMCH_RC_OPEN);     /* open: refuse (issue #19) */
         } else if (S_ISDIR(st.st_mode)) {
             /* Every failure here used to be NOTDIR, which the guest could
@@ -1734,7 +1743,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                     rc = vmch_answer(VMCH_RC_LOCKED);   /* issue #12 */
                     g_free(hp2);
                     hp2 = NULL;
-                } else if (hp2 && path_is_open(s, hp1)) {
+                } else if (hp2 && path_is_open(s, hp1, false)) {
                     rc = vmch_answer(VMCH_RC_OPEN);     /* issue #19 */
                     g_free(hp2);
                     hp2 = NULL;
@@ -1943,7 +1952,7 @@ static void vmchannel_do(VMChannelState *s, hwaddr base)
                 rc = vmch_answer(VMCH_RC_LOCKED);
                 break;
             }
-            if (path_is_open(s, hp)) {
+            if (path_is_open(s, hp, false)) {
                 rc = vmch_answer(VMCH_RC_OPEN);
                 break;
             }
@@ -2399,6 +2408,7 @@ static void vmchannel_realize(DeviceState *dev, Error **errp)
     for (int i = 0; i < VMCH_MAX_OPEN; i++) {
         s->fds[i] = -1;
         s->open_paths[i] = NULL;
+        s->open_write[i] = false;
     }
     memory_region_init_io(&s->mr, OBJECT(s), &vmchannel_ops, s,
                           "vmchannel", VMCH_REGION_SIZE);
