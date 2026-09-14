@@ -62,6 +62,20 @@
 /* commands */
 #define HN_CMD_PING     0
 #define HN_CMD_SWI      1       /* one socket SWI, by HN_HDR_SWI */
+/*
+ * Which sockets have woken since last asked.  The host cannot call into
+ * the guest, so Internet Event 19 is raised by the module from a ticker,
+ * and this is what it asks on each tick.  Edge-triggered: a socket is
+ * reported once when it becomes readable, not on every tick until it is
+ * read, which would bury the guest in events.
+ *
+ * The answer is a count in HN_HDR_RESULT and that many words from
+ * HN_HDR_SIZE, each (local port << 16) | descriptor -- R2 and R3 of the
+ * event, ready to use.
+ */
+#define HN_CMD_POLL     2
+
+#define HN_POLL_MAX     16      /* sockets reported in one tick */
 
 /* transport result codes.  A socket call that fails for an ordinary
  * networking reason is HN_RC_OK with HN_HDR_ERRNO set: that is not a
@@ -71,6 +85,38 @@
 #define HN_RC_BADSWI    2       /* SWI index out of range */
 #define HN_RC_BADADDR   3       /* a guest address would not translate */
 #define HN_RC_NOSOCKETS 4       /* present, but sockets not enabled */
+/*
+ * Not an error and not an answer: the call would have blocked on a socket
+ * the guest believes is blocking.  The host cannot wait -- it is inside
+ * the vCPU's MMIO write, holding the BQL -- so the guest waits and rings
+ * again.  That is where RISC OS's blocking semantics actually live.
+ */
+#define HN_RC_RETRY     5
+
+/*
+ * ioctl requests, from Lib/TCPIPLibs/headers/sys/h/filio through the
+ * _IOR/_IOW macros in sys/h/ioccom.  Spelled out rather than recomputed:
+ * these are the guest's numbers and do not depend on the host's.
+ */
+#define HN_FIONREAD     0x4004667F
+#define HN_FIONBIO      0x8004667E
+#define HN_FIOASYNC     0x8004667D
+#define HN_FIOSETOWN    0x8004667C
+#define HN_FIOGETOWN    0x4004667B
+
+/*
+ * One fd_set, in bytes.  FD_SETSIZE is 256 on RISC OS
+ * (Lib/TCPIPLibs/headers/sys/h/types) and must agree with HN_MAX_SOCKETS
+ * below, because the bit index in the set *is* the descriptor.
+ */
+#define HN_FDSET_BYTES  32
+
+/*
+ * Most one call moves through the doorbell in a single ring.  Not a
+ * protocol limit: a bound on what the host will allocate for one request,
+ * generous beyond any datagram and any sane stream read.
+ */
+#define HN_MAX_XFER     (1u << 20)
 
 /*
  * The socket SWIs, in chunk order from &41200 — the Internet module's
@@ -113,6 +159,23 @@ struct HostNetState {
      * getsockslot(), because programs notice if descriptors come back in
      * a different order. */
     int fds[HN_MAX_SOCKETS];
+
+    /* What the guest asked for with FIONBIO.  Every host socket is
+     * non-blocking whatever this says; it decides only whether a
+     * would-block is reported as EWOULDBLOCK or turned into HN_RC_RETRY
+     * for the guest to wait on. */
+    bool nonblock[HN_MAX_SOCKETS];
+
+    /* What the guest asked for with FIOASYNC: deliver Internet Event 19
+     * when this socket becomes readable.  Recorded from Sprint 1 because
+     * the stock Resolver sets it before it will use a socket at all;
+     * acted on in Sprint 3, when the events are actually raised. */
+    bool async[HN_MAX_SOCKETS];
+    uint32_t owner[HN_MAX_SOCKETS];     /* FIOSETOWN / FIOGETOWN */
+
+    /* Was this socket readable when HN_CMD_POLL last looked?  Only the
+     * false->true edge raises an event. */
+    bool woke[HN_MAX_SOCKETS];
 };
 
 #endif /* HW_MISC_HOSTNET_H */

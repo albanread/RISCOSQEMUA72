@@ -59,6 +59,7 @@ eval python "$GEN" \
     --rwpi \
     --init hostnet_init --final hostnet_final \
     --command "'HostNetPing:hostnet_command_ping:0:0:*HostNetPing asks the host if it is there\\rSyntax:\\t*HostNetPing'" \
+    --command "'HostNetInfo:hostnet_command_info:0:0:*HostNetInfo reports what the module sees\\rSyntax:\\t*HostNetInfo'" \
     --swi-chunk 0x41200 --swi-prefix Socket \
     $(cat "$OUT/swi-args.txt") \
     --arch armv8a \
@@ -67,6 +68,7 @@ eval python "$GEN" \
 "$LLVM/clang.exe" $CC_FLAGS -c "$OUT/module_head.s" -o "$OUT/module_head.o"
 
 echo "== module body"
+"$LLVM/clang.exe" $CC_FLAGS -c hostnet_entries.s -o "$OUT/entries.o"
 "$LLVM/clang.exe" $CC_FLAGS -c hostnet.c -o "$OUT/hostnet.o"
 
 echo "== runtime"
@@ -80,7 +82,7 @@ done
 
 echo "== link"
 "$ROSCC" link --module -o "$OUT/HostNet,ffa" \
-    "$OUT/module_head.o" "$OUT/hostnet.o" \
+    "$OUT/module_head.o" "$OUT/entries.o" "$OUT/hostnet.o" \
     "$OUT/rostrt.o" "$OUT/swis_os.o" "$OUT/modrt.o" \
     "$OUT/aeabi.o" "$OUT/atomics.o"
 

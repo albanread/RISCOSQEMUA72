@@ -23,10 +23,10 @@
  * _copyerror subtracts &20E00 to recover errno.  That is the whole
  * contract, and it is why this module can be this small.
  *
- * Sprint 0 (ROS_PRIVATE design/HOSTNET-SPRINTS.md): the host answers
- * Version and Gettsize and refuses the rest with EOPNOTSUPP.  The point is
- * not the stubs, it is that the path — veneer, frame, doorbell, MMU walk,
- * result, RISC OS error — is exercised by all thirty-five from the start.
+ * Two things here are not plain forwarding, and both are the guest doing
+ * what only the guest can: the wait loop, because the host answers from
+ * inside an MMIO write and cannot block, and Internet Event 19, because
+ * the host cannot call in.  See hn_wait_ring and hostnet_c_tick.
  */
 
 typedef unsigned int   uint32_t;
@@ -74,12 +74,21 @@ static volatile uint32_t *hn_base;   /* from OS_Memory 13, at init */
 
 #define HN_CMD_PING  0
 #define HN_CMD_SWI   1
+#define HN_CMD_POLL  2
+
+/* Sockets one poll may report; the reply is this many words after
+ * the header, each (local port << 16) | descriptor. */
+#define HN_POLL_MAX  16
 
 #define HN_RC_OK        0
 #define HN_RC_BADCMD    1
 #define HN_RC_BADSWI    2
 #define HN_RC_BADADDR   3
 #define HN_RC_NOSOCKETS 4
+#define HN_RC_RETRY     5    /* would block, and the guest is the one that waits */
+
+/* Which SWI is Select; it is the one call that is not a plain forward. */
+#define HN_SWI_SELECT   17
 
 /*
  * volatile, and not as a formality: the host writes into this block
@@ -118,6 +127,31 @@ static _kernel_oserror err_nodev = { 0x1E4, "Internet: no HostNet device" };
 static _kernel_oserror err_nosock = { 0x1E4, "Internet: host serves no sockets" };
 static _kernel_oserror err_badswi = { 0x1E4, "Internet: bad socket SWI" };
 static _kernel_oserror err_badaddr = { 0x1E4, "Internet: bad address" };
+
+/* OS_ReadMonotonicTime: centiseconds since the machine started.  The only
+ * clock a module can read without a SWI that might not be there. */
+static uint32_t os_monotonic(void)
+{
+    register uint32_t r0 __asm("r0");
+
+    __asm volatile("swi 0x20042"
+                   : "=r"(r0)
+                   :
+                   : "r1", "r2", "r3", "r12", "lr", "cc", "memory");
+    return r0;
+}
+
+/* OS_ReadEscapeState: C set means the user wants out. */
+static uint32_t os_escape(void)
+{
+    register uint32_t v __asm("r0");
+
+    __asm volatile("swi 0x2002C\n\tmrs r0, cpsr"
+                   : "=r"(v)
+                   :
+                   : "r1", "r2", "r3", "r12", "lr", "cc", "memory");
+    return (v & (1u << 29)) ? 1 : 0;      /* C */
+}
 
 /*
  * OS_Memory 13, MapIOPermanent: R1 physical, R2 size, R3 back the logical
@@ -223,13 +257,10 @@ static uint32_t hn_go(void)
  * these calls takes.  On the way back only R0 is written, because that is
  * all the Internet module ever sets (`if (!error) r->r[0] = rval`).
  */
-static _kernel_oserror *hn_call(uint32_t swi, unsigned *regs)
+static uint32_t hn_ring_once(uint32_t swi, unsigned *regs)
 {
-    uint32_t rc, i;
+    uint32_t i;
 
-    if (!live) {
-        return &err_nodev;
-    }
     req[H_CMD] = HN_CMD_SWI;
     req[H_SWI] = swi;
     req[H_ERRNO] = 0;
@@ -237,8 +268,58 @@ static _kernel_oserror *hn_call(uint32_t swi, unsigned *regs)
     for (i = 0; i < 8; i++) {
         req[H_REGS + i] = regs[i];
     }
+    return hn_go();
+}
 
-    rc = hn_go();
+/*
+ * The wait.
+ *
+ * The host cannot block -- it answers from inside the vCPU's MMIO write,
+ * holding the BQL -- so an operation that would have blocked on a socket
+ * the guest thinks is blocking comes back HN_RC_RETRY, and the waiting
+ * happens here.  That is not a workaround: it is where RISC OS's blocking
+ * semantics have always lived, in tsleep()'s spin in the Internet
+ * module's lib/c/unixenv.
+ *
+ * Sprint 1 spins, checking Escape.  A round trip costs microseconds and a
+ * DNS answer arrives in tens of milliseconds, so the spin is short, but it
+ * does hold the machine.  Sprint 2 replaces it with OS_UpCall 6 and a
+ * pollword, the way tsleep does, so a TaskWindow can multitask through it.
+ */
+static _kernel_oserror *hn_wait_ring(uint32_t swi, unsigned *regs,
+                                     uint32_t *rc_out)
+{
+    for (;;) {
+        uint32_t rc = hn_ring_once(swi, regs);
+
+        if (rc != HN_RC_RETRY) {
+            *rc_out = rc;
+            return 0;
+        }
+        if (os_escape()) {
+            return sock_error(4);          /* EINTR */
+        }
+    }
+}
+
+static _kernel_oserror *hn_select(unsigned *regs);
+
+static _kernel_oserror *hn_call(uint32_t swi, unsigned *regs)
+{
+    _kernel_oserror *e;
+    uint32_t rc;
+
+    if (!live) {
+        return &err_nodev;
+    }
+    if (swi == HN_SWI_SELECT) {
+        return hn_select(regs);
+    }
+
+    e = hn_wait_ring(swi, regs, &rc);
+    if (e) {
+        return e;
+    }
 
     switch (rc) {
     case HN_RC_OK:
@@ -260,12 +341,206 @@ static _kernel_oserror *hn_call(uint32_t swi, unsigned *regs)
     return 0;
 }
 
+/*
+ * Select is the one call the module does not simply forward, because the
+ * timeout is the caller's and the host has no way to honour it.  Each ring
+ * is a single poll; the host writes the output sets back only when
+ * something is ready, so the input sets survive a zero answer and the loop
+ * can just ask again.
+ *
+ * R0 nd, R1 read set, R2 write, R3 except, R4 struct timeval * (0 means
+ * wait for ever).  The result is the number of ready descriptors.
+ */
+static _kernel_oserror *hn_select(unsigned *regs)
+{
+    uint32_t rc, deadline = 0, timed = 0;
+
+    if (regs[4]) {
+        /* struct timeval { long tv_sec; long tv_usec; } -- guest memory,
+         * ours to read directly. */
+        const volatile uint32_t *tv = (const volatile uint32_t *)regs[4];
+        deadline = os_monotonic() + tv[0] * 100u + tv[1] / 10000u;
+        timed = 1;
+    }
+
+    for (;;) {
+        rc = hn_ring_once(HN_SWI_SELECT, regs);
+        if (rc != HN_RC_OK) {
+            return rc == HN_RC_NOSOCKETS ? &err_nosock
+                 : rc == HN_RC_BADSWI    ? &err_badswi
+                 : rc == HN_RC_BADADDR   ? &err_badaddr
+                 : &err_nodev;
+        }
+        if (req[H_ERRNO]) {
+            return sock_error(req[H_ERRNO]);
+        }
+        if (req[H_RESULT] != 0) {
+            regs[0] = req[H_RESULT];       /* something is ready */
+            return 0;
+        }
+        /* Signed compare, so the monotonic counter wrapping does not turn
+         * a short wait into a very long one. */
+        if (timed && (int32_t)(os_monotonic() - deadline) >= 0) {
+            regs[0] = 0;                   /* timed out: not an error */
+            return 0;
+        }
+        if (os_escape()) {
+            return sock_error(4);          /* EINTR */
+        }
+    }
+}
+
 /* ---- module entries ---------------------------------------------------- */
+
+/* ---- events ----------------------------------------------------------- */
+
+/*
+ * Internet Event 19 is how a RISC OS program finds out that a socket has
+ * woken.  The Internet module raised it from its own receive path; there
+ * is no receive path here, and the host cannot call into the guest, so the
+ * module asks on a ticker and raises the events itself.
+ *
+ * This is not a nicety.  The stock Resolver sets FIOASYNC, sends its
+ * query, and then does nothing at all until an event arrives — it never
+ * polls and never reads.  Without this, DNS queries go out, answers come
+ * back to the host, and the guest never asks for them.
+ */
+#define HN_TICK_CS   2          /* how often to ask: 50 times a second */
+
+extern void hostnet_tick(void);
+extern void hostnet_callback(void);
+
+static volatile uint32_t pollreq[H_WORDS + HN_POLL_MAX]
+    __attribute__((aligned(16)));
+static uint32_t cb_pending;
+static uint32_t tick_count, cb_count, event_count;
+
+/* The static base, which is what R9 holds in a -frwpi build.  Both veneers
+ * are handed it as their R12 value and move it straight back into R9. */
+static uint32_t static_base(void)
+{
+    register uint32_t r9 __asm("r9");
+
+    __asm volatile("" : "=r"(r9));
+    return r9;
+}
+
+
+/* OS_AddCallBack (R0 = code, R1 = R12 value) */
+static void os_add_callback(uint32_t code, uint32_t r12)
+{
+    register uint32_t a0 __asm("r0") = code;
+    register uint32_t a1 __asm("r1") = r12;
+
+    __asm volatile("swi 0x20054"
+                   : "+r"(a0), "+r"(a1)
+                   :
+                   : "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
+/* OS_CallEvery, SWI &3C (R0 = delay in cs, R1 = code, R2 = R12 value).
+ * Not &3D: that is OS_RemoveTickerEvent, and calling it instead registers
+ * nothing, reports nothing, and leaves the ticker silently dead. */
+static void os_call_every(uint32_t cs, uint32_t code, uint32_t r12)
+{
+    register uint32_t a0 __asm("r0") = cs;
+    register uint32_t a1 __asm("r1") = code;
+    register uint32_t a2 __asm("r2") = r12;
+
+    __asm volatile("swi 0x2003C"
+                   : "+r"(a0), "+r"(a1), "+r"(a2)
+                   :
+                   : "r3", "r12", "lr", "cc", "memory");
+}
+
+/* OS_RemoveTickerEvent, SWI &3D (R0 = code, R1 = R12 value) */
+static void os_remove_ticker(uint32_t code, uint32_t r12)
+{
+    register uint32_t a0 __asm("r0") = code;
+    register uint32_t a1 __asm("r1") = r12;
+
+    __asm volatile("swi 0x2003D"
+                   : "+r"(a0), "+r"(a1)
+                   :
+                   : "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
+/* OS_GenerateEvent: R0 event, R1 reason, R2 socket, R3 local port. */
+static void os_generate_event(uint32_t ev, uint32_t reason,
+                              uint32_t sock, uint32_t port)
+{
+    register uint32_t a0 __asm("r0") = ev;
+    register uint32_t a1 __asm("r1") = reason;
+    register uint32_t a2 __asm("r2") = sock;
+    register uint32_t a3 __asm("r3") = port;
+
+    __asm volatile("swi 0x20022"
+                   : "+r"(a0), "+r"(a1), "+r"(a2), "+r"(a3)
+                   :
+                   : "r12", "lr", "cc", "memory");
+}
+
+/*
+ * The ticker.  IRQ mode, interrupts off, almost nothing safe to call — so
+ * it does the one thing that is meant to be called from here, and leaves.
+ */
+void hostnet_c_tick(void);
+void hostnet_c_tick(void)
+{
+    tick_count++;
+    if (!live || cb_pending) {
+        return;
+    }
+    cb_pending = 1;
+    os_add_callback((uint32_t)hostnet_callback, static_base());
+}
+
+/*
+ * The callback.  USR mode, everything available.  Ask the host which
+ * sockets have woken and raise one event for each.
+ *
+ * pollreq is its own request block, separate from the one the SWIs use:
+ * a callback can land between a SWI writing the doorbell and reading its
+ * answer, and sharing the block would let one overwrite the other.
+ */
+void hostnet_c_callback(void);
+void hostnet_c_callback(void)
+{
+    uint32_t i, n;
+
+    cb_pending = 0;
+    cb_count++;
+    if (!live) {
+        return;
+    }
+    for (i = 0; i < H_WORDS; i++) {
+        pollreq[i] = 0;
+    }
+    pollreq[H_CMD] = HN_CMD_POLL;
+    pollreq[H_SEQ] = ++seq;
+    pollreq[H_RC] = 0xFFFFFFFFu;
+    hn_reg(HN_CMD / 4) = (uint32_t)pollreq;
+    if (pollreq[H_RC] != HN_RC_OK) {
+        return;
+    }
+    n = pollreq[H_RESULT];
+    if (n > HN_POLL_MAX) {
+        n = HN_POLL_MAX;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t w = pollreq[H_WORDS + i];
+
+        /* Event_Internet 19, reason 1 = SocketAsync, R2 socket, R3 port. */
+        os_generate_event(19, 1, w & 0xFFFFu, w >> 16);
+        event_count++;
+    }
+}
 
 int hostnet_init(void *ws)
 {
     (void)ws;
     live = 0;
+    cb_pending = 0;
 
     hn_base = os_map_io(HN_PHYS, HN_PAGE);
     if (!hn_base) {
@@ -278,6 +553,10 @@ int hostnet_init(void *ws)
         return 0;                   /* present, sockets switched off */
     }
     live = 1;
+
+    /* From here the module asks the host, fifty times a second, whether
+     * anything has woken.  Nothing else will: the host cannot call in. */
+    os_call_every(HN_TICK_CS, (uint32_t)hostnet_tick, static_base());
     return 0;
 }
 
@@ -285,8 +564,71 @@ int hostnet_final(unsigned fatal, void *ws)
 {
     (void)fatal;
     (void)ws;
-    /* Sprint 1 closes the guest's sockets here.  Nothing holds one yet. */
+    if (live) {
+        /* Before anything else: a ticker pointing into a module that is
+         * about to be unplugged is a branch into free memory. */
+        os_remove_ticker((uint32_t)hostnet_tick, static_base());
+    }
     live = 0;
+    return 0;
+}
+
+/* OS_Write0: a string to the current output stream. */
+static void os_write0(const char *s)
+{
+    register uint32_t r0 __asm("r0") = (uint32_t)s;
+
+    __asm volatile("swi 0x20002"
+                   : "+r"(r0)
+                   :
+                   : "r1", "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
+static void put_u32(char *out, uint32_t v)
+{
+    char tmp[12];
+    int n = 0;
+
+    do {
+        tmp[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    while (n) {
+        *out++ = tmp[--n];
+    }
+    *out = 0;
+}
+
+/*
+ * *HostNetInfo — what the module thinks is going on.
+ *
+ * The ticks and callbacks are here because "the guest never asked the host
+ * anything" and "the guest asked and the host had nothing" are impossible
+ * to tell apart from the host's side, and the difference is a registered
+ * ticker versus a dead one.
+ */
+int hostnet_command_info(const char *tail, int argc, void *ws);
+int hostnet_command_info(const char *tail, int argc, void *ws)
+{
+    char line[64], num[12];
+
+    (void)tail;
+    (void)argc;
+    (void)ws;
+
+    os_write0("HostNet: doorbell ");
+    os_write0(live ? "live" : "not found");
+    os_write0(", ticks ");
+    put_u32(num, tick_count);
+    os_write0(num);
+    os_write0(", callbacks ");
+    put_u32(num, cb_count);
+    os_write0(num);
+    os_write0(", events ");
+    put_u32(num, event_count);
+    os_write0(num);
+    os_write0("\r\n");
+    (void)line;
     return 0;
 }
 
