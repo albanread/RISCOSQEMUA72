@@ -1,0 +1,79 @@
+; setup.iss.in -- the end-user Windows installer.
+;
+; Substituted and compiled by tools/make-release.py; @NAME@ and friends are
+; filled in there.  The Mac release is one .app that carries everything;
+; Windows has no such container, so the same pieces are installed as a
+; program directory and a user data directory, and this ties them together.
+;
+; Two decisions worth stating, because both are deliberate:
+;
+;   PrivilegesRequired=lowest -- the whole thing installs per user, with no
+;   administrator prompt.  Nothing here needs machine-wide state: no
+;   service, no driver, no file associations, no PATH entry.  Asking for
+;   admin would be asking for something we do not use.
+;
+;   The disc goes to %USERPROFILE%\@NAME@, not under AppData.  The disc IS
+;   the machine's filing system -- it is the HostFS share -- so getting a
+;   file into RISC OS means opening that folder.  Hiding it would make the
+;   one thing the user has to reach the hardest to find.
+
+[Setup]
+AppId={{@APPID@}
+AppName=@DISPLAY@
+AppVersion=@VERSION@
+AppVerName=@DISPLAY@ @VERSION@
+AppPublisher=@PUBLISHER@
+DefaultDirName={localappdata}\Programs\@NAME@v@VERSION@
+DefaultGroupName=@DISPLAY@
+UninstallDisplayName=@DISPLAY@ @VERSION@
+UninstallDisplayIcon={app}\@NAME@.exe
+OutputDir=@OUTDIR@
+OutputBaseFilename=@NAME@v@VERSION@-setup
+Compression=lzma2/max
+SolidCompression=yes
+; Per user, so no administrator prompt at any point.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+DisableProgramGroupPage=yes
+DisableDirPage=no
+WizardStyle=modern
+; The disc is a few hundred megabytes; say so before it is unpacked.
+ExtraDiskSpaceRequired=@DISCBYTES@
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
+    GroupDescription: "Shortcuts:"
+
+[Files]
+; The program: emulator, the DLLs it links, the ROM, the launcher.
+Source: "@STAGE@\app\*"; DestDir: "{app}"; \
+    Flags: recursesubdirs createallsubdirs ignoreversion
+
+; The disc, into the user's own folder.  onlyifdoesntexist so that
+; reinstalling over an existing machine does not throw away the user's
+; files -- the share is their working area, not ours.
+Source: "@STAGE@\disc\*"; DestDir: "{%USERPROFILE}\@NAME@"; \
+    Flags: recursesubdirs createallsubdirs onlyifdoesntexist uninsneveruninstall
+
+[Icons]
+Name: "{group}\@DISPLAY@"; Filename: "{app}\@NAME@.exe"
+Name: "{group}\@DISPLAY@ disc folder"; Filename: "{%USERPROFILE}\@NAME@"
+Name: "{autodesktop}\@DISPLAY@"; Filename: "{app}\@NAME@.exe"; \
+    Tasks: desktopicon
+
+[Run]
+Filename: "{app}\@NAME@.exe"; Description: "Start @DISPLAY@ now"; \
+    Flags: postinstall nowait skipifsilent
+
+[UninstallDelete]
+; The ROM cache the launcher may write beside the program; the disc itself
+; is the user's and is left alone.
+Type: filesandordirs; Name: "{app}\RISCOS-*.IMG"
+
+[Messages]
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nRISC OS runs from a folder in your user area, which is also how files move between Windows and RISC OS. Nothing is installed for other users and no administrator rights are needed.
