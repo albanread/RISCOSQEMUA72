@@ -55,6 +55,7 @@ static struct {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLSamplerState> linear;
+    id<MTLSamplerState> repeat;         /* backdrop tiles */
     dispatch_semaphore_t inflight;
     bool ready;
     bool lost;
@@ -96,14 +97,17 @@ static struct {
  * tiling a sprite whose pixels carry it (tools/mkbacktile.py): the
  * kernel's sprite plot and the Wimp's block copies keep all 32 bits. */
 enum MetalBackdrop { METAL_BACKDROP_OFF = 0, METAL_BACKDROP_ACORN,
-                     METAL_BACKDROP_ACORN_LIVE, METAL_BACKDROP_IMAGE };
+                     METAL_BACKDROP_ACORN_LIVE, METAL_BACKDROP_PICTURE,
+                     METAL_BACKDROP_TILE };
 #define METAL_BACKDROP_KEY   0x00B4C0B7u  /* 0x00BBGGRR: #B7C0B4 */
 #define METAL_ICONBAR_PX     66u          /* guest px, square-pixel modes */
 static struct {
     int mode;                           /* MetalBackdrop */
-    id<MTLTexture> image;               /* METAL_BACKDROP_IMAGE */
+    id<MTLTexture> image;               /* PICTURE and TILE */
+    double image_scale;                 /* 2 for an @2x tile, else 1 */
+    NSString *spec;                     /* as given: the menu ticks it */
     CFAbsoluteTime t0;                  /* acorn-live's clock */
-} backdrop = { METAL_BACKDROP_OFF, nil, 0 };
+} backdrop = { METAL_BACKDROP_OFF, nil, 1.0, nil, 0 };
 
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
@@ -123,6 +127,7 @@ static struct {
     id<MTLRenderPipelineState> decode;  /* specialised for this bpp */
     id<MTLRenderPipelineState> scale;   /* specialised for the options */
     id<MTLRenderPipelineState> shot;    /* the scale pass into RGBA8, 1:1 */
+    uint32_t xoff, yoff, pixo;          /* the view's pan and byte order */
 } fb;
 
 static bool fb_failed;
@@ -197,6 +202,7 @@ typedef struct {
     uint32_t misc[4];   /* xoffset(px), yoffset(rows), pixo, unused */
     uint32_t post[4];   /* view w, view h, scaling, scanlines */
     uint32_t bd[4];     /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */
+    uint32_t bx[4];     /* backdrop: output px per tile px x1000, unused */
 } MetalParams;
 
 /* The front end's log: a file next to the process, because a windowed
@@ -547,13 +553,14 @@ static NSString * const SHADER_SRC = @""
 "constant uint SCALING   [[function_constant(1)]];\n"
 "constant bool SCANLINES [[function_constant(2)]];\n"
 "constant uint BACKDROP  [[function_constant(3)]];\n"
-"constant bool BACKDROP_IMAGE = (BACKDROP == 3);\n"
+"constant bool BACKDROP_IMAGE = (BACKDROP >= 3);\n"
 "\n"
 "struct Params {\n"
 "    uint4 dim;     /* xres, yres, pitch(bytes), bpp */\n"
 "    uint4 misc;    /* xoffset(px), yoffset(rows), pixo, unused */\n"
 "    uint4 post;    /* view w, view h, scaling, scanlines */\n"
 "    uint4 bd;      /* backdrop: key 0x00BBGGRR, time ms, icon bar px, on */\n"
+"    uint4 bx;      /* backdrop: output px per tile px x1000, unused */\n"
 "};\n"
 "\n"
 "struct VSOut {\n"
@@ -705,7 +712,8 @@ static NSString * const SHADER_SRC = @""
 "                         constant Params &P [[buffer(0)]],\n"
 "                         texture2d<float> src [[texture(0)]],\n"
 "                         texture2d<float> bgimg [[texture(1), function_constant(BACKDROP_IMAGE)]],\n"
-"                         sampler lin [[sampler(0)]])\n"
+"                         sampler lin [[sampler(0)]],\n"
+"                         sampler rep [[sampler(1), function_constant(BACKDROP_IMAGE)]])\n"
 "{\n"
 "    float2 outPx = float2(P.post.x, P.post.y);\n"
 "    float2 srcPx = float2(P.dim.x, P.dim.y);\n"
@@ -732,9 +740,18 @@ static NSString * const SHADER_SRC = @""
 "    float3 bg;\n"
 "    if (BACKDROP_IMAGE) {\n"
 "        float2 isz = float2(bgimg.get_width(), bgimg.get_height());\n"
-"        float s = max(outPx.x / isz.x, outPx.y / isz.y);\n"
-"        float2 uv = (v.pos.xy - 0.5 * outPx) / (s * isz) + 0.5;\n"
-"        bg = bgimg.sample(lin, uv).rgb;\n"
+"        if (BACKDROP == 4) {\n"
+"            /* tile: from the top left, each image pixel covering a\n"
+"             * point (a device pixel for an @2x tile) -- repeated by the\n"
+"             * sampler, so the seams filter like the rest */\n"
+"            float2 uv = v.pos.xy / (isz * float(P.bx.x) / 1000.0);\n"
+"            bg = bgimg.sample(rep, uv).rgb;\n"
+"        } else {\n"
+"            /* picture: fill the view, centred, cropping the overhang */\n"
+"            float s = max(outPx.x / isz.x, outPx.y / isz.y);\n"
+"            float2 uv = (v.pos.xy - 0.5 * outPx) / (s * isz) + 0.5;\n"
+"            bg = bgimg.sample(lin, uv).rgb;\n"
+"        }\n"
 "    } else {\n"
 "        bg = backdrop_scene(v.pos.xy, outPx, srcPx, P);\n"
 "    }\n"
@@ -995,13 +1012,15 @@ static bool fb_build_scale(void)
 /* The backdrop's share of the shader constants, for a frame or a
  * screenshot: the key, a clock on the scene's half-hour loop, the icon
  * bar the acorn is centred above, and whether the layer is on at all. */
-static void backdrop_params(MetalParams *p)
+static void backdrop_params(MetalParams *p, double px_per_point)
 {
     p->bd[0] = METAL_BACKDROP_KEY;
     p->bd[1] = (uint32_t)(fmod(CFAbsoluteTimeGetCurrent() - backdrop.t0,
                                1800.0) * 1000.0);
     p->bd[2] = METAL_ICONBAR_PX;
     p->bd[3] = backdrop.mode != METAL_BACKDROP_OFF;
+    p->bx[0] = (uint32_t)(px_per_point / backdrop.image_scale * 1000.0 + 0.5);
+    p->bx[1] = p->bx[2] = p->bx[3] = 0;
 }
 
 /* An image for backdrop=<file>: anything ImageIO reads, drawn over the
@@ -1023,8 +1042,8 @@ static id<MTLTexture> backdrop_load_image(const char *path)
     }
     w = CGImageGetWidth(img);
     h = CGImageGetHeight(img);
-    if (w > 8192 || h > 8192) {             /* keep inside every GPU's limit */
-        double k = 8192.0 / (double)MAX(w, h);
+    if (w > 4096 || h > 4096) {             /* ample for any window; saves VRAM */
+        double k = 4096.0 / (double)MAX(w, h);
         w = MAX((size_t)(w * k), 1);
         h = MAX((size_t)(h * k), 1);
     }
@@ -1063,38 +1082,116 @@ static id<MTLTexture> backdrop_load_image(const char *path)
     return tex;
 }
 
-/* -display metal,backdrop=off|acorn|acorn-live|<image file>.  Called at
- * init, after the window and the device exist; UI thread only after. */
+/* -display metal,backdrop=, and the Backdrop menu: off, acorn, acorn-live,
+ * tile:<image file> or picture:<image file> (a bare path is a picture).
+ * An @2x tile covers a device pixel per image pixel on a Retina screen,
+ * any other a point.  Called at init, after the window and the device
+ * exist, and from the menu; UI thread only. */
 void metal_glue_backdrop(const char *spec)
 {
     int mode = METAL_BACKDROP_OFF;
+    const char *path = NULL;
 
     [backdrop.image release];
     backdrop.image = nil;
+    backdrop.image_scale = 1.0;
     if (!spec || !*spec || !strcmp(spec, "off")) {
         mode = METAL_BACKDROP_OFF;
     } else if (!strcmp(spec, "acorn")) {
         mode = METAL_BACKDROP_ACORN;
     } else if (!strcmp(spec, "acorn-live")) {
         mode = METAL_BACKDROP_ACORN_LIVE;
+    } else if (!strncmp(spec, "tile:", 5)) {
+        mode = METAL_BACKDROP_TILE;
+        path = spec + 5;
+    } else if (!strncmp(spec, "picture:", 8)) {
+        mode = METAL_BACKDROP_PICTURE;
+        path = spec + 8;
     } else {
-        backdrop.image = backdrop_load_image(spec);
+        mode = METAL_BACKDROP_PICTURE;
+        path = spec;
+    }
+    if (path) {
+        backdrop.image = backdrop_load_image(path);
         if (backdrop.image) {
-            mode = METAL_BACKDROP_IMAGE;
-            metal_log("backdrop: %s (%lux%lu)", spec,
+            if (mode == METAL_BACKDROP_TILE && strstr(path, "@2x")) {
+                backdrop.image_scale = 2.0;
+            }
+            metal_log("backdrop: %s %s (%lux%lu)",
+                      mode == METAL_BACKDROP_TILE ? "tile" : "picture", path,
                       (unsigned long)backdrop.image.width,
                       (unsigned long)backdrop.image.height);
         } else {
             mode = METAL_BACKDROP_ACORN;
-            metal_log("backdrop: cannot read %s; using acorn", spec);
+            metal_log("backdrop: cannot read %s; using acorn", path);
         }
     }
+    [backdrop.spec release];
+    backdrop.spec = [[NSString alloc] initWithUTF8String:
+                     mode == METAL_BACKDROP_ACORN && path ? "acorn" : (spec && *spec ? spec : "off")];
     if (mode != backdrop.mode) {
         backdrop.mode = mode;
         fb_release_scale();
     }
     backdrop.t0 = CFAbsoluteTimeGetCurrent();
     metal_log("backdrop: mode %d", mode);
+}
+
+/* Whether RISC OS is painting the below tag in the key colour right now,
+ * sampled from the newest frame for the menu's hint: 1 yes, 0 no, -1 not
+ * a 32bpp mode, -2 no frame yet. */
+static int backdrop_guest_state(void)
+{
+    const uint8_t *raw;
+    uint32_t x, y;
+
+    if (!fb.up || !fb.uploaded) {
+        return -2;
+    }
+    if (fb.bpp != 32) {
+        return -1;
+    }
+    raw = [fb.raw[fb.ring] contents];
+    for (y = 0; y < fb.yres && y + fb.yoff < fb.rows; y += 7) {
+        const uint8_t *row = raw + (size_t)(y + fb.yoff) * fb.pitch;
+
+        for (x = 0; x < fb.xres; x += 7) {
+            const uint8_t *px = row + (size_t)(x + fb.xoff) * 4;
+            uint32_t rgb = fb.pixo ? (px[0] | px[1] << 8 | px[2] << 16)
+                                   : (px[2] | px[1] << 8 | px[0] << 16);
+
+            if ((px[3] & 0xC0) == 0x80 && rgb == METAL_BACKDROP_KEY) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* The folder the Backdrop menu lists: Tiles and Pictures inside it. */
+static NSString *backdrop_folder(void)
+{
+    NSString *f = [[NSUserDefaults standardUserDefaults] stringForKey:@"backdropFolder"];
+
+    return f.length ? f : [@"~/Pictures/RISC OS Backdrops" stringByExpandingTildeInPath];
+}
+
+/* The images in a folder, by name as the Finder sorts them. */
+static NSArray *backdrop_images(NSString *dir, NSSet *extensions)
+{
+    NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:NULL];
+    NSMutableArray *out = [NSMutableArray array];
+
+    for (NSString *n in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+        if (![n hasPrefix:@"."]
+            && [extensions containsObject:[[n pathExtension] lowercaseString]]) {
+            [out addObject:[dir stringByAppendingPathComponent:n]];
+            if (out.count >= 200) {
+                break;
+            }
+        }
+    }
+    return out;
 }
 
 /* The pointer pipeline: straight alpha, so the ROM's anti-fringe fill
@@ -1360,7 +1457,10 @@ static bool metal_render_frame(void)
         params.post[1] = (uint32_t)target.height;
         params.post[2] = (uint32_t)video_opts.scaling;
         params.post[3] = video_opts.scanlines ? 1 : 0;
-        backdrop_params(&params);
+        backdrop_params(&params, m.layer.contentsScale);
+        fb.xoff = v.xoffset;
+        fb.yoff = v.yoffset;
+        fb.pixo = v.pixo;
 
         /* decode pass: raw bytes -> linear RGB */
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1391,8 +1491,9 @@ static bool metal_render_frame(void)
         [enc setRenderPipelineState:fb.scale];
         [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
         [enc setFragmentTexture:fb.decoded atIndex:0];
-        if (backdrop.mode == METAL_BACKDROP_IMAGE) {
+        if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
             [enc setFragmentTexture:backdrop.image atIndex:1];
+            [enc setFragmentSamplerState:m.repeat atIndex:1];
         }
         [enc setFragmentSamplerState:m.linear atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle
@@ -1549,7 +1650,9 @@ static bool metal_screenshot_to(NSString *path)
             sp.post[0] = fb.xres;
             sp.post[1] = fb.yres;
             sp.post[2] = METAL_SCALING_NEAREST;
-            backdrop_params(&sp);
+            /* the window's tile size, carried into guest pixels */
+            backdrop_params(&sp, m.layer.contentsScale * (double)fb.yres
+                                 / MAX(m.layer.drawableSize.height, 1.0));
             srp.colorAttachments[0].texture = composite;
             srp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             srp.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -1557,8 +1660,9 @@ static bool metal_screenshot_to(NSString *path)
             [senc setRenderPipelineState:fb.shot];
             [senc setFragmentBytes:&sp length:sizeof(sp) atIndex:0];
             [senc setFragmentTexture:fb.decoded atIndex:0];
-            if (backdrop.mode == METAL_BACKDROP_IMAGE) {
+            if (backdrop.mode >= METAL_BACKDROP_PICTURE) {
                 [senc setFragmentTexture:backdrop.image atIndex:1];
+                [senc setFragmentSamplerState:m.repeat atIndex:1];
             }
             [senc setFragmentSamplerState:m.linear atIndex:0];
             [senc drawPrimitives:MTLPrimitiveTypeTriangle
@@ -1976,7 +2080,8 @@ static void metal_buttons_release_all(void)
 /* ------------------------------------------------------------------ */
 /* Application delegate: the menu's targets, and the window's fate      */
 
-@interface MetalDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface MetalDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate,
+                                     NSMenuDelegate>
 @end
 
 @implementation MetalDelegate
@@ -2038,6 +2143,151 @@ static void metal_buttons_release_all(void)
     [m.window toggleFullScreen:nil];
 }
 
+/* The Backdrop menu (MACOS.md, "The backdrop layer"): the Acorn scenes,
+ * None, and Tiles and Pictures submenus listing the images in the
+ * backdrops folder -- rebuilt each time it opens, so a file dropped into
+ * the folder is there next time.  A choice applies at once and is kept
+ * as the backdrop default, which the app's launcher passes next time. */
+static NSMenuItem *backdrop_item(NSString *title, NSString *spec, id target)
+{
+    NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title
+                                                action:@selector(backdropAction:)
+                                         keyEquivalent:@""];
+
+    [it setTarget:target];
+    [it setRepresentedObject:spec];
+    [it setState:[spec isEqualToString:backdrop.spec] ? NSControlStateValueOn
+                                                      : NSControlStateValueOff];
+    return [it autorelease];
+}
+
+static NSMenuItem *backdrop_note(NSString *title)
+{
+    NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:NULL keyEquivalent:@""];
+
+    [it setEnabled:NO];
+    return [it autorelease];
+}
+
+static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
+                             id target)
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:title];
+    bool any = false;
+
+    [menu setAutoenablesItems:NO];
+    for (NSArray *group in groups) {
+        if (group.count && any) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+        for (NSString *path in group) {
+            [menu addItem:backdrop_item([[path lastPathComponent] stringByDeletingPathExtension],
+                                        [NSString stringWithFormat:@"%@:%@", kind, path],
+                                        target)];
+            any = true;
+        }
+    }
+    if (!any) {
+        [menu addItem:backdrop_note([NSString stringWithFormat:
+            @"No images in the %@ folder", title])];
+    }
+    return [menu autorelease];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu
+{
+    NSSet *ext = [NSSet setWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
+                                       @"tif", @"tiff", @"gif", @"bmp", @"webp", nil];
+    NSString *dir = backdrop_folder();
+    NSMenuItem *sub;
+
+    if (![[menu title] isEqualToString:@"Backdrop"]) {
+        return;
+    }
+    [menu removeAllItems];
+    switch (backdrop_guest_state()) {
+    case 0:
+        [menu addItem:backdrop_note(@"RISC OS is not drawing a backdrop to show through")];
+        [menu addItem:[NSMenuItem separatorItem]];
+        break;
+    case -1:
+        [menu addItem:backdrop_note(@"Backdrops need a 16 million colour screen mode")];
+        [menu addItem:[NSMenuItem separatorItem]];
+        break;
+    default:
+        break;
+    }
+    [menu addItem:backdrop_item(@"Acorn", @"acorn", self)];
+    [menu addItem:backdrop_item(@"Acorn, Moving", @"acorn-live", self)];
+    [menu addItem:backdrop_item(@"None", @"off", self)];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    sub = [[[NSMenuItem alloc] initWithTitle:@"Tiles" action:NULL keyEquivalent:@""] autorelease];
+    [sub setSubmenu:backdrop_list(@"Tiles", @"tile",
+        @[ backdrop_images([dir stringByAppendingPathComponent:@"Tiles"], ext) ], self)];
+    [menu addItem:sub];
+    sub = [[[NSMenuItem alloc] initWithTitle:@"Pictures" action:NULL keyEquivalent:@""] autorelease];
+    [sub setSubmenu:backdrop_list(@"Pictures", @"picture",
+        @[ backdrop_images([dir stringByAppendingPathComponent:@"Pictures"], ext),
+           backdrop_images(@"/System/Library/Desktop Pictures", [NSSet setWithObject:@"heic"]) ],
+        self)];
+    [menu addItem:sub];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *open = [[[NSMenuItem alloc] initWithTitle:@"Open Backdrops Folder"
+                                                   action:@selector(openBackdropsFolderAction:)
+                                            keyEquivalent:@""] autorelease];
+    [open setTarget:self];
+    [menu addItem:open];
+    NSMenuItem *choose = [[[NSMenuItem alloc] initWithTitle:@"Choose Backdrops Folder\u2026"
+                                                     action:@selector(chooseBackdropsFolderAction:)
+                                              keyEquivalent:@""] autorelease];
+    [choose setTarget:self];
+    [menu addItem:choose];
+}
+
+- (void)backdropAction:(NSMenuItem *)sender
+{
+    NSString *spec = [sender representedObject];
+
+    if (spec) {
+        metal_glue_backdrop([spec UTF8String]);
+        [[NSUserDefaults standardUserDefaults] setObject:backdrop.spec forKey:@"backdrop"];
+    }
+}
+
+- (void)openBackdropsFolderAction:(id)sender
+{
+    NSString *dir = backdrop_folder();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    (void)sender;
+    [fm createDirectoryAtPath:[dir stringByAppendingPathComponent:@"Tiles"]
+  withIntermediateDirectories:YES attributes:nil error:NULL];
+    [fm createDirectoryAtPath:[dir stringByAppendingPathComponent:@"Pictures"]
+  withIntermediateDirectories:YES attributes:nil error:NULL];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir]];
+}
+
+- (void)chooseBackdropsFolderAction:(id)sender
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+
+    (void)sender;
+    panel.canChooseDirectories = YES;
+    panel.canChooseFiles = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.prompt = @"Use Folder";
+    panel.message = @"Choose a folder with Tiles and Pictures folders inside it.";
+    panel.directoryURL = [NSURL fileURLWithPath:backdrop_folder()];
+    [panel beginSheetModalForWindow:m.window completionHandler:^(NSModalResponse r) {
+        if (r == NSModalResponseOK && panel.URL) {
+            [[NSUserDefaults standardUserDefaults] setObject:[panel.URL path]
+                                                      forKey:@"backdropFolder"];
+        }
+    }];
+}
+
 @end
 
 static MetalDelegate *delegate;
@@ -2075,6 +2325,19 @@ static void metal_build_menu(void)
     metal_add_item(machine, @"Load Snapshot", @selector(snapshotAction:), @"",
                    0);
     [machine addItem:[NSMenuItem separatorItem]];
+    {
+        NSMenu *bd = [[NSMenu alloc] initWithTitle:@"Backdrop"];
+        NSMenuItem *bdItem = [[NSMenuItem alloc] initWithTitle:@"Backdrop"
+                                                        action:NULL
+                                                 keyEquivalent:@""];
+
+        [bd setDelegate:delegate];
+        [bd setAutoenablesItems:NO];
+        [bdItem setSubmenu:bd];
+        [machine addItem:bdItem];
+        [bd release];
+        [bdItem release];
+    }
     metal_add_item(machine, @"Toggle Full Screen",
                    @selector(fullScreenAction:), @"f",
                    NSEventModifierFlagCommand | NSEventModifierFlagControl);
@@ -2159,6 +2422,9 @@ int metal_backend_init(void)
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     m.linear = [m.device newSamplerStateWithDescriptor:sd];
+    sd.sAddressMode = MTLSamplerAddressModeRepeat;
+    sd.tAddressMode = MTLSamplerAddressModeRepeat;
+    m.repeat = [m.device newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!m.linear) {
         metal_log("no sampler");

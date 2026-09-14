@@ -315,13 +315,101 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
 
 `-display metal` takes `vsync=N` (default 30), `scaling=linear|sharp|nearest`
 (default sharp) and `scanlines=on|off`, the same three the Windows front
-end takes. In the window: ⌃⌥G grabs and releases the pointer, middle click
+end takes, and `backdrop=` (§7a). In the window: ⌃⌥G grabs and releases the pointer, middle click
 grabs, ⌘S or F13 writes `metal-screenshot-N.png`, ⌃⌘F is full screen, and
 closing the window powers the machine down cleanly. Failures land in
 `metal-debug.txt` next to the process.
 
 `-display cocoa` remains as a fallback: it goes through QEMU's own display
 path, converting the framebuffer on the CPU, and it works.
+
+## 7a. The backdrop layer
+
+*14 Sep 2026.* The Metal display can draw a layer of its own **beneath**
+RISC OS's desktop, at the window's native resolution, and show it through
+the pixels the guest marks as background. The desktop is composited over
+it: windows, menus, icons and the icon bar stay RISC OS's own pixels.
+
+**The tag.** A 32bpp RISC OS pixel is `&TTBBGGRR`, and the top byte is
+the *transfer* or *supremacy* byte (`Kernel hdr/VduExt`, ModeFlags bit
+15 clear). Everything the OS draws leaves it at 0: the kernel clears it
+(`s/vdu/vduwrch`, `GetAlphaSupremacyBits`), and a live framebuffer read
+found it 0 on all 480,000 pixels of the Acorn desktop. So the byte is
+free to carry layer tags:
+
+| Bits 7–6 | Meaning |
+| --- | --- |
+| `10` | **below** — the layer beneath shows through this pixel |
+| `01` | **above** — reserved: a layer drawn over this pixel (overlays) |
+| `00`, `11` | nothing — so the `&FF` some sprite tools write means nothing |
+
+Bits 5–0 are reserved and 0. A *below* pixel must also be the backdrop
+key colour, the Acorn sage `#B7C0B4`, before it becomes a hole: an EOR
+drag box or rubber band drawn over the backdrop changes the colour, drops
+out of the key, and stays visible.
+
+**How the guest paints it.** No RISC OS code changes. The pinboard tiles
+a small sprite whose every pixel is the key colour with transfer byte
+`&80` (`tools/mkbacktile.py`), and the Wimp is told not to fill boxes
+behind icon names on the pinboard:
+
+    Backdrop -Tile Boot:Resources.!ThemeDefs.Themes.Acorn.BackTile -Colour &B4C0B700
+    WimpVisualFlags -RemoveIconBoxes -NoIconBoxesInTransWindows ...
+
+Measured on a running machine, reading the framebuffer out of guest
+memory: the kernel's sprite plot writes all 32 bits, so the tag lands on
+exactly the backdrop; windows, menus, icons and labels stay untagged; the
+Wimp's block copies carry the byte with the pixels, so a dragged window
+leaves the area it uncovers re-tagged by Pinboard's redraw, with nothing
+stale. Without the layer the tile is just the sage ground.
+
+**How the host shows it.** The decode pass reads the byte and returns a
+transparent, premultiplied texel for a tagged key pixel; the scale pass
+filters that texture as before and composites it over the scene, so
+window edges blend the way the magnified desktop does. Screenshots run the
+scale pass once more at 1:1 so they hold the composite; QMP `screendump`
+still returns the guest's own pixels.
+
+**What it draws** — `-display metal,backdrop=`:
+
+| Value | Scene |
+| --- | --- |
+| `off` | nothing (default) |
+| `acorn` | the Acorn ground and ghost acorn, from `design/art/acorn.svg`'s own curves: it covers all 37,784 pixels of the watermark sprite RISC OS drew, with 48 sub-pixel extras at the edge, centred above the 66-pixel icon bar — crisp at Retina resolution |
+| `acorn-live` | the same, with two slow soft lights and a vignette, dithered against banding |
+| `tile:<file>` | an image repeated from the top left: an image pixel per point, or per device pixel for an `@2x` file |
+| `picture:<file>` or `<file>` | an image filling the window, centred |
+
+Images are anything ImageIO reads, capped at 4096 pixels a side and
+colour-matched to sRGB (the display path is 8-bit sRGB; a wide-gamut image
+loses its extra gamut).
+
+**The Backdrop menu.** Machine › Backdrop offers Acorn, Acorn Moving and
+None, and **Tiles** and **Pictures** submenus listing the images in the
+`Tiles` and `Pictures` folders of `~/Pictures/RISC OS Backdrops` (the
+`backdropFolder` default; *Choose Backdrops Folder…* changes it), plus
+macOS's own still wallpapers under Pictures. It is rebuilt each time it
+opens. A choice applies at once and is saved as the `backdrop` default,
+which the app's launcher passes on the next start. When RISC OS is not
+painting the tag — an older disc, or a 16- or 8-bit mode — the menu says
+so at the top.
+
+Verified 14 Sep: the guest framebuffer holds plain sage while the window
+shows the acorn; the composited desktop differs from the old sprite-drawn
+one only on the acorn's edge; tiles, a 6016×6016 HEIC picture, both Acorn
+scenes and None all switched from the menu; a resized, stretched window
+keeps the acorn centred and undistorted.
+
+**Not done:** the Windows front end (the convention is front-end neutral);
+the *above* tag; wide colour (a float, Display P3 layer, with the guest's
+sRGB converted on the way); modes with rectangular pixels, where the icon
+bar is not 66 pixels tall.
+
+**A fix found on the way.** The scale pipeline was built in
+`metal_backend_init`, before `-display`'s own options were read, and never
+rebuilt, so `scaling=` and `scanlines=` did not reach the shader — the v1
+release binary with `scanlines=on` shows uniform rows. The pipeline is now
+released whenever an option changes and rebuilt by the next frame.
 
 ## 8. Speed, measured
 

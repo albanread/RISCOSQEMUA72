@@ -216,6 +216,23 @@ socket path is limited to 104 bytes — and give each launch its own:
 
     open -n RISCOSQEA72v1.app --args -qmp unix:/tmp/q1.sock,server,nowait
 
+## mkbacktile.py — the backdrop tile
+
+`mkbacktile.py` writes the sprite that hands the desktop's background to
+the Metal display's backdrop layer (`MACOS.md` §7a): 32bpp, every pixel
+the Acorn sage with `&80` in the transfer byte, the "below" layer tag.
+Tiled as the pinboard backdrop it tags the whole background; with no layer
+it is simply the sage ground.
+
+    riscos-pi4/tools/mkbacktile.py --out BackTile,ff9
+
+`make-release.sh` does this for the Mac app unless `BACKDROP=off`: it puts
+the tile in the disc's Acorn theme, switches `PinSetup` to
+`Backdrop -Tile` and `ThemeSetup` to `-NoIconBoxesInTransWindows`, and
+records the scene (`acorn` by default, or `acorn-live`) as `RISCOSBackdrop`
+in `Info.plist` for the launcher. A user's `backdrop` default, which the
+Backdrop menu writes, overrides it.
+
 ## mkbootfx.py — the boot screen
 
 The ROM's BootFX module paints a splash JPEG and a progress bar from
