@@ -25,6 +25,12 @@
 #               cmos.bin seeds a disc that has none.
 #   the logs    ~/Library/Logs/<base name>/run.log (QEMU's stdout and
 #               stderr) and metal-debug.txt, which lands in the cwd.
+#   the backdrop  `defaults write <bundle id> backdrop acorn-live` picks
+#               the layer drawn beneath the desktop: acorn (the release's
+#               default, from RISCOSBackdrop in Info.plist), acorn-live,
+#               off, or the path of an image file.  It shows through where
+#               the disc tiles its tagged backdrop sprite (MACOS.md, "The
+#               backdrop layer"); on a disc that does not, it never shows.
 #   the mode    `defaults write <bundle id> mode 1920x1200` opens the
 #               desktop at that size (README.md: the EDID timing).
 #
@@ -88,6 +94,9 @@ EOS
 
 DISC="$(pref disc)"
 MODE="$(pref mode)"
+BACKDROP="$(pref backdrop)"
+[[ -n "$BACKDROP" ]] || BACKDROP="$(/usr/libexec/PlistBuddy -c 'Print :RISCOSBackdrop' "$CONTENTS/Info.plist" 2>/dev/null)"
+BACKDROP="${BACKDROP:-off}"
 if [[ -n "${RISCOS_CHOOSE_DISC:-}" ]]; then
     print -r -- "$APPNAME: Option held at launch: asking for the disc folder"
     choose_disc ""
@@ -130,7 +139,7 @@ args=(
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3
     -audiodev coreaudio,id=snd0
     -global bcm2835-vchiq.audiodev=snd0
-    -display metal,vsync=30
+    -display "metal,vsync=30,backdrop=$(q "$BACKDROP")"
     -name "$APPNAME"
     -global "bcm2838-peripherals.vmchannel-root=$(q "$DISC")"
 )
@@ -141,5 +150,5 @@ extra=()
 for a in "$@"; do
     [[ "$a" == -psn_* ]] || extra+=("$a")   # LaunchServices' process serial number, if it sends one
 done
-print -r -- "$APPNAME: disc $DISC${MODE:+, mode $MODE}"
+print -r -- "$APPNAME: disc $DISC${MODE:+, mode $MODE}, backdrop $BACKDROP"
 exec "$BIN" "${args[@]}" "${extra[@]}"

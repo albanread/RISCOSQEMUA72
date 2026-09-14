@@ -37,6 +37,13 @@
 #                 Mach-O with the hardened runtime and a timestamp, the
 #                 emulator with app/entitlements.plist (allow-jit: TCG
 #                 writes the code it runs), as notarization requires.
+#   BACKDROP      the layer the host draws beneath the desktop (MACOS.md,
+#                 "The backdrop layer"): acorn (default), acorn-live, or
+#                 off.  Anything but off tiles the tagged sprite from
+#                 mkbacktile.py across the disc's pinboard, turns on the
+#                 Wimp's -NoIconBoxesInTransWindows, and makes the value
+#                 the app's default (RISCOSBackdrop in Info.plist; a user
+#                 overrides it with `defaults write <id> backdrop ...`).
 #   NOTARY_PROFILE a notarytool keychain profile (xcrun notarytool
 #                 store-credentials <name>, done once by the account
 #                 holder).  With it, and a Developer ID, the app and then
@@ -62,6 +69,8 @@ FS_ZIP="${FS_ZIP:-$PRIV/dist/end_user_fs.zip}"
 BIN="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 OUT="${OUT:-$ROOT/build-macos/release}"
 SIGN_ID="${SIGN_ID:--}"
+BACKDROP="${BACKDROP:-acorn}"
+[[ "$BACKDROP" == (acorn|acorn-live|off) ]] || die "BACKDROP must be acorn, acorn-live or off, not '$BACKDROP'"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 ENTS="$ROOT/riscos-pi4/app/entitlements.plist"
 STRIP_DEFAULT=(
@@ -108,6 +117,12 @@ if [[ -z "${NO_BUILD:-}" ]]; then
     ninja -C "$ROOT/build-macos" | tail -2
 fi
 [[ -x "$BIN" ]] || die "no emulator at $BIN"
+# which Macs this copy is for: the emulator's own architecture
+if lipo -archs "$BIN" 2>/dev/null | grep -q x86_64; then
+    ARCH_DESC="Intel"
+else
+    ARCH_DESC="Apple silicon"
+fi
 python3 "$HERE/mksdef.py" >/dev/null
 
 # 2. a clean stage
@@ -163,6 +178,40 @@ if [[ -n "$stripped" && -f "$pins" ]]; then
         fi
     done
 fi
+# The backdrop: the pinboard tiles a sprite whose pixels carry the "below"
+# layer tag in their transfer byte, so the host's layer shows through the
+# background, and the Wimp stops filling boxes behind pinboard icon names
+# (they would cover the layer).  Without the layer the tile is the sage
+# ground the watermark sat on.
+backdrop_note="none"
+if [[ "$BACKDROP" != off ]]; then
+    theme="$STAGE/disc/!Boot/Resources/!ThemeDefs/Themes/Acorn"
+    [[ -d "$theme" ]] || die "no Acorn theme on the disc for the backdrop tile: $theme"
+    python3 "$HERE/mkbacktile.py" --out "$theme/BackTile,ff9" >/dev/null
+    python3 - "$STAGE/disc" <<'PY' || die "the disc's PinSetup or ThemeSetup is not the shape the backdrop patch expects"
+import sys
+disc = sys.argv[1]
+def patch(rel, old, new, done):
+    path = f"{disc}/{rel}"
+    s = open(path, "rb").read().decode("latin-1")
+    if done in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"{rel}: expected one '{old}'")
+    open(path, "wb").write(s.replace(old, new).encode("latin-1"))
+patch("!Boot/Choices/Boot/Tasks/PinSetup,feb",
+      "Backdrop -Centre Boot:Resources.!ThemeDefs.Themes.Acorn.Backdrop",
+      "Backdrop -Tile Boot:Resources.!ThemeDefs.Themes.Acorn.BackTile",
+      "Themes.Acorn.BackTile")
+patch("!Boot/Choices/Boot/PreDesk/ThemeSetup,feb",
+      "WimpVisualFlags -RemoveIconBoxes",
+      "WimpVisualFlags -RemoveIconBoxes -NoIconBoxesInTransWindows",
+      "-NoIconBoxesInTransWindows")
+PY
+    backdrop_note="$BACKDROP (the pinboard tiles BackTile, the tagged sprite)"
+    print "backdrop: $BACKDROP; the disc tiles the tagged sprite"
+fi
+
 # The CMOS: the disc's own, with FileSystem HostFS forced so the app
 # boots from the disc whatever the snapshot last said.  The same blob
 # ships as cmos.bin, to seed a disc that has lost its CMOS,ff2.
@@ -205,6 +254,7 @@ pbset CFBundleShortVersionString string "$N"
 pbset CFBundleVersion string "$N"
 pbset NSHighResolutionCapable bool true
 pbset NSHumanReadableCopyright string "Built on QEMU (GPL v2). RISC OS is copyright RISC OS Open Ltd."
+pbset RISCOSBackdrop string "$BACKDROP"
 for k in NSDocumentsFolderUsageDescription NSDesktopFolderUsageDescription NSDownloadsFolderUsageDescription NSRemovableVolumesUsageDescription NSNetworkVolumesUsageDescription; do
     pbset $k string "RISC OS keeps its disc in the folder you chose for it."
 done
@@ -323,7 +373,8 @@ dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     print "           ${resargs:+Acorn boot screen (app/bootfx) spliced in; }spliced sha256 $(sha "$RES/RISCOS.IMG")"
     print "disc       ${FS_ZIP:t} sha256 $(sha "$FS_ZIP")"
     print "           $disc_files files${stripped:+; left off:$stripped}; CMOS forced to FileSystem HostFS"
-    print "minimum    macOS $minos, Apple silicon"
+    print "minimum    macOS $minos, $ARCH_DESC"
+    print "backdrop   $backdrop_note"
     print "signing    $SIGN_ID${NOTARY_PROFILE:+; notarized and stapled}"
     print "libraries  $(ls "$APP/Contents/Frameworks" | tr '\n' ' ')"
 } > "$RES/RELEASE.txt"
@@ -339,7 +390,8 @@ WHAT IT IS
   the app.
 
 YOU NEED
-  A Mac with Apple silicon (M1 or later) running macOS $minos or later.
+  A Mac running macOS $minos or later.  This copy is for $ARCH_DESC Macs;
+  the release page has the other.
 
 INSTALLING
   Drag $NAME to Applications, or run it from wherever it is.
@@ -378,6 +430,8 @@ USING IT
 
 SETTINGS (optional, in Terminal)
   defaults write $ID mode 1920x1200    start the desktop at that size
+  defaults write $ID backdrop acorn-live   a gently moving backdrop;
+                                       or acorn, off, or the path of a picture
   defaults write $ID disc ~/Elsewhere  the disc folder, as the dialog sets it
   defaults delete $ID                  forget both; the app asks again
 
