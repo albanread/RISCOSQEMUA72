@@ -359,6 +359,9 @@ FIRST RUN
   starts and it asks again; move or copy the folder first if you want
   to keep what is in it.
 
+USER GUIDE
+  https://github.com/albanread/Aldershot/blob/main/mac/user-guide.md
+
 USING IT
   Select is a click, Menu is Control-click, Adjust is Command-click.
   Close the window to switch RISC OS off, as you would a real machine.

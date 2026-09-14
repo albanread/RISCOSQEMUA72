@@ -66,6 +66,7 @@ on run argv
     set appName to item 1 of argv
     set offer to item 2 of argv
     set why to item 3 of argv
+    activate    -- in front, not behind whatever window was frontmost at launch
     set msg to why & "RISC OS keeps its disc in a folder on this Mac. What you see inside RISC OS is that folder, and anything you put in the folder appears inside RISC OS." & return & return & "Use the folder " & offer & ", or choose one of your own? A new or empty folder is best: it becomes the disc."
     set answer to display dialog msg buttons {"Choose a Folder…", "Use " & offer} default button 2 with title appName with icon note
     if button returned of answer is "Choose a Folder…" then
@@ -109,7 +110,10 @@ if [[ ! -d "$DISC/!Boot" ]]; then
     [[ -r "$RES/Disc.zip" ]] || fail "There is no RISC OS disc at $DISC, and this app has none to install."
     mkdir -p "$DISC" || fail "Cannot create the disc folder $DISC"
     print -r -- "$APPNAME: installing the disc into $DISC"
-    unzip -q -o "$RES/Disc.zip" -d "$DISC" || fail "Unpacking the disc into $DISC failed"
+    # -n: never overwrite.  The folder is the user's choice and may already
+    # hold files of their own; a name the disc shares with one of them
+    # keeps the user's file.
+    unzip -q -n "$RES/Disc.zip" -d "$DISC" || fail "Unpacking the disc into $DISC failed"
 fi
 [[ -e "$DISC/CMOS,ff2" ]] || cp "$RES/cmos.bin" "$DISC/CMOS,ff2"
 CMOS="$STATE/cmos.bin"
