@@ -33,6 +33,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import re
 import struct
 import sys
 
@@ -123,6 +124,61 @@ def module_title(body):
     return s.decode()
 
 
+def find_resource(data, name):
+    """Locate a ResourceFS file block in the image by its full name, e.g.
+    'Resources.BootFX.1920x1080'.  A block is a 5-word header (offset to
+    the next block, load, exec, length, attributes), the zero-terminated
+    name padded to a word, a size word (length + 4) and the data.  Returns
+    (header offset, data offset, length, block size, load address).
+    """
+    needle = name.encode('latin-1') + b'\0'
+    i = -1
+    while True:
+        i = data.find(needle, i + 1)
+        if i < 0:
+            raise SystemExit(f'mkrom: resource {name} not in the image')
+        hdr = i - 20
+        if hdr < 0:
+            continue
+        nxt, load, _exec, length, _attr = struct.unpack_from('<5I', data, hdr)
+        d = ((i + len(needle) + 3) & ~3) + 4
+        if not (24 < nxt < 0x1000000 and d + length <= hdr + nxt + 4):
+            continue
+        if struct.unpack_from('<I', data, d - 4)[0] != length + 4:
+            continue
+        return hdr, d, length, nxt, load
+
+
+def replace_resources(image, pairs):
+    """Overwrite ResourceFS files in place: NAME=FILE pairs.  The new file
+    must fit the block (up to the room the block has, not just the old
+    length); the length word and the size word are updated and the rest
+    of the block zeroed.  A FILE named with a RISC OS type suffix (',c85')
+    also sets the block's file type.  Nothing moves, so every other offset
+    in the image stays where it was.
+    """
+    out = bytearray(image)
+    for name, path in pairs:
+        hdr, d, length, nxt, load = find_resource(out, name)
+        room = hdr + nxt - d
+        new = open(path, 'rb').read()
+        if len(new) > room:
+            raise SystemExit(f'mkrom: {path} is {len(new)} bytes but '
+                             f'{name} has room for {room}')
+        note = ''
+        m = re.search(r',([0-9a-fA-F]{3})$', os.path.basename(path))
+        if m:
+            t = int(m.group(1), 16)
+            load = (load & 0xFFF000FF) | (t << 8)     # 0xFFFtttdd
+            struct.pack_into('<I', out, hdr + 4, load)
+            note = f', type &{t:03X}'
+        struct.pack_into('<I', out, hdr + 12, len(new))
+        struct.pack_into('<I', out, d - 4, len(new) + 4)
+        out[d:d + room] = new + b'\0' * (room - len(new))
+        print(f'mkrom: {name} <- {path} ({len(new)} of {room} bytes{note})')
+    return bytes(out)
+
+
 def splice(base, module_paths):
     """Append modules to the chain; returns the new image bytes."""
     _flags, image_size = read_header(base)
@@ -177,6 +233,10 @@ def main():
     ap.add_argument('-m', '--module', action='append', default=[],
                     help='module file to append (repeatable; order = '
                          'initialisation order)')
+    ap.add_argument('-r', '--resource', action='append', default=[],
+                    metavar='NAME=FILE',
+                    help='replace a ResourceFS file in place, e.g. '
+                         'Resources.BootFX.1920x1080=splash,c85 (repeatable)')
     ap.add_argument('-o', '--output', help='output image (default: stdout)')
     ap.add_argument('--list', action='store_true',
                     help='list the module chain and exit')
@@ -194,14 +254,23 @@ def main():
               f'footers at {tail:#x}, slack {tail - term - 4} bytes')
         return
 
-    if not args.module:
-        ap.error('no modules given (use -m)')
+    if not args.module and not args.resource:
+        ap.error('nothing to do (use -m and/or -r)')
 
-    out = splice(base, args.module)
-    new_titles, _ = find_chain(out)
-    old_n = len(titles)
-    print(f'mkrom: chain {old_n} -> {len(new_titles)} modules '
-          f'({", ".join(new_titles[old_n:])})')
+    pairs = []
+    for spec in args.resource:
+        if '=' not in spec:
+            ap.error(f'-r wants NAME=FILE, not {spec!r}')
+        pairs.append(tuple(spec.split('=', 1)))
+
+    out = splice(base, args.module) if args.module else base
+    if args.module:
+        new_titles, _ = find_chain(out)
+        old_n = len(titles)
+        print(f'mkrom: chain {old_n} -> {len(new_titles)} modules '
+              f'({", ".join(new_titles[old_n:])})')
+    if pairs:
+        out = replace_resources(out, pairs)
     if out[tail:] != base[tail:]:
         raise SystemExit('internal error: ROM tail changed')
     h = hashlib.sha256(out).hexdigest()[:16]

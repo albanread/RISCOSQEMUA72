@@ -109,8 +109,15 @@ PLIST="$APP/Contents/Info.plist"
 
 # 3. the ROM: the stock image with HostFS and its filer appended to the
 #    module chain -- rom.zsh's splice, done once here instead of at launch
-step "ROM: ${ROM:t} + ${HOSTFS_MODS[1]:t} + ${HOSTFS_MODS[2]:t}"
-python3 "$HERE/mkrom.py" "$ROM" -m "${HOSTFS_MODS[1]}" -m "${HOSTFS_MODS[2]}" -o "$RES/RISCOS.IMG"
+#    -- and the boot screen: BootFX's Raspberry Pi splash, logo and bar
+#    replaced in place by ours (app/bootfx, built by tools/mkbootfx.py)
+BOOTFX="$ROOT/riscos-pi4/app/bootfx"
+resargs=()
+for f in 1920x1080,c85 Logo,c85 Bar24,fca; do
+    [[ -r "$BOOTFX/$f" ]] && resargs+=( -r "Resources.BootFX.${f%%,*}=$BOOTFX/$f" )
+done
+step "ROM: ${ROM:t} + ${HOSTFS_MODS[1]:t} + ${HOSTFS_MODS[2]:t}${resargs:+ + the Acorn boot screen}"
+python3 "$HERE/mkrom.py" "$ROM" -m "${HOSTFS_MODS[1]}" -m "${HOSTFS_MODS[2]}" "${resargs[@]}" -o "$RES/RISCOS.IMG"
 
 # 4. the disc
 step "disc: ${FS_ZIP:t}"
@@ -286,7 +293,7 @@ dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     print "           $("$BIN" --version | head -1)"
     print "ROM        ${ROM:t} sha256 $(sha "$ROM")"
     print "           + HostFS $(modver "${HOSTFS_MODS[1]}"), HostFSFiler $(modver "${HOSTFS_MODS[2]}")"
-    print "           spliced sha256 $(sha "$RES/RISCOS.IMG")"
+    print "           ${resargs:+Acorn boot screen (app/bootfx) spliced in; }spliced sha256 $(sha "$RES/RISCOS.IMG")"
     print "disc       ${FS_ZIP:t} sha256 $(sha "$FS_ZIP")"
     print "           $disc_files files${stripped:+; left off:$stripped}; CMOS forced to FileSystem HostFS"
     print "minimum    macOS $minos, Apple silicon"

@@ -182,6 +182,36 @@ launcher passes its arguments on:
 
     open -n RISCOSQEA72v1.app --args -qmp unix:/tmp/q.sock,server,nowait
 
+## mkbootfx.py — the boot screen
+
+The ROM's BootFX module paints a splash JPEG and a progress bar from
+the first mode change to the desktop, and a logo while the ROM
+initialises; its "Raspberry" set is compiled in, so nothing in `!Boot`
+can change it. `mkbootfx.py` builds our Acorn set from the masters in
+`app/bootfx/` — `splash.svg` and `logo.svg` rendered with `rsvg-convert`
+and made baseline JPEGs by `sips`, and three flat 640×40 sprites
+(border, fill, bar) Squash-compressed with `compress -b 12`, which is
+exactly the stream the ROM's own `Bar24` turns out to be:
+
+    riscos-pi4/tools/mkbootfx.py
+    1920x1080,c85      67367 bytes  (room in the ROM: 116220)
+    Logo,c85            6766 bytes  (room in the ROM: 8141)
+    Bar24,fca           4174 bytes  (room in the ROM: 23004)
+
+`mkrom.py -r NAME=FILE` writes a file over a ResourceFS block in place
+(the length words updated, the rest zeroed, the type taken from a `,xxx`
+suffix), so the three fit where ROOL's were and nothing else in the
+image moves. `rom.zsh` splices them into every launch by default
+(`RISCOS_BOOTFX=` boots with ROOL's), and `make-release.sh` into the
+app's ROM.
+
+One thing this uncovered: a HostFS boot used to wipe the splash and
+scatter fragments of FileSwitch's messages over the boot screen. That
+was FileSwitch's Service_Reset banner: HostFS declared no start-up text,
+and FileSwitch's fallback prints its "UntFS" message straight from the
+compressed message file, VDU codes and all. HostFS 2.05 declares one
+("HostFS 2.05"), as SDFS does ("Piccolo Systems SDFS").
+
 ## Boot probe
 
     python probe.py raspi4b RISCOS.IMG 30 -- -cpu cortex-a72,aarch64=off

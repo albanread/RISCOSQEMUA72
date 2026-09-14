@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <title>Boot screen (BootFX splash, 1920x1080)</title>
+  <desc>Sage ground, the acorn machine mark, the RISC OS wordmark. BootFX draws its progress bar at x 640..1280, y 647..687 (from the top); that band is left clear.</desc>
+  <rect width="1920" height="1080" fill="#B7C0B4"/>
+  <!-- the acorn machine mark (design/art/acorn.svg), centred at 960,360, x9 -->
+  <g transform="translate(960,360) scale(9)">
+    <rect x="-2" y="-16.5" width="4" height="6" fill="#2E5537"/>
+    <path d="M -13 -7 C -15 7 -9 18 0 18 C 9 18 15 7 13 -7 Z" fill="#3C6E47"/>
+    <path d="M -10 -4 C -11 5 -8 13 -4 16" fill="none" stroke="#5A8E62" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="M -15 -7 Q -16 -20 0 -20 Q 16 -20 15 -7 Z" fill="#3C6E47"/>
+    <g>
+      <rect x="-13" y="-11.5" width="5.2" height="3.6" fill="#C0392B"/>
+      <rect x="-7.8" y="-12.5" width="5.2" height="3.6" fill="#D98324"/>
+      <rect x="-2.6" y="-13" width="5.2" height="3.6" fill="#E1B12C"/>
+      <rect x="2.6" y="-12.5" width="5.2" height="3.6" fill="#3C6E47"/>
+      <rect x="7.8" y="-11.5" width="5.2" height="3.6" fill="#2C5A86"/>
+    </g>
+    <path d="M -13 -7 C -15 7 -9 18 0 18 C 9 18 15 7 13 -7 M -15 -7 Q -16 -20 0 -20 Q 16 -20 15 -7 Z"
+          fill="none" stroke="#23262A" stroke-width="1.6" stroke-linejoin="round"/>
+    <rect x="-2" y="-16.5" width="4" height="6.5" fill="none" stroke="#23262A" stroke-width="1.6"/>
+  </g>
+  <!-- the wordmark -->
+  <text x="960" y="610" text-anchor="middle" font-family="Gill Sans" font-weight="600" font-size="88" letter-spacing="8" fill="#23262A">RISC OS</text>
+  <!-- BootFX's progress bar lands here: 640..1280 x 647..687 -->
+  <!-- the credit line -->
+  <text x="960" y="1012" text-anchor="middle" font-family="Gill Sans" font-size="24" letter-spacing="1" fill="#4A5250">RISC OS 5.30 is copyright RISC OS Developments Ltd and developed by RISC OS Open Ltd  ·  riscosopen.org</text>
+</svg>

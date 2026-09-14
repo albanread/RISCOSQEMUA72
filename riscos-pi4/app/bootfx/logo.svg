@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="164" height="164" viewBox="0 0 164 164">
+  <title>Boot logo (BootFX Logo, 164x164, shown at ROM initialisation on the black text screen)</title>
+  <rect width="164" height="164" fill="#000000"/>
+  <g transform="translate(82,84) scale(3.6)">
+    <rect x="-2" y="-16.5" width="4" height="6" fill="#2E5537"/>
+    <path d="M -13 -7 C -15 7 -9 18 0 18 C 9 18 15 7 13 -7 Z" fill="#3C6E47"/>
+    <path d="M -10 -4 C -11 5 -8 13 -4 16" fill="none" stroke="#5A8E62" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="M -15 -7 Q -16 -20 0 -20 Q 16 -20 15 -7 Z" fill="#3C6E47"/>
+    <g>
+      <rect x="-13" y="-11.5" width="5.2" height="3.6" fill="#C0392B"/>
+      <rect x="-7.8" y="-12.5" width="5.2" height="3.6" fill="#D98324"/>
+      <rect x="-2.6" y="-13" width="5.2" height="3.6" fill="#E1B12C"/>
+      <rect x="2.6" y="-12.5" width="5.2" height="3.6" fill="#3C6E47"/>
+      <rect x="7.8" y="-11.5" width="5.2" height="3.6" fill="#2C5A86"/>
+    </g>
+    <path d="M -13 -7 C -15 7 -9 18 0 18 C 9 18 15 7 13 -7 M -15 -7 Q -16 -20 0 -20 Q 16 -20 15 -7 Z"
+          fill="none" stroke="#D9D6CC" stroke-width="1.6" stroke-linejoin="round"/>
+    <rect x="-2" y="-16.5" width="4" height="6.5" fill="none" stroke="#D9D6CC" stroke-width="1.6"/>
+  </g>
+</svg>

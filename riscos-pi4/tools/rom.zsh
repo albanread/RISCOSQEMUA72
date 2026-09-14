@@ -29,6 +29,11 @@
 #                         hostfs/dde/HostFS,ffa hostfs/filer/HostFSFiler,ffa);
 #                         set it empty to splice none.  A module whose title
 #                         is already in RISCOS_MODULES stands instead.
+#   RISCOS_BOOTFX         the boot screen: a directory holding BootFX's three
+#                         resources (1920x1080,c85 Logo,c85 Bar24,fca), written
+#                         over ROOL's Raspberry Pi set in the ROM (mkrom.py -r).
+#                         Default: app/bootfx, the Acorn boot screen; set it
+#                         empty to boot with ROOL's.
 #
 # With no modules to splice, the stock RISCOS.IMG is booted untouched.
 
@@ -72,20 +77,29 @@ rom_to_boot() {
         done
         mods=($add $mods)
     fi
-    (( ${#mods} )) || return 0
+    # The boot screen: BootFX's resources replaced in place
+    local bootfx="${RISCOS_BOOTFX-${here:h}/app/bootfx}" f
+    local -a res resargs
+    if [[ -n "$bootfx" ]]; then
+        for f in 1920x1080,c85 Logo,c85 Bar24,fca; do
+            [[ -r "$bootfx/$f" ]] && res+=("$bootfx/$f")
+        done
+    fi
+    (( ${#mods} || ${#res} )) || return 0
 
-    # Cached under a hash of the stock ROM and every module's contents, so
-    # a module edit rebuilds it and a relaunch does not.
-    key=$( (shasum -a 256 "$ROM" $mods; shasum -a 256 $mods) \
+    # Cached under a hash of the stock ROM and every module's and resource's
+    # contents, so an edit rebuilds it and a relaunch does not.
+    key=$( (shasum -a 256 "$ROM" $mods $res; shasum -a 256 $mods $res) \
            | shasum -a 256 | cut -c1-16 )
     ROM="$images/RISCOS-$key.IMG"
     if [[ ! -e "$ROM" ]]; then
-        print "rom: splicing ${#mods} module(s) -> ${ROM:t}"
+        print "rom: splicing ${#mods} module(s)${res:+, the boot screen} -> ${ROM:t}"
         local -a modargs=( -o "$ROM" )
         for m in $mods; do modargs+=( -m "$m" ); done
+        for f in $res; do modargs+=( -r "Resources.BootFX.${${f:t}%%,*}=$f" ); done
         "$here/mkrom.py" "$images/RISCOS.IMG" $modargs || return 1
     else
-        print "rom: cached ${ROM:t} (${#mods} module(s))"
+        print "rom: cached ${ROM:t} (${#mods} module(s)${res:+, the boot screen})"
     fi
 }
 
