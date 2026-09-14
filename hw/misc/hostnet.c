@@ -187,6 +187,7 @@ static int hn_alloc(HostNetState *s, int fd)
             s->nonblock[i] = false;
             s->async[i] = false;
             s->woke[i] = false;
+            s->connecting[i] = false;
             return i;
         }
     }
@@ -266,27 +267,135 @@ static void hn_sa_out(uint64_t addr, uint64_t lenaddr, bool newform,
 /* ---- readability ------------------------------------------------------ */
 
 /*
- * Is there something to read on this socket?
+ * Readiness, for Select and for the wake-up poll.
  *
- * A one-byte MSG_PEEK rather than select() or poll(), because on Windows
- * QEMU hands out C runtime file descriptors rather than SOCKETs and
- * select() cannot take them, while recv() is one of the calls QEMU wraps
- * — so this is the same code on both platforms and sets errno properly.
- * It answers for datagrams and streams alike: >0 readable, 0 a closed
- * peer (which select calls readable too), -1/EAGAIN not yet.  A real
- * error counts as readable, so that the read itself reports it.
+ * Sprint 1 answered "is it readable?" with a one-byte MSG_PEEK, which is
+ * portable and needs no fd-to-SOCKET translation.  It cannot answer "is it
+ * writable?", and a non-blocking connect() reports completion precisely by
+ * becoming writable, so TCP needs the real thing.
  *
- * Sprint 2 needs writability and exceptions too, which MSG_PEEK cannot
- * answer; that is where this grows a _get_osfhandle()/WSAPoll() path.
+ * The real thing is poll(), and on Windows WSAPoll() — which takes a
+ * SOCKET, not the C runtime file descriptor QEMU hands out.  QEMU builds
+ * those with _open_osfhandle(), so _get_osfhandle() gives the SOCKET back.
+ *
+ * POLLERR and POLLHUP are folded into *both* readable and except: a
+ * connection that failed or closed must wake a reader, so the read itself
+ * can report why, rather than leaving it blocked for ever on a socket that
+ * will never speak again.
  */
+#define HN_R 1u
+#define HN_W 2u
+#define HN_X 4u
+
+static uint32_t hn_ready(int fd, uint32_t want)
+{
+    uint32_t got = 0;
+    short ev = 0, re;
+
+    if (want & HN_R) {
+        ev |= POLLRDNORM;
+    }
+    if (want & HN_W) {
+        ev |= POLLWRNORM;
+    }
+
+#ifdef _WIN32
+    {
+        WSAPOLLFD p;
+
+        p.fd = (SOCKET)_get_osfhandle(fd);
+        p.events = ev;
+        p.revents = 0;
+        if (p.fd == (SOCKET)INVALID_HANDLE_VALUE || WSAPoll(&p, 1, 0) <= 0) {
+            return 0;
+        }
+        re = p.revents;
+    }
+#else
+    {
+        struct pollfd p;
+
+        p.fd = fd;
+        p.events = ev;
+        p.revents = 0;
+        if (poll(&p, 1, 0) <= 0) {
+            return 0;
+        }
+        re = p.revents;
+    }
+#endif
+
+    if (re & (POLLRDNORM | POLLERR | POLLHUP)) {
+        got |= HN_R;
+    }
+    if (re & (POLLWRNORM | POLLERR | POLLHUP)) {
+        got |= HN_W;
+    }
+    if (re & (POLLERR | POLLHUP | POLLPRI)) {
+        got |= HN_X;
+    }
+    return got & (want | HN_X);
+}
+
 static bool hn_readable(int fd)
 {
-    char b;
+    return (hn_ready(fd, HN_R) & HN_R) != 0;
+}
 
-    if (recv(fd, &b, 1, MSG_PEEK) >= 0) {
-        return true;
+/*
+ * macOS has no MSG_NOSIGNAL; it has SO_NOSIGPIPE on the socket instead.
+ * Either way the guest must not be able to kill the emulator by writing
+ * to a connection its peer has closed.
+ */
+static void hn_no_sigpipe(int fd)
+{
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
+/*
+ * Message flags, guest to host.
+ *
+ * Translated, never passed through.  The guest's set and the host's do not
+ * agree beyond the first few bits, and a flag the host does not recognise
+ * is not ignored by it — send() rejects the whole call with EOPNOTSUPP.
+ * That is not hypothetical: c-ares sets 0x400 (its own MSG_NOSIGNAL, a
+ * value RISC OS does not define at all) on every send, and passing it on
+ * made every HTTPS fetch fail at the first byte while the trace showed a
+ * perfectly good connected socket.
+ *
+ * So: the four that mean the same thing on both sides are mapped, and
+ * everything else is dropped. MSG_DONTWAIT needs no mapping because the
+ * socket is already non-blocking.  MSG_NOSIGNAL is added rather than
+ * relayed — a SIGPIPE from a guest writing to a closed socket would take
+ * down the emulator, not the guest.
+ */
+static int hn_msgflags(uint32_t g)
+{
+    int h = 0;
+
+    if (g & 0x1) {
+        h |= MSG_OOB;
     }
-    return !hn_blocked();
+    if (g & 0x2) {
+        h |= MSG_PEEK;
+    }
+    if (g & 0x4) {
+        h |= MSG_DONTROUTE;
+    }
+#ifdef MSG_WAITALL
+    if (g & 0x40) {
+        h |= MSG_WAITALL;
+    }
+#endif
+#ifdef MSG_NOSIGNAL
+    h |= MSG_NOSIGNAL;
+#endif
+    return h;
 }
 
 /* ---- the verbs --------------------------------------------------------- */
@@ -352,6 +461,7 @@ static void hn_creat(HostNetState *s, uint32_t *R, HNReply *r)
     /* Always non-blocking underneath, whatever the guest believes: the
      * doorbell handler holds the BQL and has to return. */
     hn_set_nonblock(fd);
+    hn_no_sigpipe(fd);
     hn_ok(r, id);
 }
 
@@ -400,10 +510,10 @@ static void hn_sendto(HostNetState *s, uint32_t *R, HNReply *r)
             hn_errset(r, ROS_EINVAL);
             return;
         }
-        n = sendto(fd, (char *)buf, len, (int)R[3],
+        n = sendto(fd, (char *)buf, len, hn_msgflags(R[3]),
                    (struct sockaddr *)&sin, sizeof(sin));
     } else {
-        n = send(fd, (char *)buf, len, (int)R[3]);
+        n = send(fd, (char *)buf, len, hn_msgflags(R[3]));
     }
     if (n < 0) {
         if (hn_blocked()) {
@@ -436,7 +546,7 @@ static void hn_recvfrom(HostNetState *s, uint32_t *R, HNReply *r,
     }
     buf = g_malloc(len ? len : 1);
     memset(&sin, 0, sizeof(sin));
-    n = recvfrom(fd, (char *)buf, len, (int)R[3],
+    n = recvfrom(fd, (char *)buf, len, hn_msgflags(R[3]),
                  (struct sockaddr *)&sin, &slen);
     if (n < 0) {
         if (hn_blocked()) {
@@ -455,6 +565,360 @@ static void hn_recvfrom(HostNetState *s, uint32_t *R, HNReply *r,
     hn_ok(r, (int32_t)n);
 }
 
+/*
+ * Connect.
+ *
+ * The host socket is non-blocking, so the first call almost always says
+ * EINPROGRESS.  What the guest does with that depends on what it asked
+ * for: a non-blocking socket gets EINPROGRESS back and is expected to
+ * watch for writability, which is how every BSD program has done this for
+ * thirty years; a blocking one gets HN_RC_RETRY and the module waits.
+ *
+ * On the retry path the second connect() does not start anything — the
+ * connection is already in flight — so it is asked about rather than
+ * repeated: writable means finished, and SO_ERROR says whether it
+ * finished well.  Calling connect() again would report EALREADY or
+ * EISCONN and tell us nothing useful.
+ */
+static void hn_connect(HostNetState *s, uint32_t *R, HNReply *r)
+{
+    int fd = hn_fd(s, R[0]);
+    struct sockaddr_in sin;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (s->connecting[R[0]]) {
+        int err = 0;
+        socklen_t el = sizeof(err);
+
+        if (!(hn_ready(fd, HN_W) & (HN_W | HN_X))) {
+            hn_wouldblock(s, r, R[0]);       /* still on its way */
+            return;
+        }
+        s->connecting[R[0]] = false;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &el) < 0) {
+            hn_fail(r);
+            return;
+        }
+        if (err) {
+            errno = err;
+            hn_fail(r);
+            return;
+        }
+        hn_ok(r, 0);
+        return;
+    }
+    if (!hn_sa_in(R[1], R[2], &sin)) {
+        hn_errset(r, ROS_EINVAL);
+        return;
+    }
+    if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
+        hn_ok(r, 0);
+        return;
+    }
+    if (errno == EINPROGRESS || errno == EALREADY || hn_blocked()) {
+        s->connecting[R[0]] = true;
+        if (s->nonblock[R[0]]) {
+            hn_errset(r, ROS_EINPROGRESS);
+        } else {
+            r->rc = HN_RC_RETRY;
+        }
+        return;
+    }
+    hn_fail(r);
+}
+
+/*
+ * send/recv, and the read/write pair that are the same calls with no
+ * flags (Socket_Read and Socket_Write take no flags argument at all).
+ */
+static void hn_sendrecv(HostNetState *s, uint32_t *R, HNReply *r,
+                        bool sending, bool flags)
+{
+    int fd = hn_fd(s, R[0]);
+    g_autofree uint8_t *buf = NULL;
+    uint32_t len = R[2];
+    int fl = flags ? hn_msgflags(R[3]) : hn_msgflags(0);
+    ssize_t n;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (len > HN_MAX_XFER) {
+        len = HN_MAX_XFER;
+    }
+    buf = g_malloc(len ? len : 1);
+    if (sending) {
+        if (!vmch_guest_rw(R[1], buf, len, false)) {
+            r->rc = HN_RC_BADADDR;
+            return;
+        }
+        n = send(fd, (char *)buf, len, fl);
+    } else {
+        n = recv(fd, (char *)buf, len, fl);
+    }
+    if (n < 0) {
+        if (hn_blocked()) {
+            hn_wouldblock(s, r, R[0]);
+        } else {
+            hn_fail(r);
+        }
+        return;
+    }
+    if (!sending && n > 0 && !vmch_guest_rw(R[1], buf, (uint32_t)n, true)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    hn_ok(r, (int32_t)n);
+}
+
+/*
+ * readv/writev.  The iovec array is in guest memory and so are the buffers
+ * it points at, so both are gathered here into one flat transfer: the host
+ * stack has no interest in where the guest chose to keep its pieces, and
+ * one send() beats iovcnt of them.
+ */
+static void hn_rwv(HostNetState *s, uint32_t *R, HNReply *r, bool sending)
+{
+    int fd = hn_fd(s, R[0]);
+    uint32_t iovcnt = R[2];
+    g_autofree uint32_t *iov = NULL;
+    g_autofree uint8_t *buf = NULL;
+    uint32_t total = 0, off = 0, i;
+    ssize_t n;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (iovcnt > HN_MAX_IOV) {
+        hn_errset(r, ROS_EINVAL);
+        return;
+    }
+    iov = g_malloc0(iovcnt * 8 + 8);          /* {base, len} per entry */
+    if (iovcnt && !vmch_guest_rw(R[1], iov, iovcnt * 8, false)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    for (i = 0; i < iovcnt; i++) {
+        total += iov[i * 2 + 1];
+    }
+    if (total > HN_MAX_XFER) {
+        total = HN_MAX_XFER;
+    }
+    buf = g_malloc(total ? total : 1);
+
+    if (sending) {
+        for (i = 0; i < iovcnt && off < total; i++) {
+            uint32_t n2 = iov[i * 2 + 1];
+
+            if (n2 > total - off) {
+                n2 = total - off;
+            }
+            if (n2 && !vmch_guest_rw(iov[i * 2], buf + off, n2, false)) {
+                r->rc = HN_RC_BADADDR;
+                return;
+            }
+            off += n2;
+        }
+        n = send(fd, (char *)buf, total, hn_msgflags(0));
+    } else {
+        n = recv(fd, (char *)buf, total, hn_msgflags(0));
+    }
+    if (n < 0) {
+        if (hn_blocked()) {
+            hn_wouldblock(s, r, R[0]);
+        } else {
+            hn_fail(r);
+        }
+        return;
+    }
+    if (!sending) {
+        uint32_t left = (uint32_t)n;
+
+        for (i = 0; i < iovcnt && left; i++) {
+            uint32_t n2 = iov[i * 2 + 1];
+
+            if (n2 > left) {
+                n2 = left;
+            }
+            if (n2 && !vmch_guest_rw(iov[i * 2], buf + off, n2, true)) {
+                r->rc = HN_RC_BADADDR;
+                return;
+            }
+            off += n2;
+            left -= n2;
+        }
+    }
+    hn_ok(r, (int32_t)n);
+}
+
+static void hn_shutdown(HostNetState *s, uint32_t *R, HNReply *r)
+{
+    int fd = hn_fd(s, R[0]);
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (shutdown(fd, (int)R[1]) < 0) {
+        hn_fail(r);
+        return;
+    }
+    hn_ok(r, 0);
+}
+
+/* getsockname / getpeername, both ABI forms. */
+static void hn_getname(HostNetState *s, uint32_t *R, HNReply *r,
+                       bool peer, bool newform)
+{
+    int fd = hn_fd(s, R[0]);
+    struct sockaddr_in sin;
+    socklen_t sl = sizeof(sin);
+    int rc;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    memset(&sin, 0, sizeof(sin));
+    rc = peer ? getpeername(fd, (struct sockaddr *)&sin, &sl)
+              : getsockname(fd, (struct sockaddr *)&sin, &sl);
+    if (rc < 0) {
+        hn_fail(r);
+        return;
+    }
+    hn_sa_out(R[1], R[2], newform, &sin);
+    hn_ok(r, 0);
+}
+
+/*
+ * Socket options.
+ *
+ * The numbers agree: Winsock copied BSD, so SO_REUSEADDR is 4 and
+ * SO_ERROR is 0x1007 on RISC OS, Windows and macOS alike, and SOL_SOCKET
+ * is 0xffff everywhere.  They are still translated by name rather than
+ * passed through, because "they happen to match today" is not a contract,
+ * and because the ones we do not understand must be *accepted* rather
+ * than forwarded: a program that cannot set SO_DEBUG should carry on, not
+ * fail.
+ */
+static bool hn_opt(uint32_t level, uint32_t name, int *hlevel, int *hname)
+{
+    if (level == 0xffff) {                    /* SOL_SOCKET */
+        *hlevel = SOL_SOCKET;
+        switch (name) {
+        case 0x0004: *hname = SO_REUSEADDR; return true;
+        case 0x0008: *hname = SO_KEEPALIVE; return true;
+        case 0x0020: *hname = SO_BROADCAST; return true;
+        case 0x0080: *hname = SO_LINGER;    return true;
+        case 0x0100: *hname = SO_OOBINLINE; return true;
+        case 0x1001: *hname = SO_SNDBUF;    return true;
+        case 0x1002: *hname = SO_RCVBUF;    return true;
+        case 0x1007: *hname = SO_ERROR;     return true;
+        case 0x1008: *hname = SO_TYPE;      return true;
+        default: return false;
+        }
+    }
+    if (level == 6) {                         /* IPPROTO_TCP */
+        *hlevel = IPPROTO_TCP;
+        switch (name) {
+        case 0x01: *hname = TCP_NODELAY; return true;
+        default: return false;
+        }
+    }
+    return false;
+}
+
+static void hn_setsockopt(HostNetState *s, uint32_t *R, HNReply *r)
+{
+    int fd = hn_fd(s, R[0]);
+    int hlevel, hname;
+    uint8_t val[32];
+    uint32_t len = R[4];
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (len > sizeof(val)) {
+        len = sizeof(val);
+    }
+    if (len && !vmch_guest_rw(R[3], val, len, false)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    if (!hn_opt(R[1], R[2], &hlevel, &hname)) {
+        hn_ok(r, 0);            /* accepted and ignored, not refused */
+        return;
+    }
+    if (setsockopt(fd, hlevel, hname, (const char *)val, (socklen_t)len) < 0) {
+        hn_fail(r);
+        return;
+    }
+    hn_ok(r, 0);
+}
+
+static void hn_getsockopt(HostNetState *s, uint32_t *R, HNReply *r)
+{
+    int fd = hn_fd(s, R[0]);
+    int hlevel, hname;
+    uint8_t val[32];
+    socklen_t sl = sizeof(val);
+    uint32_t want = R[4] ? hn_ld32(R[4]) : 4;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (!hn_opt(R[1], R[2], &hlevel, &hname)) {
+        hn_errset(r, ROS_ENOPROTOOPT);
+        return;
+    }
+    memset(val, 0, sizeof(val));
+    if (getsockopt(fd, hlevel, hname, (char *)val, &sl) < 0) {
+        hn_fail(r);
+        return;
+    }
+    /*
+     * SO_ERROR is the one that must be translated rather than copied: it
+     * hands back a host errno, and the guest is about to read it as a
+     * 4.4BSD one.
+     */
+    if (hlevel == SOL_SOCKET && hname == SO_ERROR && sl >= 4) {
+        int e;
+        uint32_t ros;
+
+        memcpy(&e, val, 4);
+        if (e) {
+            int save = errno;
+            errno = e;
+            ros = hn_errno();
+            errno = save;
+        } else {
+            ros = 0;
+        }
+        memcpy(val, &ros, 4);
+    }
+    if (want > sl) {
+        want = sl;
+    }
+    if (want > sizeof(val)) {
+        want = sizeof(val);
+    }
+    if (want && !vmch_guest_rw(R[3], val, want, true)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    if (R[4]) {
+        hn_st32(R[4], want);
+    }
+    hn_ok(r, 0);
+}
+
 static void hn_close(HostNetState *s, uint32_t *R, HNReply *r)
 {
     int fd = hn_fd(s, R[0]);
@@ -468,6 +932,7 @@ static void hn_close(HostNetState *s, uint32_t *R, HNReply *r)
     s->nonblock[R[0]] = false;
     s->async[R[0]] = false;
     s->woke[R[0]] = false;
+    s->connecting[R[0]] = false;
     hn_ok(r, 0);
 }
 
@@ -532,22 +997,30 @@ static void hn_ioctl(HostNetState *s, uint32_t *R, HNReply *r)
 static void hn_select(HostNetState *s, uint32_t *R, HNReply *r)
 {
     uint32_t nd = R[0] > HN_MAX_SOCKETS ? HN_MAX_SOCKETS : R[0];
-    uint8_t in[HN_FDSET_BYTES], out[HN_FDSET_BYTES];
-    uint32_t i, count = 0;
+    uint8_t in[3][HN_FDSET_BYTES], out[3][HN_FDSET_BYTES];
+    const uint32_t bit[3] = { HN_R, HN_W, HN_X };
+    uint32_t i, k, count = 0;
 
-    if (!R[1]) {
-        hn_ok(r, 0);            /* nothing asked about, nothing to report */
-        return;
-    }
+    memset(in, 0, sizeof(in));
     memset(out, 0, sizeof(out));
-    if (!vmch_guest_rw(R[1], in, sizeof(in), false)) {
-        r->rc = HN_RC_BADADDR;
-        return;
+    for (k = 0; k < 3; k++) {
+        if (R[1 + k] && !vmch_guest_rw(R[1 + k], in[k], HN_FDSET_BYTES,
+                                       false)) {
+            r->rc = HN_RC_BADADDR;
+            return;
+        }
     }
+
     for (i = 0; i < nd; i++) {
+        uint32_t want = 0, got;
         int fd;
 
-        if (!(in[i >> 3] & (1u << (i & 7)))) {
+        for (k = 0; k < 3; k++) {
+            if (R[1 + k] && (in[k][i >> 3] & (1u << (i & 7)))) {
+                want |= bit[k];
+            }
+        }
+        if (!want) {
             continue;
         }
         fd = hn_fd(s, i);
@@ -555,22 +1028,26 @@ static void hn_select(HostNetState *s, uint32_t *R, HNReply *r)
             hn_errset(r, ROS_EBADF);
             return;
         }
-        if (hn_readable(fd)) {
-            out[i >> 3] |= 1u << (i & 7);
-            count++;
+        got = hn_ready(fd, want);
+        for (k = 0; k < 3; k++) {
+            if ((want & bit[k]) && (got & bit[k])) {
+                out[k][i >> 3] |= 1u << (i & 7);
+                count++;      /* BSD counts each ready bit, not each fd */
+            }
         }
     }
+
+    /*
+     * Only written back when something is ready.  A zero answer leaves the
+     * caller's input sets untouched, which is what lets the module ask
+     * again without rebuilding them — and the module has to ask again,
+     * because the timeout is the caller's and the host cannot wait.
+     */
     if (count) {
-        vmch_guest_rw(R[1], out, sizeof(out), true);
-        /* The write and except sets, if asked for, get nothing this
-         * sprint; they must still be cleared or the caller reads stale
-         * bits as readiness. */
-        memset(out, 0, sizeof(out));
-        if (R[2]) {
-            vmch_guest_rw(R[2], out, sizeof(out), true);
-        }
-        if (R[3]) {
-            vmch_guest_rw(R[3], out, sizeof(out), true);
+        for (k = 0; k < 3; k++) {
+            if (R[1 + k]) {
+                vmch_guest_rw(R[1 + k], out[k], HN_FDSET_BYTES, true);
+            }
         }
     }
     hn_ok(r, (int32_t)count);
@@ -642,6 +1119,22 @@ static void hn_do_swi(HostNetState *s, uint32_t swi, uint32_t *R, HNReply *r)
     case HN_SWI_CLOSE:      hn_close(s, R, r); break;
     case HN_SWI_IOCTL:      hn_ioctl(s, R, r); break;
     case HN_SWI_SELECT:     hn_select(s, R, r); break;
+
+    /* Sprint 2: TCP. */
+    case HN_SWI_CONNECT:    hn_connect(s, R, r); break;
+    case HN_SWI_SEND:       hn_sendrecv(s, R, r, true,  true);  break;
+    case HN_SWI_RECV:       hn_sendrecv(s, R, r, false, true);  break;
+    case HN_SWI_WRITE:      hn_sendrecv(s, R, r, true,  false); break;
+    case HN_SWI_READ:       hn_sendrecv(s, R, r, false, false); break;
+    case HN_SWI_WRITEV:     hn_rwv(s, R, r, true);  break;
+    case HN_SWI_READV:      hn_rwv(s, R, r, false); break;
+    case HN_SWI_SHUTDOWN:   hn_shutdown(s, R, r); break;
+    case HN_SWI_SETSOCKOPT: hn_setsockopt(s, R, r); break;
+    case HN_SWI_GETSOCKOPT: hn_getsockopt(s, R, r); break;
+    case HN_SWI_GETSOCKNAME:   hn_getname(s, R, r, false, false); break;
+    case HN_SWI_GETSOCKNAME_1: hn_getname(s, R, r, false, true);  break;
+    case HN_SWI_GETPEERNAME:   hn_getname(s, R, r, true,  false); break;
+    case HN_SWI_GETPEERNAME_1: hn_getname(s, R, r, true,  true);  break;
 
     case HN_SWI_VERSION:    hn_ok(r, HN_VERSION_VALUE); break;
     case HN_SWI_GETTSIZE:   hn_ok(r, HN_MAX_SOCKETS); break;
@@ -777,6 +1270,9 @@ static void hostnet_reset(DeviceState *dev)
         }
         s->fds[i] = -1;
         s->nonblock[i] = false;
+        s->async[i] = false;
+        s->woke[i] = false;
+        s->connecting[i] = false;
     }
     s->seq = 0;
 }

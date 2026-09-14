@@ -118,6 +118,11 @@
  */
 #define HN_MAX_XFER     (1u << 20)
 
+/* Entries in one readv/writev.  RISC OS's own limit is UIO_MAXIOV; this
+ * only has to be larger than anything real and small enough that a bad
+ * count cannot ask the host for an absurd allocation. */
+#define HN_MAX_IOV      1024
+
 /*
  * The socket SWIs, in chunk order from &41200 — the Internet module's
  * own numbering (Networking/AUN/Internet/build/cmhg/InetHdr).  The six
@@ -176,6 +181,12 @@ struct HostNetState {
     /* Was this socket readable when HN_CMD_POLL last looked?  Only the
      * false->true edge raises an event. */
     bool woke[HN_MAX_SOCKETS];
+
+    /* A non-blocking connect() is in flight.  The second call must ask
+     * whether it finished rather than start it again -- connect() on a
+     * socket already connecting answers EALREADY, which says nothing about
+     * whether it worked. */
+    bool connecting[HN_MAX_SOCKETS];
 };
 
 #endif /* HW_MISC_HOSTNET_H */

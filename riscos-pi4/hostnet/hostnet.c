@@ -141,6 +141,29 @@ static uint32_t os_monotonic(void)
     return r0;
 }
 
+/*
+ * OS_UpCall 6 (SleepNoMore): offer the machine to anyone who can use it
+ * while we wait.  A TaskWindow claims it, lets the Wimp run, and returns;
+ * with nothing to claim it, it returns immediately and the loop is a spin.
+ *
+ * It returns rather than blocking, which is why it can be called on every
+ * turn of the loop with a pollword that never changes — that is exactly
+ * what the Internet module's tsleep() does with taskwindow_sleep().
+ * R1 must still point at a real word: the claimant may read it.
+ */
+static uint32_t upcall_pollword;
+
+static void os_yield(void)
+{
+    register uint32_t r0 __asm("r0") = 6;
+    register uint32_t r1 __asm("r1") = (uint32_t)&upcall_pollword;
+
+    __asm volatile("swi 0x20033"
+                   : "+r"(r0), "+r"(r1)
+                   :
+                   : "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
 /* OS_ReadEscapeState: C set means the user wants out. */
 static uint32_t os_escape(void)
 {
@@ -281,10 +304,12 @@ static uint32_t hn_ring_once(uint32_t swi, unsigned *regs)
  * semantics have always lived, in tsleep()'s spin in the Internet
  * module's lib/c/unixenv.
  *
- * Sprint 1 spins, checking Escape.  A round trip costs microseconds and a
- * DNS answer arrives in tens of milliseconds, so the spin is short, but it
- * does hold the machine.  Sprint 2 replaces it with OS_UpCall 6 and a
- * pollword, the way tsleep does, so a TaskWindow can multitask through it.
+ * Each turn offers the machine to anyone who can use it (OS_UpCall 6, as
+ * tsleep does) and checks Escape.  Outside a TaskWindow nothing claims the
+ * upcall and this is a spin -- which is what a blocking RISC OS SWI has
+ * always been, and why a long timeout still freezes the desktop.  What it
+ * must not do is spin *without* offering, which would stop a TaskWindow
+ * multitasking at all.
  */
 static _kernel_oserror *hn_wait_ring(uint32_t swi, unsigned *regs,
                                      uint32_t *rc_out)
@@ -299,6 +324,7 @@ static _kernel_oserror *hn_wait_ring(uint32_t swi, unsigned *regs,
         if (os_escape()) {
             return sock_error(4);          /* EINTR */
         }
+        os_yield();
     }
 }
 
@@ -387,6 +413,7 @@ static _kernel_oserror *hn_select(unsigned *regs)
         if (os_escape()) {
             return sock_error(4);          /* EINTR */
         }
+        os_yield();
     }
 }
 
