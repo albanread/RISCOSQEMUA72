@@ -400,6 +400,36 @@ one only on the acorn's edge; tiles, a 6016×6016 HEIC picture, both Acorn
 scenes and None all switched from the menu; a resized, stretched window
 keeps the acorn centred and undistorted.
 
+**Cost, measured** (M4 Max, the end-user image with GVFill on). One redraw
+of the whole 800×534 backdrop area costs RISC OS:
+
+| Backdrop | Per full redraw |
+| --- | --- |
+| the old centred watermark, all in RISC OS | 0.118 ms |
+| the tagged tile, 256 px (the default) | 0.156 ms |
+| the tagged tile, 32 px | 0.170 ms |
+| a picture as a cached sprite, all in RISC OS | 0.505 ms |
+| a picture as a JPEG, all in RISC OS | 48.3 ms |
+
+Tiling makes one sprite plot per tile, which is why the bigger tile is
+cheaper; GVFill carries each plot to the host. So against the plain Acorn
+look the layer is neutral, and against a picture drawn inside RISC OS it
+is 3× (sprite) to 300× (JPEG) cheaper, whatever the host shows. The scale
+pass's GPU time per frame, from an offscreen benchmark of this shader:
+
+| Scene | 1646×1156 window | 3840×2160 |
+| --- | --- | --- |
+| off | 0.034 ms | 0.054 ms |
+| acorn | 0.037 ms | 0.095 ms |
+| acorn-live | 0.040 ms | 0.136 ms |
+| picture (4096² image) | 0.140 ms | 0.122 ms |
+| tile | 0.019 ms | 0.058 ms |
+
+The acorn's distance function returns early for a pixel more than a unit
+clear of the mark's bounding box; before that it solved the curve for
+every pixel and cost 0.45 ms at 4K. The output is identical at every size
+tried, from 160×120 to 3840×2160.
+
 **Not done:** the Windows front end (the convention is front-end neutral);
 the *above* tag; wide colour (a float, Display P3 layer, with the guest's
 sRGB converted on the way); modes with rectangular pixels, where the icon

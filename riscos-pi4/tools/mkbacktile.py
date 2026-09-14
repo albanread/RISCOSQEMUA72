@@ -22,7 +22,12 @@ With no backdrop layer -- another front end, or backdrop=off -- the
 tile is simply the sage ground.  Keep KEY and TAG in step with
 METAL_BACKDROP_KEY and the decode shader in ui/metal.m.
 
-    mkbacktile.py --out BackTile,ff9 [--size 32]
+    mkbacktile.py --out BackTile,ff9 [--size 256]
+
+256 pixels is the default because tiling makes one sprite plot per tile:
+an 800x534 backdrop redraw measured 0.156 ms with a 256-pixel tile and
+0.170 ms with a 32-pixel one (M4 Max, GVFill on).  The file is 262 KB
+but a single colour, so the disc zip barely grows.
 """
 import argparse
 import struct
@@ -51,7 +56,7 @@ def tile(size):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--out', required=True, help='the sprite file to write (,ff9)')
-    ap.add_argument('--size', type=int, default=32, help='tile side in pixels (default 32)')
+    ap.add_argument('--size', type=int, default=256, help='tile side in pixels (default 256)')
     a = ap.parse_args()
     data = tile(a.size)
     open(a.out, 'wb').write(data)
