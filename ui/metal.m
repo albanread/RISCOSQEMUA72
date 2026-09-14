@@ -1928,31 +1928,9 @@ int metal_backend_main(void)
 
     /* Returning from here means returning from qemu_main's stand-in, which
      * unwinds main() while the main-loop thread is inside qemu_cleanup() --
-     * the process dies under it.  The main loop calls exit(); outlive it.
-     *
-     * But outlive it awake.  This is the process's main thread, and the
-     * cleanup on the other thread -- CoreAudio stopping its unit, the Metal
-     * layer and the window being torn down, AppKit in general -- can need
-     * the main run loop serviced.  A main thread parked in pause() left
-     * the machine running invisibly after every window close (ROS_PRIVATE
-     * #25); the Apple Events quit never showed it because there the loop
-     * above was still turning.  So keep turning, and if the main loop has
-     * still not ended the process after a decent wait, end it here. */
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+     * the process dies under it.  The main loop calls exit(); outlive it. */
     for (;;) {
-        @autoreleasepool {
-            NSEvent *e = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]
-                                               inMode:NSDefaultRunLoopMode
-                                              dequeue:YES];
-            if (e) {
-                [NSApp sendEvent:e];
-            }
-        }
-        if ([deadline timeIntervalSinceNow] < 0) {
-            metal_log("shutting down: the main loop has not exited in 10 s; exiting");
-            exit(0);
-        }
+        pause();
     }
     return 0;                           /* not reached */
 }
