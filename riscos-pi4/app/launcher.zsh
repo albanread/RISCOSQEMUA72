@@ -1,19 +1,24 @@
 #!/bin/zsh
 #
-# The user launch.  This is Contents/MacOS/<app name> in the release
-# bundle tools/make-release.sh builds.  LaunchServices starts it on a
-# double click and it execs the emulator beside it with the machine's
-# arguments, so the running process is the app itself -- same PID, an
-# executable inside the bundle -- and stays scriptable through the Apple
-# Events surface (SCRIPTING.md).  It opens no QMP socket: this is the
-# user persona of run-app.sh, with the paths settled for an installed app.
+# The user launch.  This is Contents/Resources/launcher.zsh in the release
+# bundle tools/make-release.sh builds; Contents/MacOS/<app name> is the
+# compiled stub (app/launcher.c) LaunchServices starts on a double click,
+# and it execs /bin/zsh on this file.  This in turn execs the emulator
+# with the machine's arguments, so the running process is the app itself
+# -- same PID, an executable inside the bundle -- and stays scriptable
+# through the Apple Events surface (SCRIPTING.md).  It opens no QMP
+# socket: this is the user persona of run-app.sh, with the paths settled
+# for an installed app.
 #
 # What it settles, in order:
 #
-#   the disc    ~/RISCOS, unpacked from the app's Disc.zip the first time
-#               and never touched by a later version.  That folder is the
-#               RISC OS disc: HostFS serves it, both ways.
-#               `defaults write <bundle id> disc /some/where` moves it.
+#   the disc    a folder of the user's choosing, asked for the first time
+#               the app runs (the offer is ~/RISCOS), unpacked from the
+#               app's Disc.zip and never touched by a later version.  That
+#               folder is the RISC OS disc: HostFS serves it, both ways.
+#               The choice is kept in `defaults` under `disc`; holding
+#               Option as the app starts asks again (the stub sets
+#               RISCOS_CHOOSE_DISC), as does a folder that has gone missing.
 #   the CMOS    the disc's own CMOS,ff2 -- HostFS rewrites it after every
 #               *Configure -- copied under a comma-free name, because the
 #               loader's option syntax splits on commas.  The app's
@@ -28,11 +33,11 @@
 #
 set -u
 SELF="${0:A}"
-APPNAME="${SELF:t}"
-CONTENTS="${SELF:h:h}"
+CONTENTS="${SELF:h:h}"           # Contents/Resources/launcher.zsh -> Contents
 RES="$CONTENTS/Resources"
 BIN="$CONTENTS/MacOS/qemu-system-aarch64"
 ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CONTENTS/Info.plist")"
+APPNAME="${RISCOS_APP_NAME:-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$CONTENTS/Info.plist")}"
 BASE="${ID##*.}"                 # com.github.albanread.RISCOSQEA72 -> RISCOSQEA72
 
 pref() { defaults read "$ID" "$1" 2>/dev/null; return 0 }
@@ -52,8 +57,50 @@ fail() {
     exit 1
 }
 
-DISC="$(pref disc)"; DISC="${DISC:-$HOME/RISCOS}"
+# Ask where the disc lives: a dialog with the offer of ~/RISCOS, or a
+# folder chooser.  Cancelling either quits, since there is no disc to boot.
+choose_disc() {
+    local offer="$HOME/RISCOS" why="$1" reply
+    reply=$(osascript - "$APPNAME" "$offer" "$why" <<'EOS' 2>/dev/null
+on run argv
+    set appName to item 1 of argv
+    set offer to item 2 of argv
+    set why to item 3 of argv
+    set msg to why & "RISC OS keeps its disc in a folder on this Mac. What you see inside RISC OS is that folder, and anything you put in the folder appears inside RISC OS." & return & return & "Use the folder " & offer & ", or choose one of your own? A new or empty folder is best: it becomes the disc."
+    set answer to display dialog msg buttons {"Choose a Folder…", "Use " & offer} default button 2 with title appName with icon note
+    if button returned of answer is "Choose a Folder…" then
+        return POSIX path of (choose folder with prompt "Choose the folder that will be the RISC OS disc" default location (path to home folder))
+    else
+        return offer
+    end if
+end run
+EOS
+)
+    if [[ -z "$reply" ]]; then
+        print -r -- "$APPNAME: no disc folder chosen; not starting"
+        exit 0
+    fi
+    DISC="${reply%/}"
+    defaults write "$ID" disc "$DISC"
+    print -r -- "$APPNAME: disc folder chosen: $DISC"
+}
+
+DISC="$(pref disc)"
 MODE="$(pref mode)"
+if [[ -n "${RISCOS_CHOOSE_DISC:-}" ]]; then
+    print -r -- "$APPNAME: Option held at launch: asking for the disc folder"
+    choose_disc ""
+elif [[ -z "$DISC" ]]; then
+    if [[ -d "$HOME/RISCOS/!Boot" ]]; then
+        DISC="$HOME/RISCOS"                    # a disc from before the choice existed
+    else
+        print -r -- "$APPNAME: first run: asking for the disc folder"
+        choose_disc ""
+    fi
+elif [[ ! -d "$DISC" ]]; then
+    print -r -- "$APPNAME: the disc folder $DISC is missing: asking again"
+    choose_disc "The RISC OS disc folder $DISC is not there any more. "
+fi
 
 [[ -x "$BIN" ]] || fail "The emulator is missing from the app: $BIN"
 [[ -r "$RES/RISCOS.IMG" ]] || fail "The ROM is missing from the app: $RES/RISCOS.IMG"

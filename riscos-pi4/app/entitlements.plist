@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The emulator under the hardened runtime (SCRIPTING.md section 3):
+	     TCG writes the code it runs, which MAP_JIT allows only with this. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- What the build signs the bare binary with; kept so the release is
+	     no less than the developer's build. -->
+	<key>com.apple.security.hypervisor</key>
+	<true/>
+</dict>
+</plist>

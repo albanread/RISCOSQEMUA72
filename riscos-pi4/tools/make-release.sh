@@ -5,7 +5,8 @@
 #   <NAME>v<N>.app   the emulator, every library it links, the stock ROM
 #                    with HostFS and its filer spliced in, the end-user
 #                    disc as a zip the app unpacks on first run, and the
-#                    launcher (app/launcher.zsh) that ties them together
+#                    launcher: a compiled stub (app/launcher.c) that runs
+#                    app/launcher.zsh, which ties them together
 #   <NAME>v<N>.dmg   that app, a Read Me and an Applications link
 #   <NAME>v<N>-disc.zip  the cut-down disc on its own, as the app carries it
 #
@@ -30,11 +31,17 @@
 #                 games.  Whatever is left off is also unpinned from the
 #                 Pinboard.  STRIP="" ships the zip as it is.
 #   NO_BUILD=1    do not run ninja first
-#   SIGN_ID       the codesign identity (default "-", ad-hoc).  Ad-hoc is
-#                 enough for local use and for testers who use "Open
-#                 Anyway"; Developer ID with the hardened runtime and
-#                 notarization is SCRIPTING.md section 8, and needs
-#                 --options runtime plus the allow-jit entitlement.
+#   SIGN_ID       the codesign identity.  Default "-": ad-hoc, enough for
+#                 local use and for testers who use "Open Anyway".  A
+#                 "Developer ID Application: ..." identity signs every
+#                 Mach-O with the hardened runtime and a timestamp, the
+#                 emulator with app/entitlements.plist (allow-jit: TCG
+#                 writes the code it runs), as notarization requires.
+#   NOTARY_PROFILE a notarytool keychain profile (xcrun notarytool
+#                 store-credentials <name>, done once by the account
+#                 holder).  With it, and a Developer ID, the app and then
+#                 the disk image are submitted to Apple, waited for, and
+#                 stapled; the build fails if Apple declines.
 #
 # The libraries: Homebrew's dylibs are copied into Contents/Frameworks and
 # every load command that named them -- in the emulator and in each other
@@ -55,6 +62,8 @@ FS_ZIP="${FS_ZIP:-$PRIV/dist/end_user_fs.zip}"
 BIN="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 OUT="${OUT:-$ROOT/build-macos/release}"
 SIGN_ID="${SIGN_ID:--}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+ENTS="$ROOT/riscos-pi4/app/entitlements.plist"
 STRIP_DEFAULT=(
     Apps/DDE Documents/DDE                  # the DDE: licensed to us, not ours to hand out
     Apps/!Store !Boot/Choices/PlingStore    # the Store is not part of this product,
@@ -88,9 +97,10 @@ done
 [[ -r "$ROM" ]]    || die "no stock ROM at $ROM (ROM=...)"
 [[ -r "$FS_ZIP" ]] || die "no end-user disc zip at $FS_ZIP (FS_ZIP=...)"
 for m in $HOSTFS_MODS; do [[ -r "$m" ]] || die "missing module $m"; done
-for f in launcher.zsh Info.plist AppIcon.icns; do
+for f in launcher.zsh launcher.c entitlements.plist Info.plist AppIcon.icns; do
     [[ -r "$ROOT/riscos-pi4/app/$f" ]] || die "missing riscos-pi4/app/$f"
 done
+[[ -n "$NOTARY_PROFILE" && "$SIGN_ID" == "-" ]] && die "NOTARY_PROFILE needs a Developer ID in SIGN_ID"
 
 # 1. the emulator, and its scripting dictionary from the command table
 if [[ -z "${NO_BUILD:-}" ]]; then
@@ -169,8 +179,10 @@ print "$disc_files files, $(du -sh "$STAGE/disc" | cut -f1) unpacked, $(du -h "$
 # 5. the bundle
 step "bundle"
 cp "$BIN" "$APP/Contents/MacOS/qemu-system-aarch64"
-cp "$ROOT/riscos-pi4/app/launcher.zsh" "$APP/Contents/MacOS/$NAME"
-chmod 755 "$APP/Contents/MacOS/$NAME" "$APP/Contents/MacOS/qemu-system-aarch64"
+cp "$ROOT/riscos-pi4/app/launcher.zsh" "$RES/launcher.zsh"
+clang -arch arm64 -mmacosx-version-min=11.0 -O2 -Wall -framework CoreGraphics \
+    -o "$APP/Contents/MacOS/$NAME" "$ROOT/riscos-pi4/app/launcher.c" || die "the launcher stub did not compile"
+chmod 755 "$APP/Contents/MacOS/$NAME" "$APP/Contents/MacOS/qemu-system-aarch64" "$RES/launcher.zsh"
 cp "$ROOT/riscos-pi4/app/AppIcon.icns" "$ROOT/riscos-pi4/app/RISCOSQEMU.sdef" "$RES/"
 cp "$ROOT/riscos-pi4/app/Info.plist" "$PLIST"
 pbset CFBundleExecutable string "$NAME"
@@ -181,6 +193,9 @@ pbset CFBundleShortVersionString string "$N"
 pbset CFBundleVersion string "$N"
 pbset NSHighResolutionCapable bool true
 pbset NSHumanReadableCopyright string "Built on QEMU (GPL v2). RISC OS is copyright RISC OS Open Ltd."
+for k in NSDocumentsFolderUsageDescription NSDesktopFolderUsageDescription NSDownloadsFolderUsageDescription NSRemovableVolumesUsageDescription NSNetworkVolumesUsageDescription; do
+    pbset $k string "RISC OS keeps its disc in the folder you chose for it."
+done
 
 # 6. the libraries
 step "libraries"
@@ -297,7 +312,7 @@ dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     print "disc       ${FS_ZIP:t} sha256 $(sha "$FS_ZIP")"
     print "           $disc_files files${stripped:+; left off:$stripped}; CMOS forced to FileSystem HostFS"
     print "minimum    macOS $minos, Apple silicon"
-    print "signing    ${SIGN_ID}${SIGN_ID:#-}"
+    print "signing    $SIGN_ID${NOTARY_PROFILE:+; notarized and stapled}"
     print "libraries  $(ls "$APP/Contents/Frameworks" | tr '\n' ' ')"
 } > "$RES/RELEASE.txt"
 sed 's/^/  /' "$RES/RELEASE.txt"
@@ -316,18 +331,28 @@ YOU NEED
 
 INSTALLING
   Drag $NAME to Applications, or run it from wherever it is.
+$(if [[ -n "$NOTARY_PROFILE" ]]; then cat <<EON
+  It is signed and notarised, so it opens like any other app; the first
+  time, macOS just confirms that you downloaded it.
+EON
+else cat <<EON
   This release is not notarised, so the first time macOS will decline
   to open it.  Open System Settings > Privacy & Security, scroll down,
   click "Open Anyway", and open it again.  Or, in Terminal:
       xattr -dr com.apple.quarantine /Applications/$NAME.app
+EON
+fi)
 
 FIRST RUN
-  The app installs its disc into a folder called RISCOS in your home
-  folder (~/RISCOS) and boots from it -- about twenty seconds to the
-  desktop.  That folder IS the RISC OS disc: put a file there on the
-  Mac and it is inside RISC OS, as HostFS; save a file in RISC OS and
-  it appears there.  A later version never replaces a disc that is
-  already there.
+  The app asks where to keep the RISC OS disc: a folder called RISCOS
+  in your home folder, or one you choose.  It puts the disc there and
+  boots from it -- about twenty seconds to the desktop.  That folder IS
+  the RISC OS disc: put a file there on the Mac and it is inside RISC
+  OS, as HostFS; save a file in RISC OS and it appears there.  A later
+  version never replaces a disc that is already there.
+  To keep the disc somewhere else, hold down the Option key as the app
+  starts and it asks again; move or copy the folder first if you want
+  to keep what is in it.
 
 USING IT
   Select is a click, Menu is Control-click, Adjust is Command-click.
@@ -338,13 +363,13 @@ USING IT
 
 SETTINGS (optional, in Terminal)
   defaults write $ID mode 1920x1200    start the desktop at that size
-  defaults write $ID disc ~/Elsewhere  keep the disc somewhere else
-  defaults delete $ID                  back to the defaults
+  defaults write $ID disc ~/Elsewhere  the disc folder, as the dialog sets it
+  defaults delete $ID                  forget both; the app asks again
 
 IF SOMETHING GOES WRONG
   ~/Library/Logs/$BASENAME/run.log and metal-debug.txt say what happened.
-  Delete ~/RISCOS/CMOS,ff2 to reset RISC OS's configuration; delete
-  ~/RISCOS to start again from a fresh disc.
+  Delete CMOS,ff2 in the disc folder to reset RISC OS's configuration;
+  delete the folder to start again from a fresh disc.
 
 LICENCES
   Built on QEMU, GNU GPL v2 (https://www.qemu.org).  RISC OS is
@@ -363,20 +388,39 @@ sign() {   # codesign, quiet unless it fails: "replacing existing signature" is 
         die "codesign failed on ${@[-1]}"
     fi
 }
-# the emulator keeps the entitlements it was built and signed with
-ents="$STAGE/entitlements.plist"
-entargs=()
-if codesign -d --entitlements - --xml "$BIN" >"$ents" 2>/dev/null && grep -q '<plist' "$ents"; then
-    entargs=(--entitlements "$ents")
-fi
+signopts=()
+[[ "$SIGN_ID" != "-" ]] && signopts=(--options runtime --timestamp)
 xattr -cr "$APP"
 for f in "$APP"/Contents/Frameworks/*.dylib; do
-    sign -f -s "$SIGN_ID" "$f"
+    sign -f -s "$SIGN_ID" "${signopts[@]}" "$f"
 done
-sign -f -s "$SIGN_ID" "${entargs[@]}" "$APP/Contents/MacOS/qemu-system-aarch64"
-sign -f -s "$SIGN_ID" "$APP"
+sign -f -s "$SIGN_ID" "${signopts[@]}" --entitlements "$ENTS" "$APP/Contents/MacOS/qemu-system-aarch64"
+sign -f -s "$SIGN_ID" "${signopts[@]}" "$APP/Contents/MacOS/$NAME"
+sign -f -s "$SIGN_ID" "${signopts[@]}" "$APP"
 codesign --verify --deep --strict "$APP" || die "the signature does not verify"
-print "signature verifies${entargs:+, with the emulator's entitlements}"
+print "signature verifies (${SIGN_ID}${signopts:+; hardened runtime, timestamped})"
+
+# 9b. notarization: the app first, stapled; the disk image after it is made
+notarize() {   # notarize <file>: submit, wait, insist on Accepted
+    local out="$STAGE/notary-${1:t}.json" id status
+    xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait \
+        --output-format json >"$out" 2>"$STAGE/notary.err" || {
+        cat "$STAGE/notary.err" >&2; die "notarytool submit failed for ${1:t}"
+    }
+    id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$out")
+    status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$out")
+    print "notarization of ${1:t}: $status (submission $id)"
+    if [[ "$status" != "Accepted" ]]; then
+        xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" >&2 || true
+        die "Apple did not accept ${1:t}"
+    fi
+}
+if [[ -n "$NOTARY_PROFILE" ]]; then
+    step "notarizing the app (keychain profile $NOTARY_PROFILE)"
+    ditto -c -k --keepParent "$APP" "$STAGE/$NAME.zip"
+    notarize "$STAGE/$NAME.zip"
+    xcrun stapler staple "$APP" >/dev/null || die "stapling the app failed"
+fi
 
 # 10. the disk image
 step "disk image"
@@ -385,7 +429,18 @@ ditto "$APP" "$STAGE/dmg/$NAME.app"
 ln -s /Applications "$STAGE/dmg/Applications"
 cp "$RES/ReadMe.txt" "$STAGE/dmg/Read Me.txt"
 hdiutil create -volname "$NAME" -srcfolder "$STAGE/dmg" -ov -format UDZO -quiet "$DMG"
+[[ "$SIGN_ID" != "-" ]] && sign -f -s "$SIGN_ID" --timestamp "$DMG"
+if [[ -n "$NOTARY_PROFILE" ]]; then
+    notarize "$DMG"
+    xcrun stapler staple "$DMG" >/dev/null || die "stapling the disk image failed"
+    xcrun stapler validate "$APP" >/dev/null && xcrun stapler validate "$DMG" >/dev/null \
+        && print "staples validate" || die "a staple does not validate"
+fi
 rm -rf "$STAGE"
+
+step "Gatekeeper's verdict"
+spctl --assess --type execute -vv "$APP" 2>&1 | sed 's/^/  /' || true
+[[ -n "$NOTARY_PROFILE" ]] && { spctl --assess --type open --context context:primary-signature -vv "$DMG" 2>&1 | sed 's/^/  /' || true; }
 
 step "done"
 print "app   $APP  ($(du -sh "$APP" | cut -f1))"
