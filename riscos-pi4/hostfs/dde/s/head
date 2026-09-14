@@ -68,7 +68,7 @@ Module_Base
 Flags   DCD     1                               ; bit 0: 32-bit compatible
 
 Title   =       "HostFS", 0
-Help    =       "HostFS", 9, 9, "2.04 (13 Sep 2026)", 0
+Help    =       "HostFS", 9, 9, "2.05 (14 Sep 2026)", 0
         ALIGN
 
 ; *Command table (PRM 1-205).  Information word: byte 0 minimum parameters,
@@ -229,7 +229,7 @@ FSInfoWord      *       220 :OR: (16 :SHL: 8) :OR: (1 :SHL: 26) :OR: (1 :SHL: 23
 
 FSInfo
         DCD     FSName - Module_Base
-        DCD     0                               ; startup text: none
+        DCD     FSStartup - Module_Base         ; startup text: see below
         DCD     FS_Open - Module_Base
         DCD     FS_GetBytes - Module_Base
         DCD     FS_PutBytes - Module_Base
@@ -242,6 +242,19 @@ FSInfo
         DCD     0                               ; extra information word
 
 FSName  =       "HostFS", 0
+        ALIGN
+
+; The startup text is what FileSwitch prints on Service_Reset for the
+; configured filing system, under the memory and processor lines ("Piccolo
+; Systems SDFS" on a card boot).  It is not optional in practice: with the
+; word above zero, FileSwitch (5.30) falls back to its "UntFS" message and
+; prints the pointer MessageTrans hands it for that token -- which, the
+; ROM's message files being compressed, is the raw compressed file.  The
+; run of bytes carries VDU codes (a clear-graphics-window among them), so a
+; HostFS boot wiped BootFX's splash screen and littered the boot screen
+; with fragments of FileSwitch's messages until this line existed.
+FSStartup
+        =       "HostFS 2.05", 0
         ALIGN
 
 ; ---------------------------------------------------------------------------
