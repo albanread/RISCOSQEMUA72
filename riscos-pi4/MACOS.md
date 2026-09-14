@@ -251,8 +251,12 @@ needed yet.
   artwork — the repository carries no third-party material — and a nod to
   RISC OS's cog branding), packed into `riscos-pi4/app/AppIcon.icns` and
   wired through `CFBundleIconFile` and `make-bundle.sh`.
-- **Grab, full screen and the snapshot menu are written but unexercised.**
-  ⌃⌥G, ⌃⌘F and Load Snapshot have not been driven yet.
+- **Load Snapshot is written but unexercised.** Grab and full screen
+  were driven on 14 Sep against the signed release app: ⌃⌥G logs
+  `grab on` and `grab off`, ⌃⌘F takes the window into full screen and
+  out again, ⌘S writes `metal-screenshot-N.png` to Application Support,
+  and ⌘Q and the close button both end the process within a fraction of a
+  second. Load Snapshot has not been driven yet.
 
   Everything else in the input path has been. The pointer, the buttons and
   a window drag went through against a running desktop — the drag is also

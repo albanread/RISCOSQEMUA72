@@ -133,6 +133,11 @@ more:
 - **No ROM inside the bundle.** The licence position in `README.md` is
   unchanged: the ROM and card image stay outside, in `riscos-images/` or a
   directory the settings name, and the bundle ships without them.
+  *Superseded for the user release, 14 Sep 2026:* the owner decided that
+  the end-user app built by `tools/make-release.sh` carries RISC OS Open's
+  5.30 ROM (Apache 2.0) with HostFS spliced in, and a minimal disc, so a
+  user installs nothing else. The developer bundle from `make-bundle.sh`
+  still ships without them.
 
 Signing order is the counter-intuitive part, and it is an agents-first
 conclusion, not a deployment afterthought:
@@ -401,6 +406,23 @@ name, so:
    (a downloaded zip) opens without interaction; the Automation consent
    from the previous build still holds.
 
+**As built, 14 Sep 2026** — for the user release, in
+`tools/make-release.sh` and `tools/sign-release.sh` (`tools/README.md`
+says how to run them). Steps 1–4 are done. The bundle's main executable
+is a compiled stub (`app/launcher.c`), so everything executable in it is
+a signed Mach-O. Every Mach-O is signed with a Developer ID, the hardened
+runtime and a timestamp; the emulator's entitlements are
+`com.apple.security.cs.allow-jit` and the hypervisor entitlement the
+build already carried — `allow-unsigned-executable-memory` was not
+needed, and the hardened emulator boots to a desktop pixel-identical to
+the unsigned build's. The app and its disk image are notarized and
+stapled; Apple accepted both, for Apple silicon and for Intel. Of step 5,
+the first property holds: Gatekeeper accepts a quarantined download of
+the disk image and of the app copied out of it, and
+`syspolicy_check distribution` passes. The second — Automation consent
+surviving an update — waits for a second signed release to measure.
+RISCOSQEA72v1 is published on the Aldershot repository's Releases page.
+
 ## 9. Sprints
 
 Days are estimates in this project's usual sense — a budget, not a
@@ -434,6 +456,8 @@ promise. E0's answers gate E1's shape; nothing else starts before them.
   address (the VCHIQ doorbell write is the test) and steps off it.
 - **E5 — signing and notarization (2 d).** §8 through step 5, scripted.
   Done when the two agent-facing properties hold and are written down.
+  *Done 14 Sep for the user release, bar the consent-across-updates
+  measurement (§8, as built).*
 - **E6 — the agent kit (1–2 d).** `tools/ae-cookbook.md` with osascript
   and JXA examples in the project's voice (boot-and-wait, capture-a-bug,
   snapshot round trip); optionally `aerun`, a PID-addressed raw-AppleEvent
@@ -479,7 +503,9 @@ rest stand.
    (expected) and Developer ID consent surviving an update (expected) —
    two builds, measured, because the sprint order leans on it.
 4. **Hardened runtime vs TCG**: is `allow-jit` alone enough on this
-   build? Minimal-first, add on failure only.
+   build? Minimal-first, add on failure only. *Answered 14 Sep: yes. The
+   release's emulator runs TCG under the hardened runtime with
+   `allow-jit` (and the hypervisor entitlement it already had).*
 5. **Reply size ceiling** for the day PNG bytes ride in the reply
    descriptor; v1 uses paths, but the bound should be known, not found.
 6. **Remote sender detection**: can the received event's address attribute

@@ -145,17 +145,25 @@ two platforms' clocks can be compared with the same instrument.
 
 `make-release.sh` builds the end-user release: one self-contained
 application, `RISCOSQEA72v<N>.app`, and a disk image to hand out. Inside
-the app are the emulator with every Homebrew library it links copied
-into `Contents/Frameworks` and its load commands rewritten (so it runs on
-a Mac with no Homebrew), the stock 5.30 ROM with HostFS and HostFSFiler
-spliced in by `mkrom.py`, the end-user disc as a zip the app unpacks into
-`~/RISCOS` on its first run, and `app/launcher.zsh`, which is what a
-double click starts. It is `run-app.sh`'s user persona — no QMP socket,
-Apple Events the only control channel — with the paths settled for an
-installed app.
+the app are:
+
+- the emulator, with every Homebrew library it links copied into
+  `Contents/Frameworks` and its load commands rewritten, so it runs on a
+  Mac with no Homebrew;
+- the stock 5.30 ROM with HostFS and HostFSFiler spliced in by `mkrom.py`,
+  and the Acorn boot screen (`mkbootfx.py`, below);
+- the end-user disc, as a zip the app unpacks on its first run;
+- the launcher: `app/launcher.c`, a compiled stub that is the bundle's
+  main executable, which runs `app/launcher.zsh`, which execs the
+  emulator — the same process throughout, so the running app stays
+  scriptable. The stub is built for the emulator binary's architecture.
+
+It is `run-app.sh`'s user persona — no QMP socket, Apple Events the only
+control channel — with the paths settled for an installed app.
 
     riscos-pi4/tools/make-release.sh 1
-    FS_ZIP=/path/end_user_fs.zip riscos-pi4/tools/make-release.sh 2
+    SIGN_ID="Developer ID Application: …" NOTARY_PROFILE=<keychain profile> \
+        FS_ZIP=/path/end_user_fs.zip riscos-pi4/tools/make-release.sh 1
 
 The ROM and the disc come from the private repo by default (`ROS_PRIVATE`,
 `ROM` and `FS_ZIP` override). The disc is the end-user zip minus whatever
@@ -163,24 +171,50 @@ The ROM and the disc come from the private repo by default (`ROS_PRIVATE`,
 partition image, Ghostscript, the unused themes, the manuals and the
 games: everything that is not the desktop and its applications, and
 whatever goes is taken off the Pinboard too — with its CMOS forced to
-boot from HostFS. Everything lands
-in `build-macos/release/`: the app, the `.dmg` (app, Read Me, Applications
-link) and the cut-down disc as a zip of its own. `RELEASE.txt` inside the
-app records what went in: commit, ROM and disc hashes, module versions,
-minimum macOS, the libraries. Signing is ad-hoc unless `SIGN_ID` names a
-Developer ID, and the minimum macOS is whatever the newest binary demands
-(26.0 with today's Homebrew bottles).
+boot from HostFS. Everything lands in `build-macos/release/`: the app,
+the `.dmg` (app, Read Me, Applications link) and the cut-down disc as a
+zip of its own. `RELEASE.txt` inside the app records what went in:
+commit, ROM and disc hashes, module versions, minimum macOS, signing, the
+libraries. The minimum macOS is whatever the newest binary demands — 26.0
+with today's Homebrew bottles, on Apple silicon and on Intel alike.
 
-Installed, the app logs to `~/Library/Logs/RISCOSQEA72/` and takes two
-settings from `defaults`:
+**Signing.** With the default `SIGN_ID=-` the app is ad-hoc signed, which
+is enough for local use. A Developer ID in `SIGN_ID` signs every Mach-O
+inside-out — the libraries, the emulator with `app/entitlements.plist`
+(`allow-jit`, which TCG needs, and the hypervisor entitlement the build
+already carries), the stub, then the bundle — with the hardened runtime
+and a timestamp. `NOTARY_PROFILE`, a `notarytool store-credentials`
+keychain profile, then submits the app, staples it, builds and signs the
+disk image, submits and staples that, validates both staples and prints
+Gatekeeper's verdict. The build fails if Apple does not accept either.
+
+**Two machines.** `sign-release.sh` is the signing half on its own, for
+an app assembled on a Mac that does not hold the Developer ID — an Intel
+build, say: `make-release.sh` there with the default ad-hoc signing, then
+`sign-release.sh <app>` on the machine with the identity and the profile.
+Its disk image is named for the architecture, `RISCOSQEA72v<N>-x86_64.dmg`.
+RISCOSQEA72v1 was published that way: the Apple silicon image from
+`make-release.sh` on the M4 Max, the Intel one via `sign-release.sh`.
+
+**Installed**, the app asks on its first run where the disc folder should
+be — `~/RISCOS`, or a folder chosen in a standard chooser — unpacks the
+disc there without overwriting anything already in it, and boots. The
+choice is kept in `defaults`; holding Option as the app starts asks
+again, as does a folder that has gone missing. It logs to
+`~/Library/Logs/RISCOSQEA72/` (every instance shares those files), and
+takes two settings from `defaults`:
 
     defaults write com.github.albanread.RISCOSQEA72 mode 1920x1200
     defaults write com.github.albanread.RISCOSQEA72 disc ~/Elsewhere
 
-A developer can still reach an installed app over QMP, because the
-launcher passes its arguments on:
+`mode` sets the desktop's starting size (verified at 1280x800: the
+framebuffer and the window both come up at that size).
 
-    open -n RISCOSQEA72v1.app --args -qmp unix:/tmp/q.sock,server,nowait
+A developer can still reach an installed app over QMP, because the
+launcher passes its arguments on. Keep the socket path short — a unix
+socket path is limited to 104 bytes — and give each launch its own:
+
+    open -n RISCOSQEA72v1.app --args -qmp unix:/tmp/q1.sock,server,nowait
 
 ## mkbootfx.py — the boot screen
 
