@@ -186,7 +186,7 @@ static int hn_alloc(HostNetState *s, int fd)
             s->fds[i] = fd;
             s->nonblock[i] = false;
             s->async[i] = false;
-            s->woke[i] = false;
+            s->woke[i] = 0;
             s->connecting[i] = false;
             return i;
         }
@@ -287,6 +287,37 @@ static void hn_sa_out(uint64_t addr, uint64_t lenaddr, bool newform,
 #define HN_W 2u
 #define HN_X 4u
 
+/*
+ * The raw answer.  Kept separate from hn_ready because the event path
+ * needs to know *why* a socket woke — readable, urgent or broken are three
+ * different Internet Event reasons — and hn_ready deliberately flattens
+ * that into what select() is allowed to say.
+ */
+static short hn_revents(int fd, short ev)
+{
+#ifdef _WIN32
+    WSAPOLLFD p;
+
+    p.fd = (SOCKET)_get_osfhandle(fd);
+    p.events = ev;
+    p.revents = 0;
+    if (p.fd == (SOCKET)INVALID_HANDLE_VALUE || WSAPoll(&p, 1, 0) <= 0) {
+        return 0;
+    }
+    return p.revents;
+#else
+    struct pollfd p;
+
+    p.fd = fd;
+    p.events = ev;
+    p.revents = 0;
+    if (poll(&p, 1, 0) <= 0) {
+        return 0;
+    }
+    return p.revents;
+#endif
+}
+
 static uint32_t hn_ready(int fd, uint32_t want)
 {
     uint32_t got = 0;
@@ -298,32 +329,7 @@ static uint32_t hn_ready(int fd, uint32_t want)
     if (want & HN_W) {
         ev |= POLLWRNORM;
     }
-
-#ifdef _WIN32
-    {
-        WSAPOLLFD p;
-
-        p.fd = (SOCKET)_get_osfhandle(fd);
-        p.events = ev;
-        p.revents = 0;
-        if (p.fd == (SOCKET)INVALID_HANDLE_VALUE || WSAPoll(&p, 1, 0) <= 0) {
-            return 0;
-        }
-        re = p.revents;
-    }
-#else
-    {
-        struct pollfd p;
-
-        p.fd = fd;
-        p.events = ev;
-        p.revents = 0;
-        if (poll(&p, 1, 0) <= 0) {
-            return 0;
-        }
-        re = p.revents;
-    }
-#endif
+    re = hn_revents(fd, ev);
 
     if (re & (POLLRDNORM | POLLERR | POLLHUP)) {
         got |= HN_R;
@@ -756,6 +762,187 @@ static void hn_rwv(HostNetState *s, uint32_t *R, HNReply *r, bool sending)
     hn_ok(r, (int32_t)n);
 }
 
+static void hn_listen(HostNetState *s, uint32_t *R, HNReply *r)
+{
+    int fd = hn_fd(s, R[0]);
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    if (listen(fd, (int)R[1]) < 0) {
+        hn_fail(r);
+        return;
+    }
+    hn_ok(r, 0);
+}
+
+/*
+ * Accept, both ABI forms.  The new socket gets its own slot, so the guest
+ * sees a descriptor in the same numbering as everything else, and it is
+ * non-blocking from the start like every other socket here — inheriting
+ * the listener's blocking flag would not help, because the host cannot
+ * block either way.
+ */
+static void hn_accept(HostNetState *s, uint32_t *R, HNReply *r, bool newform)
+{
+    int fd = hn_fd(s, R[0]);
+    struct sockaddr_in sin;
+    socklen_t sl = sizeof(sin);
+    int nfd, id;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    memset(&sin, 0, sizeof(sin));
+    nfd = qemu_accept(fd, (struct sockaddr *)&sin, &sl);
+    if (nfd < 0) {
+        if (hn_blocked()) {
+            hn_wouldblock(s, r, R[0]);
+        } else {
+            hn_fail(r);
+        }
+        return;
+    }
+    id = hn_alloc(s, nfd);
+    if (id < 0) {
+        closesocket(nfd);
+        hn_errset(r, ROS_EMFILE);
+        return;
+    }
+    hn_set_nonblock(nfd);
+    hn_no_sigpipe(nfd);
+    hn_sa_out(R[1], R[2], newform, &sin);
+    hn_ok(r, id);
+}
+
+/*
+ * sendmsg / recvmsg, in both ABI forms.
+ *
+ * The two msghdrs differ at the end, not the beginning: Internet 4's
+ * omsghdr is six words ending in access rights, Internet 5's is seven
+ * ending in control data and flags (build/h/inet4 and sys/h/socket).  The
+ * first four words — name, namelen, iov, iovlen — are the same in both,
+ * and they are the only ones that carry data anywhere.  Access rights and
+ * control data are dropped: RISC OS has no file descriptors to pass, and
+ * the library documentation says the old calls ignore the field on entry
+ * anyway.
+ */
+static void hn_msg(HostNetState *s, uint32_t *R, HNReply *r,
+                   bool sending, bool newform)
+{
+    int fd = hn_fd(s, R[0]);
+    uint32_t mh[7];
+    uint32_t words = newform ? 7 : 6;
+    uint32_t name, namelen, iovp, iovcnt;
+    struct sockaddr_in sin;
+    socklen_t sl = sizeof(sin);
+    g_autofree uint32_t *iov = NULL;
+    g_autofree uint8_t *buf = NULL;
+    uint32_t total = 0, off = 0, i;
+    int fl;
+    ssize_t n;
+
+    if (fd < 0) {
+        hn_errset(r, ROS_EBADF);
+        return;
+    }
+    memset(mh, 0, sizeof(mh));
+    if (!vmch_guest_rw(R[1], mh, words * 4, false)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    name = mh[0];
+    namelen = mh[1];
+    iovp = mh[2];
+    iovcnt = mh[3];
+    fl = hn_msgflags(R[2]);
+
+    if (iovcnt > HN_MAX_IOV) {
+        hn_errset(r, ROS_EINVAL);
+        return;
+    }
+    iov = g_malloc0(iovcnt * 8 + 8);
+    if (iovcnt && !vmch_guest_rw(iovp, iov, iovcnt * 8, false)) {
+        r->rc = HN_RC_BADADDR;
+        return;
+    }
+    for (i = 0; i < iovcnt; i++) {
+        total += iov[i * 2 + 1];
+    }
+    if (total > HN_MAX_XFER) {
+        total = HN_MAX_XFER;
+    }
+    buf = g_malloc(total ? total : 1);
+    memset(&sin, 0, sizeof(sin));
+
+    if (sending) {
+        for (i = 0; i < iovcnt && off < total; i++) {
+            uint32_t n2 = iov[i * 2 + 1];
+
+            if (n2 > total - off) {
+                n2 = total - off;
+            }
+            if (n2 && !vmch_guest_rw(iov[i * 2], buf + off, n2, false)) {
+                r->rc = HN_RC_BADADDR;
+                return;
+            }
+            off += n2;
+        }
+        if (name && namelen) {
+            if (!hn_sa_in(name, namelen, &sin)) {
+                hn_errset(r, ROS_EINVAL);
+                return;
+            }
+            n = sendto(fd, (char *)buf, total, fl,
+                       (struct sockaddr *)&sin, sizeof(sin));
+        } else {
+            n = send(fd, (char *)buf, total, fl);
+        }
+    } else {
+        n = recvfrom(fd, (char *)buf, total, fl,
+                     (struct sockaddr *)&sin, &sl);
+    }
+
+    if (n < 0) {
+        if (hn_blocked()) {
+            hn_wouldblock(s, r, R[0]);
+        } else {
+            hn_fail(r);
+        }
+        return;
+    }
+
+    if (!sending) {
+        uint32_t left = (uint32_t)n;
+
+        for (i = 0; i < iovcnt && left; i++) {
+            uint32_t n2 = iov[i * 2 + 1];
+
+            if (n2 > left) {
+                n2 = left;
+            }
+            if (n2 && !vmch_guest_rw(iov[i * 2], buf + off, n2, true)) {
+                r->rc = HN_RC_BADADDR;
+                return;
+            }
+            off += n2;
+            left -= n2;
+        }
+        if (name) {
+            /* msg_namelen is a word in the header, not a pointer to one,
+             * so the length goes back by rewriting that word. */
+            hn_sa_out(name, 0, newform, &sin);
+            hn_st32(R[1] + 4, 16);
+        }
+        if (newform) {
+            hn_st32(R[1] + 24, 0);        /* msg_flags: nothing to report */
+        }
+    }
+    hn_ok(r, (int32_t)n);
+}
+
 static void hn_shutdown(HostNetState *s, uint32_t *R, HNReply *r)
 {
     int fd = hn_fd(s, R[0]);
@@ -931,7 +1118,7 @@ static void hn_close(HostNetState *s, uint32_t *R, HNReply *r)
     s->fds[R[0]] = -1;
     s->nonblock[R[0]] = false;
     s->async[R[0]] = false;
-    s->woke[R[0]] = false;
+    s->woke[R[0]] = 0;
     s->connecting[R[0]] = false;
     hn_ok(r, 0);
 }
@@ -1066,6 +1253,25 @@ static void hn_select(HostNetState *s, uint32_t *R, HNReply *r)
  * same event every tick until the guest got round to it.  Only the
  * not-readable to readable transition counts.
  */
+/* The reasons in one poll's answer, for the trace: "which socket woke and
+ * why" is the whole question when an event-driven program goes quiet. */
+static const char *hn_reasons(const uint32_t *list, uint32_t n)
+{
+    static char buf[128];
+    static const char *name[4] = { "?", "async", "urgent", "broken" };
+    uint32_t i, off = 0;
+
+    for (i = 0; i < n && off + 24 < sizeof(buf); i++) {
+        uint32_t reason = (list[i] >> 8) & 0xFF;
+
+        off += snprintf(buf + off, sizeof(buf) - off, " fd%u=%s:%u",
+                        list[i] & 0xFF,
+                        name[reason < 4 ? reason : 0], list[i] >> 16);
+    }
+    buf[off] = 0;
+    return buf;
+}
+
 static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
 {
     uint32_t list[HN_POLL_MAX];
@@ -1073,14 +1279,36 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
     int i;
 
     for (i = 0; i < HN_MAX_SOCKETS; i++) {
+        short re;
         bool now;
+        uint32_t reason;
 
         if (s->fds[i] < 0 || !s->async[i]) {
-            s->woke[i] = false;
+            s->woke[i] = 0;
             continue;
         }
-        now = hn_readable(s->fds[i]);
-        if (now && !s->woke[i] && n < HN_POLL_MAX) {
+        re = hn_revents(s->fds[i], POLLRDNORM);
+        now = (re & (POLLRDNORM | POLLPRI | POLLERR | POLLHUP)) != 0;
+
+        /*
+         * Which of the three reasons this is.  The order matters: a socket
+         * that has broken is broken whatever else is true of it, and out-of
+         * -band data outranks ordinary data — a program watching for urgent
+         * data wants to hear about it before it is told there is something
+         * to read.
+         */
+        if (re & (POLLERR | POLLHUP)) {
+            reason = HN_EV_BROKEN;
+        } else if (re & POLLPRI) {
+            reason = HN_EV_URGENT;
+        } else {
+            reason = HN_EV_ASYNC;
+        }
+
+        if (!now) {
+            reason = 0;
+        }
+        if (reason && reason != s->woke[i] && n < HN_POLL_MAX) {
             struct sockaddr_in sin;
             socklen_t sl = sizeof(sin);
             uint32_t port = 0;
@@ -1089,9 +1317,9 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
             if (getsockname(s->fds[i], (struct sockaddr *)&sin, &sl) == 0) {
                 port = ntohs(sin.sin_port);
             }
-            list[n++] = (port << 16) | (uint32_t)i;
+            list[n++] = (port << 16) | (reason << 8) | (uint32_t)i;
         }
-        s->woke[i] = now;
+        s->woke[i] = (uint8_t)reason;
     }
     if (n) {
         vmch_guest_rw(base + HN_HDR_SIZE, list, n * 4, true);
@@ -1101,7 +1329,8 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
          * from the guest, and they have completely different causes. */
         static uint32_t polls;
         if (n || polls < 3 || (polls % 200) == 0) {
-            hn_trace("hostnet: POLL #%u -> %u ready\n", polls, n);
+            hn_trace("hostnet: POLL #%u -> %u ready%s\n", polls, n,
+                     n ? hn_reasons(list, n) : "");
         }
         polls++;
     }
@@ -1135,6 +1364,15 @@ static void hn_do_swi(HostNetState *s, uint32_t swi, uint32_t *R, HNReply *r)
     case HN_SWI_GETSOCKNAME_1: hn_getname(s, R, r, false, true);  break;
     case HN_SWI_GETPEERNAME:   hn_getname(s, R, r, true,  false); break;
     case HN_SWI_GETPEERNAME_1: hn_getname(s, R, r, true,  true);  break;
+
+    /* Sprint 3: listeners, and the message calls in both ABI forms. */
+    case HN_SWI_LISTEN:     hn_listen(s, R, r); break;
+    case HN_SWI_ACCEPT:     hn_accept(s, R, r, false); break;
+    case HN_SWI_ACCEPT_1:   hn_accept(s, R, r, true);  break;
+    case HN_SWI_SENDMSG:    hn_msg(s, R, r, true,  false); break;
+    case HN_SWI_SENDMSG_1:  hn_msg(s, R, r, true,  true);  break;
+    case HN_SWI_RECVMSG:    hn_msg(s, R, r, false, false); break;
+    case HN_SWI_RECVMSG_1:  hn_msg(s, R, r, false, true);  break;
 
     case HN_SWI_VERSION:    hn_ok(r, HN_VERSION_VALUE); break;
     case HN_SWI_GETTSIZE:   hn_ok(r, HN_MAX_SOCKETS); break;
@@ -1271,7 +1509,7 @@ static void hostnet_reset(DeviceState *dev)
         s->fds[i] = -1;
         s->nonblock[i] = false;
         s->async[i] = false;
-        s->woke[i] = false;
+        s->woke[i] = 0;
         s->connecting[i] = false;
     }
     s->seq = 0;

@@ -492,6 +492,30 @@ static void os_remove_ticker(uint32_t code, uint32_t r12)
                    : "r2", "r3", "r12", "lr", "cc", "memory");
 }
 
+/*
+ * Service_InternetStatus (&B0), reason 0 = AddressChanged: the stack is up
+ * and has an address.
+ *
+ * Emitted once at init for form's sake.  Everything that used to listen
+ * for it -- Freeway, Net, the DHCP client, LanManFS -- is unplugged in a
+ * HostNet machine, so nothing is expected to answer; a program loaded
+ * later that waits for it would otherwise wait for ever.
+ *
+ * Only AddressChanged.  InterfaceUpDown wants a device information block
+ * in R4, and there is no interface and no DIB to point at; handing a
+ * listener a null one would be worse than staying quiet.
+ */
+static void os_service_internetstatus(void)
+{
+    register uint32_t r0 __asm("r0") = 0;      /* AddressChanged */
+    register uint32_t r1 __asm("r1") = 0xB0;   /* Service_InternetStatus */
+
+    __asm volatile("swi 0x20030"
+                   : "+r"(r0), "+r"(r1)
+                   :
+                   : "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
 /* OS_GenerateEvent: R0 event, R1 reason, R2 socket, R3 local port. */
 static void os_generate_event(uint32_t ev, uint32_t reason,
                               uint32_t sock, uint32_t port)
@@ -557,8 +581,12 @@ void hostnet_c_callback(void)
     for (i = 0; i < n; i++) {
         uint32_t w = pollreq[H_WORDS + i];
 
-        /* Event_Internet 19, reason 1 = SocketAsync, R2 socket, R3 port. */
-        os_generate_event(19, 1, w & 0xFFFFu, w >> 16);
+        /*
+         * Event_Internet is 19; the host packed the rest into one word --
+         * port in the top half, reason in the middle byte, descriptor in
+         * the bottom.  R1 reason, R2 socket, R3 local port.
+         */
+        os_generate_event(19, (w >> 8) & 0xFFu, w & 0xFFu, w >> 16);
         event_count++;
     }
 }
@@ -584,6 +612,10 @@ int hostnet_init(void *ws)
     /* From here the module asks the host, fifty times a second, whether
      * anything has woken.  Nothing else will: the host cannot call in. */
     os_call_every(HN_TICK_CS, (uint32_t)hostnet_tick, static_base());
+
+    /* And tell anyone listening that there is a working stack, which from
+     * their point of view is what has just happened. */
+    os_service_internetstatus();
     return 0;
 }
 

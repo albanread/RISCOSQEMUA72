@@ -70,12 +70,25 @@
  * read, which would bury the guest in events.
  *
  * The answer is a count in HN_HDR_RESULT and that many words from
- * HN_HDR_SIZE, each (local port << 16) | descriptor -- R2 and R3 of the
- * event, ready to use.
+ * HN_HDR_SIZE, each
+ *
+ *     (local port << 16) | (reason << 8) | descriptor
+ *
+ * which is R3, R1 and R2 of the event, ready to use.  The descriptor fits
+ * in eight bits because there are 256 of them, which leaves the middle
+ * byte free for the reason.
  */
 #define HN_CMD_POLL     2
 
 #define HN_POLL_MAX     16      /* sockets reported in one tick */
+
+/*
+ * Internet Event 19's reason codes, from the Internet module's
+ * lib/c/unixenv: SIGIO, SIGURG and SIGPIPE as a RISC OS program sees them.
+ */
+#define HN_EV_ASYNC     1       /* something to read */
+#define HN_EV_URGENT    2       /* out-of-band data */
+#define HN_EV_BROKEN    3       /* the connection has gone */
 
 /* transport result codes.  A socket call that fails for an ordinary
  * networking reason is HN_RC_OK with HN_HDR_ERRNO set: that is not a
@@ -178,9 +191,18 @@ struct HostNetState {
     bool async[HN_MAX_SOCKETS];
     uint32_t owner[HN_MAX_SOCKETS];     /* FIOSETOWN / FIOGETOWN */
 
-    /* Was this socket readable when HN_CMD_POLL last looked?  Only the
-     * false->true edge raises an event. */
-    bool woke[HN_MAX_SOCKETS];
+    /*
+     * What HN_CMD_POLL last reported about this socket: 0 for nothing, or
+     * one of HN_EV_*.  An event is raised when this *changes*, not merely
+     * when the socket is readable.
+     *
+     * A plain readable/not-readable edge is not enough, and the difference
+     * is not academic: a socket that has data and then breaks stays
+     * readable throughout, so tracking readability alone reports the first
+     * wake and silently swallows the disconnection -- which is the one a
+     * program most needs to hear about.
+     */
+    uint8_t woke[HN_MAX_SOCKETS];
 
     /* A non-blocking connect() is in flight.  The second call must ask
      * whether it finished rather than start it again -- connect() on a
