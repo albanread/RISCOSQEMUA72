@@ -27,14 +27,21 @@
 
 /*
  * poll() and its POLL* flags live in <poll.h>, which qemu/osdep.h does not
- * pull in on macOS; and a socket is closed with closesocket() only on
- * Windows (WinSock) — on POSIX it is plain close().  qemu/osdep.h already
- * declares close() (via <unistd.h>).
+ * pull in on macOS.
+ *
+ * Every socket here comes from qemu_socket()/qemu_accept(), which on
+ * Windows return a C runtime descriptor wrapping the SOCKET
+ * (_open_osfhandle, util/oslib-win32.c) — not the SOCKET itself.  The
+ * right close for that is close(), which os-win32.h maps to
+ * qemu_close_wrap(): it frees the descriptor and closes the SOCKET
+ * beneath it.  Winsock's own closesocket() would take the descriptor for
+ * a SOCKET, fail, and leak both.  So closesocket() is close() on every
+ * host.
  */
 #ifndef _WIN32
 #include <poll.h>
-#define closesocket close
 #endif
+#define closesocket close
 
 /*
  * RISC OS's errno values are 4.4BSD's (Lib/TCPIPLibs/headers/sys/h/errno,
