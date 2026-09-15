@@ -26,7 +26,7 @@ What an agent can do to the app today, and what each path costs:
 
 | Path | Has | Lacks |
 | --- | --- | --- |
-| QMP over TCP (`run-macos.sh` opens 127.0.0.1:4455) | everything QMP has: `stop`, `cont`, `screendump`, `human-monitor-command`, `savevm` | a client that speaks the greeting/capabilities dance; identity (dies with the PID); any consent model |
+| QMP over a unix socket (`run-macos.sh` opens `${TMPDIR:-/tmp}/riscos-qmp.sock`) | everything QMP has: `stop`, `cont`, `screendump`, `human-monitor-command`, `savevm` | a client that speaks the greeting/capabilities dance (`tools/qmpunix.py`); identity (dies with the PID); any consent model |
 | HMP through that | `x/i`, `info registers`, the lot, via `human-monitor-command` | same as above, plus parsing prose |
 | gdbstub | breakpoints, single-step | a gdb/lldb client per session; no app-level state |
 | `-trace`, logs, `ticks.py` | measurement | read-only, host-side files |

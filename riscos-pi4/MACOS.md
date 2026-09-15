@@ -310,7 +310,7 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -device usb-tablet,bus=usb-bus.0,port=1.2 \
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 \
     -display metal,vsync=30 \
-    -qmp tcp:127.0.0.1:4455,server,nowait
+    -qmp unix:${TMPDIR:-/tmp}/riscos-qmp.sock,server,nowait
 ```
 
 `-display metal` takes `vsync=N` (default 30), `scaling=linear|sharp|nearest`

@@ -13,18 +13,22 @@
 #   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
 #                  guest (FSDESIGN.md); unset leaves the doorbell
 #                  device present but file commands off
-#   RISCOS_QMP     the -qmp chardev (default tcp:127.0.0.1:4455,server,nowait).
-#                  Two machines cannot share a port; give each its own,
-#                  or a unix socket: unix:/path/qmp.sock,server,nowait
+#   RISCOS_QMP     the -qmp chardev (default a unix socket,
+#                  ${TMPDIR:-/tmp}/riscos-qmp.sock).  A unix socket, not a
+#                  loopback TCP port, because QMP has no authentication and
+#                  the guest can reach a loopback port: with HostNet in one
+#                  Socket_Connect, through slirp's 10.0.2.2 even without it
+#                  (ROS_PRIVATE#34).  Two machines cannot share a socket;
+#                  give each its own path
 #   RISCOS_NAME    -name, so a machine is identifiable in ps and its window
 #   RISCOS_PIDFILE -pidfile, so a machine can be stopped without touching
 #                  anyone else's.  Stop machines by pidfile or QMP quit,
 #                  never by process name: pkill -f qemu-system-aarch64
 #                  kills every session on the host.
 #
-# Everything above defaults to exactly what this script did before, so a
-# plain run-macos.sh is unchanged.  tools/instance.sh builds on these to
-# run several isolated machines at once.
+# Everything above defaults to what this script did before, apart from
+# RISCOS_QMP, whose tcp default moved to a unix socket (see below).
+# tools/instance.sh builds on these to run several isolated machines.
 #   RISCOS_MODULES space-separated module files spliced into the ROM
 #                  before boot; a share (RISCOS_HOSTFS) also splices the
 #                  HostFS module.  See rom.zsh.  With neither, the stock
@@ -64,7 +68,7 @@ args=(
     -audiodev "$AUDIODEV",id=snd0
     -global bcm2835-vchiq.audiodev=snd0
     -display "$DISPLAY_OPT"
-    -qmp "${RISCOS_QMP:-tcp:127.0.0.1:4455,server,nowait}"
+    -qmp "${RISCOS_QMP:-unix:${TMPDIR:-/tmp}/riscos-qmp.sock,server,nowait}"
 )
 [[ -n "${RISCOS_NAME:-}" ]] && args+=(-name "$RISCOS_NAME")
 [[ -n "${RISCOS_PIDFILE:-}" ]] && args+=(-pidfile "$RISCOS_PIDFILE")

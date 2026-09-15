@@ -4,12 +4,12 @@
     farm.py create              make (or repair) all four instances
     farm.py up alpha            start one
     farm.py up all              start all four
-    farm.py status              which are running, on which port
+    farm.py status              which are running
     farm.py shot alpha          screendump to its screen/ directory
     farm.py hmp alpha "info registers"
     farm.py down bravo          stop one politely, then firmly
     farm.py reset charlie       throw away its disc writes, keep the share
-    farm.py ls                  names, ports and paths
+    farm.py ls                  names and paths
 
 Why a farm rather than four copies of run.py: three things are shared by
 default and every one of them is a way for two machines to corrupt each
@@ -21,9 +21,11 @@ other's work.
   - **The HostFS share.**  This is how a compiler gets binaries into the
     guest and results back out, so two machines sharing one host directory
     would overwrite each other's build outputs.  Each gets its own.
-  - **The control port.**  QMP is how anything drives the machine; one port
-    means one machine.  run.py's 4461 is deliberately left alone so a hand
-    session can still use it while the farm runs.
+  - **The control socket.**  QMP is how anything drives the machine; one
+    socket means one machine.  A unix socket in each instance directory,
+    not a loopback TCP port: QMP has no authentication, and the guest can
+    reach a loopback port -- with HostNet in one Socket_Connect, through
+    slirp's 10.0.2.2 even without it (ROS_PRIVATE#34).
 
 Headless by default.  Four windows is not a thing anyone wants, and driving
 a window means posting messages at it, which moves the real mouse pointer.
@@ -35,11 +37,11 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
 
+import qmpunix
 import rom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,13 +65,8 @@ FARM = r"F:\RISCOSDEV\qemu-farm"
 MINGW_BIN = r"F:\RISCOSDEV\msys64\mingw64\bin"
 
 # Named rather than numbered, because "charlie is wedged" is a sentence and
-# "instance 2 is wedged" is a lookup.  4461 belongs to run.py.
-INSTANCES = [
-    ("alpha", 4471),
-    ("bravo", 4472),
-    ("charlie", 4473),
-    ("delta", 4474),
-]
+# "instance 2 is wedged" is a lookup.
+INSTANCES = ["alpha", "bravo", "charlie", "delta"]
 
 
 def child_env():
@@ -93,20 +90,14 @@ def paths(name):
         "logs": os.path.join(d, "logs"),
         "screen": os.path.join(d, "screen"),
         "log": os.path.join(d, "logs", "qemu.log"),
+        "qmp": os.path.join(d, "qmp.sock"),
     }
-
-
-def port_of(name):
-    for n, p in INSTANCES:
-        if n == name:
-            return p
-    raise SystemExit(f"no instance called {name!r}; try: farm.py ls")
 
 
 def resolve(which):
     if which in ("all", None):
-        return [n for n, _ in INSTANCES]
-    if which not in [n for n, _ in INSTANCES]:
+        return list(INSTANCES)
+    if which not in INSTANCES:
         raise SystemExit(f"no instance called {which!r}; try: farm.py ls")
     return [which]
 
@@ -114,27 +105,26 @@ def resolve(which):
 # --------------------------------------------------------------------- QMP
 
 
-def qmp_connect(port, timeout=2.0):
-    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-    f = s.makefile("rb")
+def qmp_connect(sock, timeout=2.0):
+    f = qmpunix.connect(sock, timeout=timeout)
     f.readline()                                   # greeting
-    s.sendall(b'{"execute":"qmp_capabilities"}\n')
+    f.write(b'{"execute":"qmp_capabilities"}\n')
     f.readline()
-    return s, f
+    return f
 
 
-def qmp_execute(port, command, arguments=None, timeout=30.0):
+def qmp_execute(sock, command, arguments=None, timeout=30.0):
     """One QMP command. Raises if the machine is not listening."""
-    s, f = qmp_connect(port, timeout=timeout)
+    f = qmp_connect(sock, timeout=timeout)
     try:
         request = {"execute": command}
         if arguments:
             request["arguments"] = arguments
-        s.sendall(json.dumps(request).encode() + b"\n")
+        f.write(json.dumps(request).encode() + b"\n")
 
         deadline = time.time() + timeout
         while time.time() < deadline:
-            s.settimeout(max(0.1, deadline - time.time()))
+            f.settimeout(max(0.1, deadline - time.time()))
             line = f.readline()
             if not line:
                 raise RuntimeError("QMP closed")
@@ -148,13 +138,13 @@ def qmp_execute(port, command, arguments=None, timeout=30.0):
                 raise RuntimeError(message["error"]["desc"])
         raise TimeoutError(command)
     finally:
-        s.close()
+        f.close()
 
 
-def is_up(port):
+def is_up(sock):
     try:
-        s, _ = qmp_connect(port, timeout=0.6)
-        s.close()
+        f = qmp_connect(sock, timeout=0.6)
+        f.close()
         return True
     except OSError:
         return False
@@ -166,7 +156,7 @@ def is_up(port):
 def create(args):
     os.makedirs(FARM, exist_ok=True)
 
-    for name, port in INSTANCES:
+    for name in INSTANCES:
         p = paths(name)
         for key in ("dir", "share", "logs", "screen"):
             os.makedirs(p[key], exist_ok=True)
@@ -186,12 +176,12 @@ def create(args):
         marker = os.path.join(p["share"], "WhoAmI,fff")
         if not os.path.exists(marker):
             with open(marker, "w", newline="\r") as fh:
-                fh.write(f"{name}\rQMP port {port}\r")
+                fh.write(f"{name}\rQMP socket {p['qmp']}\r")
 
         with open(p["config"], "w", encoding="utf-8") as fh:
             json.dump({
                 "name": name,
-                "qmp_port": port,
+                "qmp": p["qmp"],
                 "base_image": BASE_IMAGE,
                 "kernel": KERNEL,
                 "cmos": CMOS,
@@ -199,7 +189,7 @@ def create(args):
                 "share": p["share"],
             }, fh, indent=2)
 
-        print(f"{name:<8} port {port}  overlay {made}  {p['dir']}")
+        print(f"{name:<8} {p['qmp']}  overlay {made}  {p['dir']}")
 
     print()
     print("Base image is shared read-only; each overlay holds only that "
@@ -210,7 +200,7 @@ def create(args):
 # ---------------------------------------------------------------------- up
 
 
-def command_line(name, port, display, audiodev, kernel, cmos, card=True):
+def command_line(name, display, audiodev, kernel, cmos, card=True):
     p = paths(name)
     argv = [
         QEMU,
@@ -231,7 +221,7 @@ def command_line(name, port, display, audiodev, kernel, cmos, card=True):
         "-global", "bcm2835-vchiq.audiodev=snd0",
         "-display", display,
         "-serial", "null",
-        "-qmp", f"tcp:127.0.0.1:{port},server,nowait",
+        "-qmp", f"unix:{p['qmp']},server,nowait",
         "-global", f"bcm2838-peripherals.vmchannel-root={p['share']}",
     ]
     # No card at all: the share is the whole machine.  It needs to hold a
@@ -245,7 +235,6 @@ def up(args):
     failures = 0
 
     for name in resolve(args.which):
-        port = port_of(name)
         p = paths(name)
 
         if not args.no_card and not os.path.exists(p["overlay"]):
@@ -253,8 +242,8 @@ def up(args):
             failures += 1
             continue
 
-        if is_up(port):
-            print(f"{name:<8} already up on {port}")
+        if is_up(p["qmp"]):
+            print(f"{name:<8} already up ({p['qmp']})")
             continue
 
         # Which ROM and CMOS this machine boots.  run.py follows the Mac
@@ -278,11 +267,16 @@ def up(args):
             failures += 1
             continue
 
-        argv = command_line(name, port, args.display, args.audiodev,
+        argv = command_line(name, args.display, args.audiodev,
                             kernel, cmos, card=not args.no_card)
         log = open(p["log"], "ab", buffering=0)
         log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"{' '.join(argv)}\n".encode())
+
+        # A crashed machine leaves its socket file behind, and a unix
+        # bind on an existing path fails, so clear the way first.
+        if os.path.exists(p["qmp"]):
+            os.remove(p["qmp"])
 
         # Detached, so the machine outlives this script.
         flags = 0
@@ -306,15 +300,16 @@ def up(args):
         # booted". Booting the desktop takes tens of seconds.
         for _ in range(60):
             time.sleep(0.5)
-            if is_up(port):
+            if is_up(p["qmp"]):
                 break
             if process.poll() is not None:
                 break
 
-        if is_up(port):
-            print(f"{name:<8} up   pid {process.pid}  qmp {port}")
+        if is_up(p["qmp"]):
+            print(f"{name:<8} up   pid {process.pid}  qmp {p['qmp']}")
         else:
-            print(f"{name:<8} FAILED to listen on {port}; see {p['log']}")
+            print(f"{name:<8} FAILED to listen on {p['qmp']}; "
+                  f"see {p['log']}")
             failures += 1
 
     return 1 if failures else 0
@@ -325,30 +320,31 @@ def up(args):
 
 def down(args):
     for name in resolve(args.which):
-        port = port_of(name)
+        p = paths(name)
+        sock = p["qmp"]
 
-        if not is_up(port):
+        if not is_up(sock):
             print(f"{name:<8} not running")
             continue
 
         try:
-            qmp_execute(port, "quit", timeout=5)
+            qmp_execute(sock, "quit", timeout=5)
         except (OSError, RuntimeError, TimeoutError):
             pass                       # quit closes the socket under us
 
         for _ in range(20):
             time.sleep(0.25)
-            if not is_up(port):
+            if not is_up(sock):
                 break
 
-        if is_up(port):
+        if is_up(sock):
             print(f"{name:<8} did not quit; killing by window name")
             subprocess.run(
                 ["taskkill", "/FI", f"WINDOWTITLE eq riscos-{name}", "/F"],
                 capture_output=True)
             time.sleep(1)
 
-        print(f"{name:<8} {'down' if not is_up(port) else 'STILL UP'}")
+        print(f"{name:<8} {'down' if not is_up(sock) else 'STILL UP'}")
 
     return 0
 
@@ -357,10 +353,10 @@ def down(args):
 
 
 def status(args):
-    print(f"{'name':<8} {'qmp':>5}  {'state':<9} {'overlay':>9}  share")
-    for name, port in INSTANCES:
+    print(f"{'name':<8} {'state':<9} {'overlay':>9}  share")
+    for name in INSTANCES:
         p = paths(name)
-        live = is_up(port)
+        live = is_up(p["qmp"])
 
         size = "-"
         if os.path.exists(p["overlay"]):
@@ -369,15 +365,15 @@ def status(args):
         state = "running" if live else (
             "stopped" if os.path.exists(p["overlay"]) else "not made")
 
-        print(f"{name:<8} {port:>5}  {state:<9} {size:>9}  {p['share']}")
+        print(f"{name:<8} {state:<9} {size:>9}  {p['share']}")
     return 0
 
 
 def ls(args):
-    for name, port in INSTANCES:
+    for name in INSTANCES:
         p = paths(name)
         print(f"{name}")
-        print(f"    qmp      127.0.0.1:{port}")
+        print(f"    qmp      {p['qmp']}")
         print(f"    overlay  {p['overlay']}")
         print(f"    share    {p['share']}")
         print(f"    log      {p['log']}")
@@ -389,23 +385,22 @@ def ls(args):
 
 def shot(args):
     for name in resolve(args.which):
-        port = port_of(name)
-        if not is_up(port):
+        p = paths(name)
+        if not is_up(p["qmp"]):
             print(f"{name:<8} not running")
             continue
-        p = paths(name)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         out = os.path.join(p["screen"], f"{stamp}.ppm")
-        qmp_execute(port, "screendump", {"filename": out})
+        qmp_execute(p["qmp"], "screendump", {"filename": out})
         print(f"{name:<8} {out}")
     return 0
 
 
 def hmp(args):
-    port = port_of(args.which)
-    if not is_up(port):
+    p = paths(args.which)
+    if not is_up(p["qmp"]):
         raise SystemExit(f"{args.which} is not running")
-    print(qmp_execute(port, "human-monitor-command",
+    print(qmp_execute(p["qmp"], "human-monitor-command",
                       {"command-line": args.command}))
     return 0
 
@@ -415,8 +410,8 @@ def hmp(args):
 
 def reset(args):
     for name in resolve(args.which):
-        port = port_of(name)
-        if is_up(port):
+        p = paths(name)
+        if is_up(p["qmp"]):
             print(f"{name:<8} is running; stop it first (farm.py down {name})")
             continue
 

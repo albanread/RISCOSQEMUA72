@@ -16,18 +16,20 @@ window's system menu gains "Load snapshot", which rewinds to the
 snapshot named "desktop" however the emulator was started.
 
 Paths assume the development tree layout: QEMU build at <repo>/build,
-ROM and card image under F:/RISCOSDEV/roms.  QMP listens on 4461;
-everything is overridable with --qemu, --kernel, --cmos, --image.
+ROM and card image under F:/RISCOSDEV/roms.  QMP listens on a unix
+socket beside the emulator (run-qmp.sock) -- not a TCP port the guest
+could reach; everything is overridable with --qemu, --kernel, --cmos,
+--image.
 """
 
 import argparse
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
 
+import qmpunix
 import rom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -93,7 +95,7 @@ def command_line(args, overlay):
         "-display", "dx11" + (",backdrop=" + args.backdrop
                               if args.backdrop else ""),
         "-serial", "null",
-        "-qmp", "tcp:127.0.0.1:4461,server,nowait",
+        "-qmp", "unix:" + qmp_sock_for(args.qemu) + ",server,nowait",
     ]
     # No card at all is a real configuration now, not a broken one: a share
     # can hold !Boot and the DDE and be the whole machine.
@@ -107,31 +109,41 @@ def command_line(args, overlay):
     return argv
 
 
-def qmp_call(cmd, timeout=30):
+def qmp_sock_for(qemu):
+    """The QMP endpoint beside the emulator it belongs to.  A unix
+    socket, not a loopback port: QMP has no authentication, and the
+    guest can reach a loopback port -- with HostNet in one
+    Socket_Connect, through slirp's 10.0.2.2 even without it
+    (ROS_PRIVATE#34)."""
+    return os.path.join(os.path.dirname(os.path.abspath(qemu)),
+                        "run-qmp.sock")
+
+
+def qmp_call(cmd, timeout=30, sock=None):
     """One HMP command over QMP; returns its reply as text."""
-    s = socket.create_connection(("127.0.0.1", 4461), timeout=timeout)
-    f = s.makefile("rb")
-    f.readline()
-    s.sendall(b'{"execute":"qmp_capabilities"}\n')
-    f.readline()
-    s.sendall(json.dumps({"execute": "human-monitor-command",
-                          "arguments": {"command-line": cmd}}).encode() + b"\n")
-    while True:
-        s.settimeout(timeout)
-        line = f.readline()
-        if not line:
-            s.close()
-            raise RuntimeError("QMP closed")
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            continue
-        if "return" in msg:
-            s.close()
-            return msg["return"]
-        if "error" in msg:
-            s.close()
-            raise RuntimeError(msg["error"]["desc"])
+    f = qmpunix.connect(sock or qmp_sock_for(QEMU), timeout=timeout)
+    try:
+        f.readline()
+        f.write(b'{"execute":"qmp_capabilities"}\n')
+        f.readline()
+        f.write(json.dumps({"execute": "human-monitor-command",
+                            "arguments": {"command-line": cmd}}).encode()
+                + b"\n")
+        while True:
+            f.settimeout(timeout)
+            line = f.readline()
+            if not line:
+                raise RuntimeError("QMP closed")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "return" in msg:
+                return msg["return"]
+            if "error" in msg:
+                raise RuntimeError(msg["error"]["desc"])
+    finally:
+        f.close()
 
 
 def post_escape():
@@ -175,6 +187,7 @@ def wait_for_desktop(qemu_path, deadline_s=300):
     builddir = os.path.dirname(os.path.abspath(qemu_path))
     poll = os.path.join(builddir, "run-poll.ppm")
     log = os.path.join(builddir, "dx11-debug.txt")
+    sock = qmp_sock_for(qemu_path)
     deadline = time.time() + deadline_s
     escaped = False
     prev = None
@@ -182,7 +195,7 @@ def wait_for_desktop(qemu_path, deadline_s=300):
 
     while time.time() < deadline:
         try:
-            qmp_call("screendump run-poll.ppm", timeout=5)
+            qmp_call("screendump run-poll.ppm", timeout=5, sock=sock)
             body = open(poll, "rb").read().split(b"\n", 3)[3]
         except (OSError, RuntimeError):
             time.sleep(0.5)
@@ -296,6 +309,11 @@ def main():
 
     argv = command_line(args, overlay)
     print(" ".join(argv), flush=True)
+    # A crashed emulator leaves its socket file behind, and a unix bind
+    # on an existing path fails, so clear the way first.
+    stale = qmp_sock_for(args.qemu)
+    if os.path.exists(stale):
+        os.remove(stale)
     # The emulator writes its debug log, screendumps and window
     # screenshots to its CWD: keep that the build tree, as everywhere
     # else in the tooling.
@@ -306,7 +324,7 @@ def main():
 
     if args.save:
         if wait_for_desktop(args.qemu):
-            qmp_call(f"savevm {args.save}")
+            qmp_call(f"savevm {args.save}", sock=qmp_sock_for(args.qemu))
             print(f"saved snapshot '{args.save}'; emulator keeps running",
                   flush=True)
         else:

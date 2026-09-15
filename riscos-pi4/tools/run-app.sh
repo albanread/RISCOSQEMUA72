@@ -58,7 +58,7 @@ args=(
 [[ -e "$IMAGES/card.img" ]] && \
     args+=(-drive file="$IMAGES/card.img",if=sd,format=raw,snapshot=on)
 [[ -n "${WITH_QMP:-}" ]] && \
-    args+=(-qmp tcp:127.0.0.1:4455,server,nowait)
+    args+=(-qmp "unix:${TMPDIR:-/tmp}/riscos-qmp-app.sock,server,nowait")
 [[ -n "${RISCOS_HOSTFS:-}" ]] && \
     args+=(-global "bcm2838-peripherals.vmchannel-root=$RISCOS_HOSTFS")
 

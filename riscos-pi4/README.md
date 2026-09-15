@@ -373,7 +373,7 @@ qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
     -global bcm2835-vchiq.audiodev=snd0 \
     -global bcm2838-peripherals.vmchannel-root=$HOME/riscos-share \
     -display dx11 \
-    -qmp tcp:127.0.0.1:4455,server,nowait
+    -qmp unix:/tmp/riscos-qmp.sock,server,nowait
 ```
 
 Things worth knowing about that line:
@@ -504,15 +504,17 @@ known-good state, and so four builds can run without waiting for each other.
     python riscos-pi4/tools/farm.py down bravo
     python riscos-pi4/tools/farm.py reset charlie   throw away its disc writes
 
-| machine | QMP | state |
+| machine | QMP socket | state |
 |---|---|---|
-| alpha | 127.0.0.1:4471 | `F:\RISCOSDEV\qemu-farm\alpha` |
-| bravo | 127.0.0.1:4472 | `...\bravo` |
-| charlie | 127.0.0.1:4473 | `...\charlie` |
-| delta | 127.0.0.1:4474 | `...\delta` |
+| alpha | `F:\RISCOSDEV\qemu-farm\alpha\qmp.sock` | `F:\RISCOSDEV\qemu-farm\alpha` |
+| bravo | `...\bravo\qmp.sock` | `...\bravo` |
+| charlie | `...\charlie\qmp.sock` | `...\charlie` |
+| delta | `...\delta\qmp.sock` | `...\delta` |
 
-4461 is left free deliberately, so `run.py` still works by hand while the
-farm is up.
+The sockets are unix sockets, not TCP ports, so nothing running in the
+guest can reach them: QMP has no authentication, and a loopback port
+would be one `Socket_Connect` away with HostNet, or reachable through
+slirp's 10.0.2.2 alias without it.
 
 Three things are shared by default and each is a way for two machines to
 corrupt each other's work, so each instance gets its own:
@@ -526,8 +528,9 @@ corrupt each other's work, so each instance gets its own:
   overwrite each other's output. Each share holds a `WhoAmI` file naming
   its machine, which is worth more than it sounds when you are looking at
   four identical desktops.
-- **The control port.** QMP is how anything drives a machine; one port
-  means one machine.
+- **The control socket.** QMP is how anything drives a machine; one
+  socket means one machine, and a unix socket is one the guest cannot
+  reach.
 
 Headless by default. Four windows is not something anyone wants, and
 driving a window means posting messages at it, which moves the real mouse

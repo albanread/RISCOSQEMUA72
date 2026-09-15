@@ -51,10 +51,12 @@ take.
 
     qemu-system-aarch64 -M raspi4b -cpu cortex-a72,aarch64=off \
         -kernel RISCOS.IMG -display none -serial null \
-        -qmp tcp:127.0.0.1:4455,server,nowait \
+        -qmp unix:/tmp/riscos-qmp.sock,server,nowait \
         -d unimp,guest_errors -trace enable=bcm2835_mbox* -D q.log
 
-Driving it: QMP over TCP. `human-monitor-command` gives `info registers`,
+Driving it: QMP over a unix socket (a loopback TCP port would be
+reachable from the guest, and QMP has no authentication).
+`human-monitor-command` gives `info registers`,
 `x/16i <addr>` and `xp/16wx <addr>`; `screendump` writes a PNG (pass
 `format:"png"` — the default is still PPM).
 
