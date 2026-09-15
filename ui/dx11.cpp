@@ -2788,7 +2788,17 @@ extern "C" int dx11_glue_composite_get(uint32_t *w, uint32_t *h,
     comp.want = true;
     LeaveCriticalSection(&comp.lock);
 
-    WaitForSingleObject(comp.ready, wait_ms < 0 ? 0 : (DWORD)wait_ms);
+    if (WaitForSingleObject(comp.ready, wait_ms < 0 ? 0 : (DWORD)wait_ms)
+        != WAIT_OBJECT_0) {
+        /* Nothing arrived in the window.  Say so, rather than hand back
+         * whatever an earlier capture left in comp.pixels: QMP screendump
+         * would present that stale frame as the screen's present state,
+         * and a window that draws nothing -- minimised, or waiting on a
+         * swap-chain slot -- is exactly when this fires.  The caller
+         * falls back to the guest framebuffer (ROS_PRIVATE#38). */
+        LeaveCriticalSection(&comp.turn);
+        return 0;
+    }
 
     EnterCriticalSection(&comp.lock);
     if (!comp.pixels || !comp.w || !comp.h) {
