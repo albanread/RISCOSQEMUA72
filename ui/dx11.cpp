@@ -142,6 +142,10 @@ static const wchar_t DX11_TITLE[] = L"RISC OS 5 — Raspberry Pi 4 (QEMU)";
 /* System-menu id for the snapshot entry (SC_* ids live at 0xF000+). */
 #define DX11_SC_LOADSNAP 0x0100
 
+/* ... and for the HostNet switch, and the note under it. */
+#define DX11_SC_HOSTNET      0x0110
+#define DX11_SC_HOSTNET_NOTE 0x0120
+
 /* Development log: dx11-debug.txt next to the CWD, one line per notable
  * event, so failures on a windowed app are not lost to OutputDebugString. */
 static void dx11_log(const char *fmt, ...)
@@ -168,6 +172,10 @@ static void backdrop_build_menu(void);
 static bool backdrop_command(UINT id);
 static void backdrop_attach_menu(void);
 static HMENU backdrop_menu_handle(void);
+
+/* The HostNet switch in the window menu, defined after the Backdrop menu. */
+static void hostnet_build_menu(HMENU sm);
+static void hostnet_command(void);
 
 /* ------------------------------------------------------------------ */
 /* Grab: the guest owns the keyboard and the pointer until Ctrl+Alt+G  */
@@ -440,10 +448,21 @@ static LRESULT CALLBACK dx11_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
             backdrop_build_menu();
             return 0;
         }
+        /* The window menu itself: HostNet's item follows its module file,
+         * which Explorer or RISC OS can move as easily as the menu can.
+         * The system still gets the message, to grey Move, Size and the
+         * rest as it always does. */
+        if (HIWORD(l) && (HMENU)w == GetSystemMenu(h, FALSE)) {
+            hostnet_build_menu((HMENU)w);
+        }
         return DefWindowProcW(h, msg, w, l);
     case WM_SYSCOMMAND:
         if ((w & 0xfff0) == DX11_SC_LOADSNAP) {
             dx11_glue_load_snapshot();
+            return 0;
+        }
+        if ((w & 0xfff0) == DX11_SC_HOSTNET) {
+            hostnet_command();
             return 0;
         }
         if (backdrop_command((UINT)(w & 0xfff0))) {
@@ -1188,6 +1207,74 @@ static bool backdrop_command(UINT id)
         }
     }
     return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* The HostNet switch                                                   */
+
+/*
+ * One item in the window menu, ticked while HostNet is on.  The switch is
+ * where HostNet's module sits on the share -- Modules or Modules\Disabled
+ * (ui/dx11.c has the detail) -- so the item is there only when the module
+ * is in one of the two, and a machine with nothing to switch shows none.
+ *
+ * Rebuilt each time the window menu opens.  Under it, greyed, a note
+ * whenever what the menu says is not what RISC OS is running -- which the
+ * device knows, because HostNet rings it fifty times a second.
+ */
+static void hostnet_build_menu(HMENU sm)
+{
+    int state = dx11_glue_hostnet_state();
+    const wchar_t *note = nullptr;
+
+    DeleteMenu(sm, DX11_SC_HOSTNET, MF_BYCOMMAND);
+    DeleteMenu(sm, DX11_SC_HOSTNET_NOTE, MF_BYCOMMAND);
+    if (state == DX11_HOSTNET_NONE) {
+        return;
+    }
+
+    bool on = state & DX11_HOSTNET_ON;
+    bool lit = state & DX11_HOSTNET_LIT;
+    bool running = state & DX11_HOSTNET_RUNNING;
+
+    AppendMenuW(sm, MF_STRING | (on ? MF_CHECKED : MF_UNCHECKED),
+                DX11_SC_HOSTNET, L"HostNet");
+    if (on && !running) {
+        /* Dark only if the file was moved by hand rather than from this
+         * menu; the launcher lights it at the next start. */
+        note = lit ? L"On when RISC OS next starts"
+                   : L"On when you quit and start again";
+    } else if (!on && running) {
+        note = L"Off when RISC OS next starts";
+    }
+    if (note) {
+        AppendMenuW(sm, MF_STRING | MF_GRAYED | MF_DISABLED,
+                    DX11_SC_HOSTNET_NOTE, note);
+    }
+}
+
+static void hostnet_command(void)
+{
+    int state = dx11_glue_hostnet_state();
+    bool on;
+    char why[1024];
+
+    if (state == DX11_HOSTNET_NONE) {
+        return;                     /* moved away since the menu opened */
+    }
+    on = !(state & DX11_HOSTNET_ON);
+    if (dx11_glue_hostnet_switch(on, why, sizeof(why)) == 0) {
+        dx11_log("hostnet: switched %s", on ? "on" : "off");
+        return;
+    }
+    dx11_log("hostnet: %s", why);
+
+    wchar_t wwhy[1024];
+
+    if (!MultiByteToWideChar(CP_UTF8, 0, why, -1, wwhy, 1024)) {
+        wcscpy(wwhy, L"The module could not be moved.");
+    }
+    MessageBoxW(dx11.hwnd, wwhy, L"HostNet", MB_ICONWARNING | MB_OK);
 }
 
 /* Shaders: one source, one decode variant per format                  */

@@ -1418,6 +1418,10 @@ static void hn_ring(HostNetState *s, uint64_t base)
     uint32_t swi;
 
     s->seq = hn_ld32(base + HN_HDR_SEQ);
+    /* Its ticker rings fifty times a second, so within a tick of starting
+     * this says HostNet is loaded -- which the window menu cannot tell from
+     * where the module file is, once the file has moved. */
+    s->rung = true;
 
     if (cmd == HN_CMD_PING) {
         hn_st32(base + HN_HDR_RESULT, HN_MAGIC_VALUE);
@@ -1543,6 +1547,7 @@ static void hostnet_reset(DeviceState *dev)
         s->connecting[i] = false;
     }
     s->seq = 0;
+    s->rung = false;
 }
 
 static void hostnet_realize(DeviceState *dev, Error **errp)

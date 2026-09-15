@@ -19,6 +19,7 @@
 #include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_vsyncgen.h"
 #include "hw/misc/bcm2835_vchiq.h"
+#include "hw/misc/hostnet.h"
 #include "migration/snapshot.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -313,6 +314,127 @@ void dx11_glue_load_snapshot(void)
         dx11_loadvm_bh = qemu_bh_new(dx11_loadvm_bh_fn, NULL);
     }
     qemu_bh_schedule(dx11_loadvm_bh);
+}
+
+/* ------------------------------------------------------------------ */
+/* The HostNet switch, from the window's system menu                   */
+
+/*
+ * HostNet is switched by where its module is on the share, not by a
+ * setting (ROS_PRIVATE docs/hostnet.md):
+ *
+ *     Modules\HostNet,ffa            on.  !Boot's PreDesk.HostModules
+ *                                    RMLoads every ,ffa in Modules, and a
+ *                                    module titled Internet replaces the
+ *                                    ROM's Internet module as it loads
+ *     Modules\Disabled\HostNet,ffa   off.  HostModules neither descends
+ *                                    into Disabled nor loads a directory
+ *
+ * The menu moves the file and the launcher reads where it is, so the
+ * machine's disc and the emulator's switches cannot drift apart.  The
+ * paths go through GLib, as vmchannel's do, so the share root means here
+ * exactly what it means to HostFS.
+ */
+#define DX11_HOSTNET_LEAF "HostNet,ffa"
+
+static HostNetState *dx11_hostnet_device(void)
+{
+    Object *obj = object_resolve_path_type("", TYPE_HOSTNET, NULL);
+
+    return obj ? HOSTNET(obj) : NULL;
+}
+
+/* The share's Modules folder, or NULL on a machine with no share. */
+static char *dx11_hostnet_modules(void)
+{
+    Object *obj = object_resolve_path_type("", "bcm2838-peripherals", NULL);
+    char *root, *dir = NULL;
+
+    if (!obj) {
+        return NULL;
+    }
+    root = object_property_get_str(obj, "vmchannel-root", NULL);
+    if (root && root[0]) {
+        dir = g_build_filename(root, "Modules", NULL);
+    }
+    g_free(root);
+    return dir;
+}
+
+int dx11_glue_hostnet_state(void)
+{
+    HostNetState *hn = dx11_hostnet_device();
+    g_autofree char *dir = dx11_hostnet_modules();
+    g_autofree char *on = NULL, *off = NULL;
+    int state;
+
+    if (!hn || !dir) {
+        return DX11_HOSTNET_NONE;
+    }
+    on = g_build_filename(dir, DX11_HOSTNET_LEAF, NULL);
+    off = g_build_filename(dir, "Disabled", DX11_HOSTNET_LEAF, NULL);
+    if (g_file_test(on, G_FILE_TEST_IS_REGULAR)) {
+        state = DX11_HOSTNET_ON;
+    } else if (g_file_test(off, G_FILE_TEST_IS_REGULAR)) {
+        state = 0;
+    } else {
+        return DX11_HOSTNET_NONE;
+    }
+    if (hn->enabled) {
+        state |= DX11_HOSTNET_LIT;
+    }
+    if (hn->rung) {
+        state |= DX11_HOSTNET_RUNNING;
+    }
+    return state;
+}
+
+/*
+ * Either way the switch takes effect when RISC OS next starts.  Off needs
+ * nothing more here: the launcher attaches the card whichever way the
+ * switch lies, so the ROM's stack has it after a restart.
+ *
+ * On also lights the doorbell, which the launcher leaves dark while
+ * HostNet is off.  Dark, restarting RISC OS would RMLoad HostNet against
+ * no host: the kernel kills the ROM's Internet module before the
+ * newcomer's initialisation runs, HostNet then declines, and the machine
+ * is left with no Internet module at all.
+ *
+ * Off never darkens it: a HostNet already running is still serving this
+ * session's sockets.  The next start of the emulator leaves it dark.
+ */
+int dx11_glue_hostnet_switch(bool on, char *why, size_t why_len)
+{
+    HostNetState *hn = dx11_hostnet_device();
+    g_autofree char *dir = dx11_hostnet_modules();
+    g_autofree char *disabled = NULL, *from = NULL, *to = NULL;
+
+    if (!hn || !dir) {
+        g_snprintf(why, why_len, "This machine has no HostFS share, so "
+                   "there is no Modules folder to keep HostNet in.");
+        return -1;
+    }
+    disabled = g_build_filename(dir, "Disabled", NULL);
+    from = g_build_filename(on ? disabled : dir, DX11_HOSTNET_LEAF, NULL);
+    to = g_build_filename(on ? dir : disabled, DX11_HOSTNET_LEAF, NULL);
+
+    if (!g_file_test(from, G_FILE_TEST_IS_REGULAR)) {
+        g_snprintf(why, why_len, "%s is not there any more.", from);
+        return -1;
+    }
+    if (g_mkdir_with_parents(on ? dir : disabled, 0755) != 0
+        || (g_file_test(to, G_FILE_TEST_EXISTS) && g_remove(to) != 0)
+        || g_rename(from, to) != 0) {
+        g_snprintf(why, why_len, "Cannot move %s to %s: %s", from, to,
+                   g_strerror(errno));
+        return -1;
+    }
+    if (on) {
+        bql_lock();
+        hn->enabled = true;
+        bql_unlock();
+    }
+    return 0;
 }
 
 /*

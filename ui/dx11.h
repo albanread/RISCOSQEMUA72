@@ -150,6 +150,24 @@ void dx11_glue_composite_done(void);
  * system menu; the load itself runs as a bottom half on the main loop. */
 void dx11_glue_load_snapshot(void);
 
+/*
+ * The HostNet switch, which is a file on the share rather than a setting:
+ * Modules\HostNet,ffa is on, Modules\Disabled\HostNet,ffa is off.
+ *
+ * dx11_glue_hostnet_state() answers DX11_HOSTNET_NONE when there is
+ * nothing to switch (no share, no HostNet device, or the module in neither
+ * folder), and otherwise a mask of the bits below.  Thread: UI.
+ */
+#define DX11_HOSTNET_NONE        (-1)
+#define DX11_HOSTNET_ON          1  /* the module is in Modules */
+#define DX11_HOSTNET_LIT         2  /* the doorbell answers right now */
+#define DX11_HOSTNET_RUNNING     4  /* HostNet has rung since RISC OS started */
+int dx11_glue_hostnet_state(void);
+
+/* Move the module into Modules (on) or Modules\Disabled (off).  Returns 0,
+ * or -1 with a reason for the user in `why`.  Thread: UI. */
+int dx11_glue_hostnet_switch(bool on, char *why, size_t why_len);
+
 #ifdef __cplusplus
 }
 #endif

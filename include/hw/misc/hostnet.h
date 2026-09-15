@@ -170,7 +170,11 @@ struct HostNetState {
     MemoryRegion mr;
 
     uint32_t seq;               /* last sequence number seen */
-    bool enabled;               /* sockets served (the -global switch) */
+    bool enabled;               /* sockets served: the -global switch, or
+                                 * lit mid-session by the window menu's
+                                 * HostNet item (ui/dx11.c), never darkened */
+    bool rung;                  /* the module has rung since the last reset:
+                                 * HostNet is what this boot is running */
 
     /* Slot -> host socket.  -1 is free; the guest's descriptor is the
      * slot number, allocated lowest-free like the Internet module's

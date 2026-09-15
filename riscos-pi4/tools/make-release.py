@@ -26,6 +26,11 @@ machine's filing system, so getting files in and out means opening that
 folder.  Hiding it under AppData would make the one thing they need to
 reach the hardest to find.
 
+HostNet ships on the disc as a module, and the switch is where it is:
+Modules\\HostNet,ffa is on, Modules\\Disabled\\HostNet,ffa is off.  The
+launcher reads that at every start and the window menu's HostNet item
+moves it.  --hostnet off builds a release that starts with it off.
+
 Needs Inno Setup 6 (ISCC.exe) for the last step; everything before it
 runs without.
 """
@@ -161,6 +166,51 @@ def build_disc(fs_zip, dest, strip):
 
 
 
+# ---------------------------------------------------------------- hostnet
+
+HOSTNET_LEAF = "HostNet,ffa"
+
+
+def place_hostnet(disc, on):
+    """HostNet's module, in the folder that switches it on or off.
+
+    Modules is loaded before the desktop by !Boot's PreDesk.HostModules,
+    every ,ffa in name order; Modules/Disabled is not, because HostModules
+    neither descends into a folder nor loads one.  The module is titled
+    Internet, so loading it replaces the ROM's Internet module: a module
+    in Modules is the whole of switching the guest over.
+
+    Returns the folder it went to, relative to the disc, for the installer.
+    """
+    step(f"disc: HostNet, switched {'on' if on else 'off'}")
+    if not os.path.exists(rom.DEFAULT_HOSTNET_MODULE):
+        raise SystemExit("make-release: HostNet is not built; run "
+                         "riscos-pi4/hostnet/build-hostnet.sh")
+    loader = os.path.join(disc, "!Boot", "Choices", "Boot", "PreDesk",
+                          "HostModules,feb")
+    if not os.path.exists(loader):
+        # Without it nothing loads Modules, and a machine switched on
+        # would start with a lit doorbell, no card and no HostNet.
+        raise SystemExit("make-release: the disc has no PreDesk.HostModules "
+                         "to load HostNet with (riscos-pi4/hostfs/boot)")
+    modules = os.path.join(disc, "Modules")
+    disabled = os.path.join(modules, "Disabled")
+    # Disabled is made either way: it is where any module goes to be
+    # switched off, and an empty one says so to anyone who looks.
+    os.makedirs(disabled, exist_ok=True)
+    for folder in (modules, disabled):
+        stale = os.path.join(folder, HOSTNET_LEAF)
+        if os.path.exists(stale):
+            os.remove(stale)
+    dest = modules if on else disabled
+    shutil.copyfile(rom.DEFAULT_HOSTNET_MODULE,
+                    os.path.join(dest, HOSTNET_LEAF))
+    rel = os.path.relpath(dest, disc)
+    log(f"   {rel}{os.sep}{HOSTNET_LEAF} "
+        f"({os.path.getsize(rom.DEFAULT_HOSTNET_MODULE):,} bytes)")
+    return rel
+
+
 # ---------------------------------------------------------------- network
 
 # The guest side of slirp, fixed.  slirp is always 10.0.2.0/24 with the host
@@ -175,9 +225,104 @@ GUEST_DNS = "208.67.222.222 208.67.220.220"      # OpenDNS
 GUEST_DOMAIN = "lan"
 
 
+def obey_box(*lines):
+    """The ruled comment block !InetSetup heads its files with."""
+    for text in lines:
+        assert len(text) <= 62, f"obey_box: too wide for the rule: {text}"
+    rule = "|" + "=" * 64 + "|"
+    return "\n".join([rule] + [f"| {text:<63}|" for text in lines]
+                     + [rule]) + "\n"
+
+
+# Choices:Internet.Startup.  The one file !Internet's !Run runs whichever
+# stack is the Internet module, so it holds only what both need, and hands
+# the interfaces to a file of their own when the stack is the ROM's.
+#
+# The test is RMEnsure, which runs its command when the module is older
+# than the version given: HostNet is Internet 6.00, the ROM's is 5.67.
+# Under HostNet IfConfig and route have no interface to act on and fail,
+# and CheckError after them would abort !Run before the User file -- which
+# is where the name servers are set, so the machine would come up looking
+# healthy with no DNS.
+STARTUP = obey_box(
+    "Startup file for !Internet",
+    "",
+    "Written by the release, not by !InetSetup: saving from",
+    "!InetSetup replaces it with one that knows nothing of HostNet.",
+    "",
+    "Either of two stacks can be the Internet module, and this file",
+    "serves both.  HostNet, Internet 6.00, is loaded from $.Modules",
+    "when it is switched on.  It hands every socket to the host, so",
+    "there is no interface or route to set up, and IfConfig fails.",
+    "Switched off, the ROM's own stack drives the emulated network",
+    "card, and Choices:Internet.Interfaces sets that up.",
+    "",
+    "The name servers are in the User file: both stacks need them.",
+) + """
+Set Inet$HostName RISCOSpi
+
+| Read by !Run after this file returns: no gateway, no RouteD.
+Set Inet$IsGateway ""
+Set Inet$RouteDOptions ""
+
+| The interfaces, only when the Internet module is older than HostNet.
+RMEnsure Internet 6.00 Run Choices:Internet.Interfaces
+"""
+
+# Choices:Internet.Interfaces: the rest of !InetSetup's Startup, as the
+# release has always set it up for the ROM's stack -- the card's address
+# given directly instead of asked of DHCP, and nothing else changed.
+INTERFACES = obey_box(
+    "Interfaces for !Internet: the ROM's own stack",
+    "",
+    "Run by Choices:Internet.Startup when the Internet module is",
+    "the ROM's, which is when HostNet is switched off.  Written by",
+    "the release, like Startup.",
+    "",
+    "slirp is always 10.0.2.0/24 with the host at .2, so the card's",
+    "address is set here rather than waited for from DHCP.",
+) + f"""|
+| DHCP pre-interface initialisation
+|
+RMEnsure DHCP 0.22 RMLoad System:Modules.Network.DHCP
+|
+| Interface: Ethernet over USB
+|
+Set Inet$EtherDevice EtherUSB
+Set Inet$EtherIPAddr {GUEST_IP}
+Set Inet$EtherIPMask {GUEST_MASK}
+RMEnsure EtherUSB 0.08 RMLoad System:Modules.Network.EtherUSB
+IfConfig -e ej0 {GUEST_IP} netmask {GUEST_MASK}
+CheckError
+Set Inet$Gateway {GUEST_GW}
+do /Inet:bin.route -e add default {GUEST_GW}
+CheckError
+IF "<Wimp$State>" = "commands" THEN Echo <11><23><8><5><6><0><0><0><0><0><0><11>
+|
+| Loopback
+|
+IfConfig -e lo0 127.0.0.1
+CheckError
+Set Inet$EtherType <Inet$EtherTypeA>
+Unset Inet$EtherTypeA
+|
+| Routing
+|
+Run Choices:Internet.Routes
+CheckError
+|
+| Access
+|
+IfThere Resources:$.Resources.ShareFS.!Boot then Run Resources:$.Resources.ShareFS.!Boot
+RMFind Freeway 0.26 System:Modules.Network.Freeway
+RMFind ShareFS 3.38 System:Modules.Network.Share+
+SetEval Inet$KickFiler 1
+"""
+
+
 def configure_network(disc):
-    """Point Choices:Internet at slirp, statically."""
-    step("disc: network, static against slirp")
+    """Choices:Internet for either stack: HostNet, or the card on slirp."""
+    step("disc: network, HostNet or the card statically against slirp")
     ch = os.path.join(disc, "!Boot", "Choices", "Internet")
     startup = os.path.join(ch, "Startup,feb")
     user = os.path.join(ch, "User,feb")
@@ -185,32 +330,14 @@ def configure_network(disc):
         log("   no Internet choices in this disc, skipped")
         return
 
-    text = io.open(startup, encoding="latin-1", newline="").read()
-    if "DHCPExecute" in text:
-        text = text.replace("Set Inet$EtherIPAddr dhcp",
-                            f"Set Inet$EtherIPAddr {GUEST_IP}")
-        text = text.replace("Set Inet$EtherIPMask default",
-                            f"Set Inet$EtherIPMask {GUEST_MASK}")
-        old = ('IF "<Wimp$State>" = "commands" THEN Echo Contacting DHCP '
-               'server for Ethernet over USB interface\n'
-               'DHCPExecute -e -b -w -p ej0\n'
-               'CheckError\n'
-               'If "<Inet$Gateway>" <> "" Then do /Inet:bin.route -e add '
-               'default <Inet$Gateway>\n'
-               'CheckError\n')
-        new = (f'IfConfig -e ej0 {GUEST_IP} netmask {GUEST_MASK}\n'
-               'CheckError\n'
-               f'Set Inet$Gateway {GUEST_GW}\n'
-               f'do /Inet:bin.route -e add default {GUEST_GW}\n'
-               'CheckError\n')
-        if old in text:
-            text = text.replace(old, new, 1)
-            io.open(startup, "w", encoding="latin-1", newline="").write(text)
-            log(f"   {GUEST_IP}/{GUEST_MASK} via {GUEST_GW}, no DHCP")
-        else:
-            log("   WARNING: DHCP block not in the expected form, left alone")
-    else:
-        log("   already static")
+    # Written whole rather than edited: !InetSetup's file is the one this
+    # replaces, and a boot file is not somewhere to leave a half-applied
+    # edit behind a warning.
+    for path, text in ((startup, STARTUP),
+                       (os.path.join(ch, "Interfaces,feb"), INTERFACES)):
+        io.open(path, "w", encoding="latin-1", newline="").write(text)
+    log("   Startup: the host name, then Interfaces unless HostNet is loaded")
+    log(f"   Interfaces: {GUEST_IP}/{GUEST_MASK} via {GUEST_GW}, no DHCP")
 
     u = io.open(user, encoding="latin-1", newline="").read()
     if "Inet$Resolvers" in u:
@@ -313,6 +440,10 @@ def main():
     ap.add_argument("--mingw", default=DEFAULTS["mingw"])
     ap.add_argument("--no-strip", action="store_true",
                     help="ship the disc as it is")
+    ap.add_argument("--hostnet", choices=("on", "off"), default="on",
+                    help="how a new machine starts: HostNet's module in "
+                         "Modules (on, the default) or Modules\\Disabled; "
+                         "the window menu switches it after that")
     ap.add_argument("--stage-only", action="store_true",
                     help="lay the pieces out, do not run Inno Setup")
     args = ap.parse_args()
@@ -328,15 +459,17 @@ def main():
 
     build_app(args, app_dir)
     build_launcher(app_dir, args.name)
-    files, size = build_disc(args.fs_zip, disc_dir,
-                             [] if args.no_strip else STRIP_DEFAULT)
+    build_disc(args.fs_zip, disc_dir, [] if args.no_strip else STRIP_DEFAULT)
     configure_network(disc_dir)
+    hostnet_dir = place_hostnet(disc_dir, args.hostnet == "on")
+    files, size = tree_size(disc_dir)
 
     if args.stage_only:
         step("staged, not packaged (--stage-only)")
         return 0
 
-    setup = compile_installer(args, full, stage, app_dir, disc_dir)
+    setup = compile_installer(args, full, stage, app_dir, disc_dir,
+                              hostnet_dir)
     step("done")
     log(f"   {setup}")
     log(f"   {os.path.getsize(setup) / 1e6:.1f} MB, disc {files:,} files "
@@ -361,8 +494,13 @@ def find_iscc():
         "--id JRSoftware.InnoSetup --scope user")
 
 
-def compile_installer(args, full, stage, app_dir, disc_dir):
-    """Substitute the .iss template and run the Inno compiler."""
+def compile_installer(args, full, stage, app_dir, disc_dir, hostnet_dir):
+    """Substitute the .iss template and run the Inno compiler.
+
+    hostnet_dir is where place_hostnet put the module, relative to the
+    disc: where a new machine gets it.  An existing machine keeps HostNet
+    in whichever folder its user left it (setup.iss.in).
+    """
     step("installer: compiling with Inno Setup")
     iscc = find_iscc()
     template = os.path.join(ROOT, "app", "win", "setup.iss.in")
@@ -381,6 +519,7 @@ def compile_installer(args, full, stage, app_dir, disc_dir):
         "@OUTDIR@": os.path.abspath(args.out),
         "@STAGE@": os.path.abspath(stage),
         "@DISCBYTES@": str(discbytes),
+        "@HOSTNET_DIR@": hostnet_dir.replace("/", "\\"),
     }
     for key, value in fields.items():
         text = text.replace(key, value)

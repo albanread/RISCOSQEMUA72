@@ -56,9 +56,21 @@ Source: "@STAGE@\app\*"; DestDir: "{app}"; \
 
 ; The disc, into the user's own folder.  onlyifdoesntexist so that
 ; reinstalling over an existing machine does not throw away the user's
-; files -- the share is their working area, not ours.
+; files -- the share is their working area, not ours.  HostNet is not part
+; of it; it has its own entry below.  (The ? stands for the comma, which
+; would split the pattern.)
 Source: "@STAGE@\disc\*"; DestDir: "{%USERPROFILE}\@NAME@"; \
+    Excludes: "\Modules\HostNet?ffa,\Modules\Disabled\HostNet?ffa"; \
     Flags: recursesubdirs createallsubdirs onlyifdoesntexist uninsneveruninstall
+
+; HostNet, whose folder is its switch: Modules is on, Modules\Disabled is
+; off, and the launcher starts the emulator to match.  Always replaced,
+; because the module and the emulator it talks to are one version -- but
+; in the folder the user left it in, so a reinstall never switches HostNet
+; on or off.  A machine from before HostNet is not given it: see
+; HostNetWanted.
+Source: "@STAGE@\disc\@HOSTNET_DIR@\HostNet,ffa"; DestDir: "{code:HostNetDir}"; \
+    Flags: ignoreversion uninsneveruninstall; Check: HostNetWanted
 
 [Icons]
 Name: "{group}\@DISPLAY@"; Filename: "{app}\@NAME@.exe"
@@ -77,3 +89,44 @@ Type: filesandordirs; Name: "{app}\RISCOS-*.IMG"
 
 [Messages]
 WelcomeLabel2=This will install [name/ver] on your computer.%n%nRISC OS runs from a folder in your user area, which is also how files move between Windows and RISC OS. Nothing is installed for other users and no administrator rights are needed.
+
+[Code]
+var
+  DiscWasThere: Boolean;
+
+function DiscDir(): String;
+begin
+  Result := ExpandConstant('{%USERPROFILE}\@NAME@');
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  { Asked before anything is copied: is this a machine the user already has? }
+  DiscWasThere := DirExists(DiscDir() + '\!Boot');
+  Result := True;
+end;
+
+{ Where HostNet's module goes: where it already is, or for a new machine
+  where the release starts it, @HOSTNET_DIR@. }
+function HostNetDir(Param: String): String;
+begin
+  if FileExists(DiscDir() + '\Modules\HostNet,ffa') then
+    Result := DiscDir() + '\Modules'
+  else if FileExists(DiscDir() + '\Modules\Disabled\HostNet,ffa') then
+    Result := DiscDir() + '\Modules\Disabled'
+  else
+    Result := DiscDir() + '\@HOSTNET_DIR@';
+end;
+
+{ A machine from before HostNet keeps the Internet Startup it was given,
+  written for the network card alone, and under HostNet that fails before
+  the name servers are set.  So it is left without the module -- and
+  without the menu item that would switch it on -- rather than given one
+  its boot cannot use.  A new machine, or one that has HostNet already,
+  gets it. }
+function HostNetWanted(): Boolean;
+begin
+  Result := (not DiscWasThere)
+    or FileExists(DiscDir() + '\Modules\HostNet,ffa')
+    or FileExists(DiscDir() + '\Modules\Disabled\HostNet,ffa');
+end;
