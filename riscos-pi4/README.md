@@ -1,3 +1,9 @@
+> [!CAUTION]
+> 🛑 **REPOSITORY CLOSED — UNMAINTAINED.**
+>
+> Do not assume the reliability of any data in this repository. It will be
+> archived on **15 October 2026**.
+
 # RISC OS 5 on an emulated Raspberry Pi 4
 
 ![RECENT EXPERIMENT](https://img.shields.io/badge/RECENT_EXPERIMENT-c1121f?style=for-the-badge&labelColor=c1121f)
