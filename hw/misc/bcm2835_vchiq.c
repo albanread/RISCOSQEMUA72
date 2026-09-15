@@ -1173,6 +1173,21 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
              */
             uint32_t fourcc = vchiq_ld(s, hdr + VCHIQ_MSG_HDR_SIZE);
             uint32_t srcport = VCHIQ_MSG_SRCPORT(msgid);
+            /*
+             * Accepting 'DISP' tells HWP_Init the GPU owns the pointer
+             * overlay, so the kernel stops drawing its own -- but only
+             * ui/metal and ui/dx11 actually composite VchiqCursor onto
+             * the screen.  A Linux build has neither (GTK, SDL, VNC), so
+             * there 'DISP' is refused like any unanswered service: the
+             * kernel's software pointer stays on and the arrow is drawn
+             * into the framebuffer, visible on any display (issue #2).
+             * macOS and Windows builds keep answering it.
+             */
+#ifdef CONFIG_LINUX
+            bool disp_supported = false;
+#else
+            bool disp_supported = true;
+#endif
 
             if (fourcc == VCHIQ_FOURCC_AUDS && !s->auds_open) {
                 uint32_t ack = VCHIQ_AUDS_VERSION;   /* a short, low half */
@@ -1184,7 +1199,8 @@ static void vchiq_parse_guest_messages(BCM2835VchiqState *s)
                     VCHIQ_MAKE_MSG(VCHIQ_MSG_OPENACK,
                                    VCHIQ_AUDS_VC_PORT, srcport),
                     &ack, 4);
-            } else if (fourcc == VCHIQ_FOURCC_DISP && !s->disp_open) {
+            } else if (fourcc == VCHIQ_FOURCC_DISP && !s->disp_open
+                       && disp_supported) {
                 uint32_t ack = VCHIQ_DISP_VERSION;
 
                 s->disp_open = true;
