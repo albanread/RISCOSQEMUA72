@@ -2471,6 +2471,42 @@ static void vmchannel_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mr);
 }
 
+/*
+ * A machine reset -- Ctrl-Break, or a device reset -- starts the guest's
+ * filing system afresh: every file the old session held open is, as far as
+ * the guest is now concerned, closed.  Close the host fds to match and clear
+ * the handle table.  Without this the device kept the old fds open across
+ * the reboot and their slots stayed taken; the leak accumulated reboot on
+ * reboot until an FSEntry_Open ran out of the 255 slots and failed "too many
+ * open files" -- which surfaced as HostFS "cannot open scrap" a few reboots
+ * in, since the scrap and Wimp temporaries are opened constantly.  realize()
+ * cannot stand in for this: it runs once, at cold start, not on a warm reset.
+ */
+static void vmchannel_reset(DeviceState *dev)
+{
+    VMChannelState *s = VMCHANNEL(dev);
+
+    for (int i = 0; i < VMCH_MAX_OPEN; i++) {
+        if (s->fds[i] != -1) {
+            /* Flush a writer to disk before releasing it: on an abrupt reboot
+             * the guest never got to close its files, and every write reached
+             * the host but may still be in the OS cache.  Readers need none. */
+            if (s->open_write[i]) {
+#ifdef _WIN32
+                _commit(s->fds[i]);
+#else
+                fsync(s->fds[i]);
+#endif
+            }
+            close(s->fds[i]);
+            s->fds[i] = -1;
+        }
+        g_free(s->open_paths[i]);
+        s->open_paths[i] = NULL;
+        s->open_write[i] = false;
+    }
+}
+
 static const Property vmchannel_props[] = {
     DEFINE_PROP_STRING("root", VMChannelState, root),
 };
@@ -2480,6 +2516,9 @@ static void vmchannel_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = vmchannel_realize;
+    /* Close (and flush) the guest's open files on a machine reset, so the
+     * host fds do not leak across a reboot and fill the handle table. */
+    device_class_set_legacy_reset(dc, vmchannel_reset);
     device_class_set_props(dc, vmchannel_props);
     /* No vmstate: registers only, nothing persists between requests. */
     dc->vmsd = NULL;
