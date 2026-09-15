@@ -21,7 +21,7 @@ CPU=cortex-a72
 OUT=build
 
 VERSION="6.00"
-DATE="14 Sep 2026"
+DATE="15 Sep 2026"
 
 # ROSTRT_STATIC_HEAP because this is a module: it has no application slot
 # to grow a heap into, so the runtime uses static arrays instead of the

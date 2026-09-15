@@ -103,9 +103,12 @@ static uint32_t live;          /* the doorbell answered at init */
 
 /* ---- RISC OS ---------------------------------------------------------- */
 
+/* 252 is the PRM's size, and what the Internet module's own error blocks
+ * use.  The 32 this was held "Internet: HostNet needs the emulator"
+ * unterminated, and err_notemul overran it. */
 typedef struct {
     int32_t errnum;
-    char errmess[32];
+    char errmess[252];
 } _kernel_oserror;
 
 /*
