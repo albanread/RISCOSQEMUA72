@@ -5,7 +5,7 @@ RISC OS 5 on an emulated Raspberry Pi 4 -- a fork
 .. image:: https://img.shields.io/badge/REPOSITORY_CLOSED-c1121f?style=for-the-badge&labelColor=c1121f
 
 **🛑 REPOSITORY CLOSED — UNMAINTAINED.** Do not assume the reliability of any
-data in this repository. It will be archived on **15 October 2026**.
+data in this repository. It will be archived in **December 2026**.
 
 .. image:: https://img.shields.io/badge/RECENT_EXPERIMENT-c1121f?style=for-the-badge&labelColor=c1121f
 
