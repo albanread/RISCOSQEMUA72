@@ -311,6 +311,17 @@ static void hn_sa_out(uint64_t addr, uint64_t lenaddr, bool newform,
  * different Internet Event reasons — and hn_ready deliberately flattens
  * that into what select() is allowed to say.
  */
+/*
+ * The event bit that means out-of-band data is waiting.  POSIX poll
+ * reports it as POLLPRI, and only when asked for; WSAPoll has no POLLPRI
+ * and shows out-of-band data as POLLRDBAND instead.
+ */
+#ifdef _WIN32
+#define HN_POLL_URGENT POLLRDBAND
+#else
+#define HN_POLL_URGENT POLLPRI
+#endif
+
 static short hn_revents(int fd, short ev)
 {
 #ifdef _WIN32
@@ -339,7 +350,8 @@ static short hn_revents(int fd, short ev)
 static uint32_t hn_ready(int fd, uint32_t want)
 {
     uint32_t got = 0;
-    short ev = 0, re;
+    short ev = HN_POLL_URGENT;   /* ask, or poll never reports it */
+    short re;
 
     if (want & HN_R) {
         ev |= POLLRDNORM;
@@ -355,7 +367,7 @@ static uint32_t hn_ready(int fd, uint32_t want)
     if (re & (POLLWRNORM | POLLERR | POLLHUP)) {
         got |= HN_W;
     }
-    if (re & (POLLERR | POLLHUP | POLLPRI)) {
+    if (re & (POLLERR | POLLHUP | HN_POLL_URGENT)) {
         got |= HN_X;
     }
     return got & (want | HN_X);
@@ -1305,8 +1317,8 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
             s->woke[i] = 0;
             continue;
         }
-        re = hn_revents(s->fds[i], POLLRDNORM);
-        now = (re & (POLLRDNORM | POLLPRI | POLLERR | POLLHUP)) != 0;
+        re = hn_revents(s->fds[i], POLLRDNORM | HN_POLL_URGENT);
+        now = (re & (POLLRDNORM | HN_POLL_URGENT | POLLERR | POLLHUP)) != 0;
 
         /*
          * Which of the three reasons this is.  The order matters: a socket
@@ -1317,7 +1329,7 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
          */
         if (re & (POLLERR | POLLHUP)) {
             reason = HN_EV_BROKEN;
-        } else if (re & POLLPRI) {
+        } else if (re & HN_POLL_URGENT) {
             reason = HN_EV_URGENT;
         } else {
             reason = HN_EV_ASYNC;
@@ -1336,8 +1348,14 @@ static void hn_poll(HostNetState *s, uint64_t base, HNReply *r)
                 port = ntohs(sin.sin_port);
             }
             list[n++] = (port << 16) | (reason << 8) | (uint32_t)i;
+            s->woke[i] = (uint8_t)reason;  /* reported, so not again */
+        } else if (!reason) {
+            /* Gone quiet: the next wake is news again.  A socket whose
+             * wake was not listed -- the list is HN_POLL_MAX long --
+             * keeps its old woke[] on purpose: it has not been
+             * reported, and the next poll owes it the event. */
+            s->woke[i] = 0;
         }
-        s->woke[i] = (uint8_t)reason;
     }
     if (n) {
         vmch_guest_rw(base + HN_HDR_SIZE, list, n * 4, true);
