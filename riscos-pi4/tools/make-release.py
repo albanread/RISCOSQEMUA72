@@ -31,6 +31,11 @@ Modules\\HostNet,ffa is on, Modules\\Disabled\\HostNet,ffa is off.  The
 launcher reads that at every start and the window menu's HostNet item
 moves it.  --hostnet off builds a release that starts with it off.
 
+The backdrop layer is on as the Mac release has it (make-release.sh,
+BACKDROP): the disc's pinboard tiles the tagged sprite the layer shows
+through, and the launcher starts the window with backdrop=acorn, which
+also gives it the Backdrop menu.  --backdrop off leaves both out.
+
 Needs Inno Setup 6 (ISCC.exe) for the last step; everything before it
 runs without.
 """
@@ -164,6 +169,53 @@ def build_disc(fs_zip, dest, strip):
     log(f"   CMOS,ff2 {os.path.getsize(cmos)} bytes")
     return n, b
 
+
+
+# --------------------------------------------------------------- backdrop
+
+def configure_backdrop(disc, scene):
+    """The disc's half of the backdrop layer, as make-release.sh does it.
+
+    The pinboard tiles a sprite whose pixels carry the "below" layer tag in
+    their transfer byte, so the window's layer shows through the desktop's
+    background, and the Wimp stops filling boxes behind pinboard icon names,
+    which would cover it.  With no layer -- backdrop=off, or another front
+    end -- the tile is just the sage ground the watermark sat on.  Without
+    the tile the layer never shows, whatever the menu says.
+    """
+    step(f"disc: backdrop, {scene}")
+    if scene == "off":
+        log("   off: the disc keeps its watermark, the window no Backdrop menu")
+        return
+    theme = os.path.join(disc, "!Boot", "Resources", "!ThemeDefs", "Themes",
+                         "Acorn")
+    if not os.path.isdir(theme):
+        raise SystemExit(f"make-release: no Acorn theme on the disc for the "
+                         f"backdrop tile: {theme}")
+    subprocess.run([sys.executable, os.path.join(HERE, "mkbacktile.py"),
+                    "--out", os.path.join(theme, "BackTile,ff9")],
+                   check=True, capture_output=True)
+
+    def patch(rel, old, new, done):
+        path = os.path.join(disc, *rel.split("/"))
+        text = io.open(path, encoding="latin-1", newline="").read()
+        if done in text:
+            return
+        if text.count(old) != 1:
+            raise SystemExit(f"make-release: {rel} is not the shape the "
+                             f"backdrop patch expects (one '{old}')")
+        io.open(path, "w", encoding="latin-1", newline="").write(
+            text.replace(old, new))
+
+    patch("!Boot/Choices/Boot/Tasks/PinSetup,feb",
+          "Backdrop -Centre Boot:Resources.!ThemeDefs.Themes.Acorn.Backdrop",
+          "Backdrop -Tile Boot:Resources.!ThemeDefs.Themes.Acorn.BackTile",
+          "Themes.Acorn.BackTile")
+    patch("!Boot/Choices/Boot/PreDesk/ThemeSetup,feb",
+          "WimpVisualFlags -RemoveIconBoxes",
+          "WimpVisualFlags -RemoveIconBoxes -NoIconBoxesInTransWindows",
+          "-NoIconBoxesInTransWindows")
+    log("   the pinboard tiles BackTile, the tagged sprite")
 
 
 # ---------------------------------------------------------------- hostnet
@@ -405,12 +457,13 @@ def mingw_dlls(exe, mingw_bin):
 
 # -------------------------------------------------------------- launcher
 
-def build_launcher(app_dir, name):
+def build_launcher(app_dir, name, backdrop):
     """Compile the launcher stub.
 
     A .cmd would flash a console window and look like a script; the Mac
     release compiles a stub for the same reason.  This one is a GUI-subsystem
-    exe, so nothing appears but the emulator's own window.
+    exe, so nothing appears but the emulator's own window.  The backdrop
+    scene is compiled in, as the Mac app takes its default from Info.plist.
     """
     step("launcher: compiling the stub")
     src = os.path.join(ROOT, "app", "win", "launcher.c")
@@ -421,7 +474,7 @@ def build_launcher(app_dir, name):
     # -mwindows: no console window behind the emulator's own.
     # -municode: wWinMain, so the paths are wide characters throughout.
     subprocess.run([gcc, "-O2", "-mwindows", "-municode",
-                    f'-DAPP_NAME=L"{name}"', src,
+                    f'-DAPP_NAME=L"{name}"', f'-DBACKDROP=L"{backdrop}"', src,
                     "-o", exe, "-lshell32"], check=True, env=env)
     log(f"   {os.path.basename(exe)} {os.path.getsize(exe) / 1024:.0f} KB")
     return exe
@@ -444,6 +497,11 @@ def main():
                     help="how a new machine starts: HostNet's module in "
                          "Modules (on, the default) or Modules\\Disabled; "
                          "the window menu switches it after that")
+    ap.add_argument("--backdrop", choices=("acorn", "acorn-live", "off"),
+                    default="acorn",
+                    help="the layer the window draws beneath the desktop, "
+                         "as the Mac release's BACKDROP; off leaves out the "
+                         "disc's tagged tile and the Backdrop menu")
     ap.add_argument("--stage-only", action="store_true",
                     help="lay the pieces out, do not run Inno Setup")
     args = ap.parse_args()
@@ -458,9 +516,10 @@ def main():
     os.makedirs(stage)
 
     build_app(args, app_dir)
-    build_launcher(app_dir, args.name)
+    build_launcher(app_dir, args.name, args.backdrop)
     build_disc(args.fs_zip, disc_dir, [] if args.no_strip else STRIP_DEFAULT)
     configure_network(disc_dir)
+    configure_backdrop(disc_dir, args.backdrop)
     hostnet_dir = place_hostnet(disc_dir, args.hostnet == "on")
     files, size = tree_size(disc_dir)
 

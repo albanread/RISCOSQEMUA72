@@ -44,7 +44,11 @@
  *     and restarting RISC OS boots a stack with no interface: "Route:
  *     Network is unreachable", and no network until the emulator restarts.
  *
- * APP_NAME is set at compile time by make-release.py.
+ * The window starts with the backdrop layer, as the Mac app does, which also
+ * gives it the Backdrop menu; the disc tiles the tagged sprite it shows
+ * through.  BACKDROP=L"off" leaves the feature and its menu out.
+ *
+ * APP_NAME and BACKDROP are set at compile time by make-release.py.
  */
 
 #include <windows.h>
@@ -54,6 +58,10 @@
 
 #ifndef APP_NAME
 #define APP_NAME L"RISCOSQEA72"
+#endif
+
+#ifndef BACKDROP
+#define BACKDROP L"acorn"
 #endif
 
 #define EMULATOR L"qemu-system-aarch64.exe"
@@ -170,7 +178,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         L"-device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3 "
         L"%ls"
         L"-audiodev dsound,id=snd0 -global bcm2835-vchiq.audiodev=snd0 "
-        L"-display dx11 -serial null "
+        L"-display dx11,backdrop=" BACKDROP L" -serial null "
         L"-global \"bcm2838-peripherals.vmchannel-root=%ls\"",
         emu, rom, cmos_opt, net, disc_opt);
 
