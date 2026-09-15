@@ -1094,6 +1094,27 @@ static id<MTLTexture> backdrop_load_image(const char *path)
     return tex;
 }
 
+/* Whether a tile is double density: the leaf name carries @2x before
+ * its extension, Apple-style (name@2x.png).  Only the leaf, not the
+ * whole path: a plain tile in a folder called @2x is an ordinary tile
+ * (ROS_PRIVATE#44). */
+static bool tile_is_2x(const char *path)
+{
+    const char *leaf = strrchr(path, '/');
+    const char *dot, *p;
+    size_t stem;
+
+    leaf = leaf ? leaf + 1 : path;
+    dot = strrchr(leaf, '.');
+    stem = (dot && dot != leaf) ? (size_t)(dot - leaf) : strlen(leaf);
+    for (p = leaf; p + 3 <= leaf + stem; p++) {
+        if (p[0] == '@' && p[1] == '2' && p[2] == 'x') {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* The scene: none, acorn, acorn-live, tile:<image file> or picture:<image
  * file> (a bare path is a picture).  An @2x tile covers a device pixel per
  * image pixel on a Retina screen, any other a point.  Only ever reached
@@ -1126,7 +1147,7 @@ static void backdrop_set_scene(const char *spec)
     if (path) {
         backdrop.image = backdrop_load_image(path);
         if (backdrop.image) {
-            if (mode == METAL_BACKDROP_TILE && strstr(path, "@2x")) {
+            if (mode == METAL_BACKDROP_TILE && tile_is_2x(path)) {
                 backdrop.image_scale = 2.0;
             }
             metal_log("backdrop: %s %s (%lux%lu)",

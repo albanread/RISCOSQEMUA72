@@ -829,11 +829,32 @@ static bool backdrop_load_image(const char *path)
 
 /*
  * backdrop=off | none | acorn | acorn-live | tile:<file> | picture:<file>
- * | <file> (a bare path is a picture).  A tile whose name carries @2x
- * covers half an output pixel per image pixel.  An unreadable image falls
- * back to the acorn rather than to nothing, so the window is never a
- * mystery black.
+ * | <file> (a bare path is a picture).  A tile whose leaf name carries
+ * @2x before its extension covers half an output pixel per image pixel.
+ * An unreadable image falls back to the acorn rather than to nothing,
+ * so the window is never a mystery black.
  */
+static bool tile_is_2x(const char *path)
+{
+    const char *leaf = strrchr(path, '/');
+    const char *bs = strrchr(path, '\\');
+    const char *dot, *p;
+    size_t stem;
+
+    if (bs && (!leaf || bs > leaf)) {
+        leaf = bs;                      /* Windows separators too */
+    }
+    leaf = leaf ? leaf + 1 : path;
+    dot = strrchr(leaf, '.');
+    stem = (dot && dot != leaf) ? (size_t)(dot - leaf) : strlen(leaf);
+    for (p = leaf; p + 3 <= leaf + stem; p++) {
+        if (p[0] == '@' && p[1] == '2' && p[2] == 'x') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void backdrop_set_scene(const char *spec)
 {
     int mode = DX11_BACKDROP_OFF;
@@ -864,7 +885,7 @@ static void backdrop_set_scene(const char *spec)
     }
     if (path) {
         if (backdrop_load_image(path)) {
-            if (mode == DX11_BACKDROP_TILE && strstr(path, "@2x")) {
+            if (mode == DX11_BACKDROP_TILE && tile_is_2x(path)) {
                 backdrop.image_scale = 2.0;
             }
         } else {
