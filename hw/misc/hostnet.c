@@ -961,10 +961,12 @@ static void hn_msg(HostNetState *s, uint32_t *R, HNReply *r,
             left -= n2;
         }
         if (name) {
-            /* msg_namelen is a word in the header, not a pointer to one,
-             * so the length goes back by rewriting that word. */
-            hn_sa_out(name, 0, newform, &sin);
-            hn_st32(R[1] + 4, 16);
+            /* msg_namelen is a word in the header, not a pointer to
+             * one, so hn_sa_out reads and rewrites it in place.  It
+             * copies no more than the caller said would fit: a shorter
+             * msg_name buffer than a sockaddr_in is overrun otherwise
+             * (ROS_PRIVATE#32). */
+            hn_sa_out(name, R[1] + 4, newform, &sin);
         }
         if (newform) {
             hn_st32(R[1] + 24, 0);        /* msg_flags: nothing to report */
