@@ -123,16 +123,208 @@ Four, no more, each with a length cap and a real error block:
 | `PIN(va, len)` / `UNPIN` | notes the range; the portal defers where it can, refuses where it cannot | stability for a transfer that spans guest execution |
 | `COPY_IN/OUT(buf, va, len)` | validated copy, in the callback | small transfers with no walk at all |
 
-`MAP_ENSURE` is the one that answers the lazy-page problem for
-host-initiated consumers: the blitter takes a sprite plot, the host's
-walk hits a hole, the host queues `MAP_ENSURE`, the next tick faults the
-pages in through the OS's own handler, the host retries the DMA — and a
-plot that would have been a fallback (or, before the DMA-fault fix,
-silent garbage) simply completes.
+`MAP_ENSURE` is the one that answers the lazy-page problem for the
+accesses the host initiates on its own schedule, with the guest running
+freely between them — the backdrop capture on its settle timer, a
+screendump of a mode change, the snapshot path.  The host queues
+`MAP_ENSURE`, the next tick faults the pages in through the OS's own
+handler, and the capture that would have read a hole simply reads.
+
+The blitter, by contrast, is *not* a portal consumer, and the design
+must not pretend otherwise: a blit is serviced inside the `BLIT_GO`
+write, which is doorbell context — the guest that would service the
+request is parked in the very op asking.  The blitter's lazy-page story
+is Phase 1's: the plot fails `BLIT_RC_FAULT`, GVFill touches the
+sprite's pages, rewrites `BLIT_GO`, and the plot takes.  §"The
+deadlock" applies to the blitter exactly as it does to HostFS.
 
 `PIN` is named, specified, and built last or never: no transfer today
 outlives a single doorbell or vector claim.  Written down so the
 decision is recorded rather than revisited.
+
+## Code outline
+
+Not built: the DDE has not seen the guest half, and the host half is
+written against the vmchannel that exists.  It is close enough to code
+that the implementation is typing, not designing.  The wire definitions
+are held by both sides and compared at hello, not trusted to drift.
+
+### The wire — one copy each side, guest and host
+
+```c
+#define PORTAL_VERSION   1
+#define PORTAL_SLOTS     8
+#define PORTAL_FEATURE   (1u << 4)     /* vmchannel feature bit, HELLO gate */
+
+/* the donated page, byte offsets.  4096 bytes, ring under ~800, the
+ * tail is COPY scratch. */
+#define PO_KICK      0    /* uint32: request count, host increments after
+                           * writing a slot; the guest polls it on tick */
+#define PO_SEQ       4    /* uint32: response seqlock, odd while the
+                           * guest is writing, even when done */
+#define PO_NEXT      8    /* uint32: next slot to service, guest's */
+#define PO_REQ(i)    (16 + (i) * 48)
+#define PO_RESP(i)   (16 + PORTAL_SLOTS * 48 + (i) * 48)
+#define PO_STATS     (16 + 2 * PORTAL_SLOTS * 48)
+#define PO_SCRATCH   (PO_STATS + 32)   /* .. end of page, COPY buffer */
+
+/* request slot */
+#define RS_OP     0      /* uint32 */
+#define RS_LEN    4
+#define RS_VA     8
+#define RS_COOKIE 12
+
+/* response slot: mirrors op and cookie, then rc and payload[8] */
+#define TS_RC      8      /* POR_*, below */
+#define TS_PAYLOAD 12
+
+enum {
+    PO_MAP_ENSURE = 1,   /* payload[0] = pages mapped */
+    PO_TRANSLATE  = 2,   /* payload: up to 8 {phys, len} runs */
+    PO_COPY_IN    = 3,   /* host buffer <- guest va, via scratch */
+    PO_COPY_OUT   = 4,
+    PO_PIN        = 5,   /* v1 refuses: POR_REFUSED, spec'd not built */
+    PO_UNPIN      = 6,
+};
+
+enum { POR_OK = 0, POR_REFUSED = 1, POR_FAULT = 2 };
+
+/* Phase 1's one wire change, issued by the host when the walk fails:
+ * "not mapped", not "bad address".  Distinct from every RC_ above. */
+#define RC_NOTMAPPED 14
+```
+
+### The host — vmchannel.c
+
+```c
+static struct {
+    uint32_t page;                /* donated page's guest va, 0 = absent */
+    uint32_t kick;                /* our own count of issued requests */
+    uint32_t answered, refused;   /* PO_STATS mirror, for the log */
+} portal;
+
+/* in the doorbell dispatch, beside the other C_ cases.  BQL held:
+ * the hello is an ordinary synchronous doorbell op. */
+case C_PORTAL_HELLO:
+    /* arglen 8: version, feature bits, page address.  Version we do
+     * not know or a page we cannot reach: answered, not remembered --
+     * an absent portal is a supported configuration, not an error. */
+    if (version == PORTAL_VERSION && vmch_guest_rw(page, probe, 4, false)) {
+        portal.page = page;
+    }
+    rc = VMCH_RC_OK;
+    break;
+
+/*
+ * Issue one request and wait for its cookie.  The wait is the whole
+ * contract: callers are contexts the guest schedules in -- host
+ * timers, QMP handlers -- and a doorbell op that calls this is the
+ * deadlock the design forbids.  v1 polls the main loop; a QEMUBH is
+ * the refinement, not the correction.
+ */
+bool vmch_portal_ask(uint32_t op, uint64_t va, uint32_t len,
+                     void *resp, uint32_t resp_len)
+{
+    uint64_t deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000;
+    uint32_t slot = portal.kick % PORTAL_SLOTS, cookie = ++portal.kick;
+
+    if (!portal.page) {
+        return false;                          /* absent: caller falls back */
+    }
+    vmch_st32(portal.page + PO_REQ(slot) + RS_OP, op);
+    vmch_st32(portal.page + PO_REQ(slot) + RS_LEN, len);
+    vmch_st32(portal.page + PO_REQ(slot) + RS_VA, (uint32_t)va);
+    vmch_st32(portal.page + PO_REQ(slot) + RS_COOKIE, cookie);
+    vmch_st32(portal.page + PO_KICK, cookie);  /* publish, last */
+    while (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < deadline) {
+        /* seqlock read of the slot: even, then cookie ours, then rc */
+        ...
+    }
+    return false;                              /* timeout: caller falls back */
+}
+```
+
+### The guest — riscos-pi4/portal/portal.c
+
+Against the HostNet module's proven skeleton, whole: freestanding C,
+no writable statics outside the workspace, the doorbell request block
+our own, the veneers identical.
+
+```c
+/* workspace, -zM shape, RMA-claimed */
+struct portalws {
+    uint32_t page;                    /* the donated page */
+    uint32_t live;
+    uint32_t cb_pending;
+    /* the counters *PortalInfo prints, at PO_STATS for the host too */
+    uint32_t ticks, callbacks, asks, mapped, refused;
+};
+
+init:
+    ws->page = OS_Module 6 (claim 4096, RMA)       /* always mapped:
+                                                      the host's writes
+                                                      to it cannot walk
+                                                      into a hole */
+    zero the page; PO_SEQ = 0; PO_NEXT = 0
+    ring C_PORTAL_HELLO (version, feature bits, ws->page)
+    OS_CallEvery 2cs, tick, static_base()
+
+final:
+    OS_RemoveTickerEvent; OS_RemoveCallBack         /* the RMCkill order
+                                                      * HostNet learned */
+    ring C_PORTAL_HELLO (version, 0)                /* "gone": the host
+                                                      * stops asking */
+    OS_Module 7 (release the page)
+
+tick:                       /* IRQ context: nothing but the callback */
+    if (!live || cb_pending) return;
+    cb_pending = 1;
+    OS_AddCallBack callback, static_base()
+
+callback:                   /* USR mode: app-space is touchable in mode,
+                             * which is the whole trick */
+    cb_pending = 0
+    while (PO_NEXT != PO_KICK) {
+        slot = PO_NEXT % PORTAL_SLOTS
+        switch (request[slot].op) {
+
+        case PO_MAP_ENSURE:
+            /* OS_ValidateAddress first: it is the gate that says the
+             * range is the guest's to fault in.  Refusals are answers,
+             * not errors -- the adversarial leg of the test ladder. */
+            if (!validate(va, len)) { refused++; answer(POR_REFUSED); break; }
+            for (p = va & ~0xFFF; p < va + len; p += 4096) {
+                (void)*(volatile uint8_t *)p;   /* the OS's own fault path
+                                                  * completes the mapping */
+                mapped++;
+            }
+            answer(POR_OK, pages);
+
+        case PO_TRANSLATE:
+            /* our own short-descriptor walk, mrc-veneer TTBCR/TTBR0/1:
+             * the tables are complete now, MAP_ENSURE saw to it */
+            runs = walk(va, len, payload, 8);
+            answer(runs ? POR_OK : POR_REFUSED, runs);
+
+        case PO_COPY_IN:                          /* guest -> scratch */
+        case PO_COPY_OUT:                         /* scratch -> guest */
+            validate, then copy by words through scratch
+
+        case PO_PIN: case PO_UNPIN:
+            refused++; answer(POR_REFUSED);      /* spec'd, not built */
+        }
+        PO_NEXT++;
+        /* response written under the seqlock: odd, fill, even */
+    }
+    asks = PO_NEXT
+```
+
+The one subtlety the outline cannot show and the implementation must
+not lose: `MAP_ENSURE`'s touch runs in *callback mode*, so app-space
+buffers fault through the USR-mode fault handler, which is the handler
+the OS would have used.  A touch from SVC would take the wrong path
+for the same page.  HostNet's callback already runs USR; this relies
+on nothing new.
 
 ## What this is not
 
