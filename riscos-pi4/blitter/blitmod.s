@@ -290,6 +290,14 @@ final:
     ADR     r1, gv_handler
     MOV     r2, r4
     SWI     XOS_Release
+    @ *SprBench's sprite area, if a benchmark ever ran: the workspace's
+    @ word is the only record of it, so it goes before that record does.
+    LDR     r2, [r12, #WS_SB_AREA]
+    TEQ     r2, #0
+    BEQ     fin_nobench
+    MOV     r0, #ModFree
+    SWI     XOS_Module
+fin_nobench:
     MOV     r0, #ModFree
     MOV     r2, r12
     SWI     XOS_Module
@@ -553,9 +561,11 @@ sv_handler:
     @ plain store, and not really scaling.  A pixel translation table is
     @ allowed through: at 32bpp it is a ColourMap format descriptor, not
     @ a palette, and for a sprite already in the screen's format it has
-    @ nothing to say.
-    CMP     r0, #512
-    BLO     sv_pass
+    @ nothing to say.  52 + 512 exactly: the PRM's area values are +0
+    @ and +256 (R2 a name) and +512 (R2 a pointer), so nothing above
+    @ 564 is a defined form, and its R2 is not ours to read.
+    TEQ     r0, #564
+    BNE     sv_pass
     LDR     r8, [r2, #spImage]
     LDR     r9, [r2, #spTrans]
     TEQ     r8, r9
