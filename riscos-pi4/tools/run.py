@@ -287,7 +287,7 @@ def main():
                   flush=True)
 
     # Which ROM and CMOS this launch boots: the same rules, and the same
-    # two builders, that run-macos.sh gets from rom.zsh.
+    # one builder; the launchers call it as a program too.
     try:
         args.kernel = rom.rom_to_boot(args.kernel, args.modules,
                                       hostfs=args.hostfs,

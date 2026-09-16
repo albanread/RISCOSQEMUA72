@@ -30,11 +30,11 @@
 # RISCOS_QMP, whose tcp default moved to a unix socket (see below).
 # tools/instance.sh builds on these to run several isolated machines.
 #   RISCOS_MODULES space-separated module files spliced into the ROM
-#                  before boot; a share (RISCOS_HOSTFS) also splices the
-#                  HostFS module.  See rom.zsh.  With neither, the stock
+#                  before boot (rom.py boot); a share (RISCOS_HOSTFS) also splices the
+#                  HostFS module.  See rom.py boot.  With neither, the stock
 #                  RISCOS.IMG is booted untouched.
 #   RISCOS_BOOT    "hostfs" boots from the share instead of the card: the
-#                  CMOS says FileSystem HostFS (rom.zsh)
+#                  CMOS says FileSystem HostFS (rom.py cmos)
 #
 # Anything after the options is passed on to QEMU.
 #
@@ -52,9 +52,11 @@ for f in "$Q" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
 done
 
 # ROM module splicing (BOOTDESIGN.md §3), and HostFS with a share
-source "$HERE/rom.zsh"
-rom_to_boot "$IMAGES"
-cmos_to_boot "$IMAGES"
+# rom.py, not a zsh twin: one implementation, and the same one the
+# Windows launch and the farm use.  Progress goes to stderr; stdout is
+# the path, captured here.
+ROM=$(python3 "$HERE/rom.py" boot "$IMAGES") || exit 1
+CMOS=$(python3 "$HERE/rom.py" cmos "$IMAGES") || exit 1
 
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off

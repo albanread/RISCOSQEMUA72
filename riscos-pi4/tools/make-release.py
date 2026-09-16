@@ -155,7 +155,7 @@ def build_disc(fs_zip, dest, strip):
     # The settings the machine boots from.  The launcher hands this file to
     # the loader directly and RISC OS writes back to it through HostFS, so
     # *Configure survives a restart -- which is why FileSystem is forced
-    # here, once, rather than regenerated at every launch as rom.zsh does
+    # here, once, rather than regenerated at every launch as rom.py does
     # on the Mac.  There is no Python on the user's machine to do that.
     step("disc: settings, with FileSystem HostFS")
     cmos = os.path.join(dest, "CMOS,ff2")

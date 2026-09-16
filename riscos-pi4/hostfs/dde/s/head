@@ -387,7 +387,7 @@ Free_Path
 ; Keeping CMOS on the share, as SDCMOS keeps it on a card
 ; (HWSupport/SD/SDCMOS): when HostFS is the boot filing system and the share
 ; has a $.CMOS, every CMOS write is followed by *SaveCMOS to it, and the
-; launcher boots from that file next time (tools/rom.zsh).
+; launcher boots from that file next time (tools/rom.py).
 ;
 ;   op 0  OS_AddCallBack the start-up work — setting the clock from the
 ;         host, then this check — which has to wait until after start-up,

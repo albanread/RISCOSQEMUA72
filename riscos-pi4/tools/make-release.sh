@@ -140,7 +140,7 @@ RES="$APP/Contents/Resources"
 PLIST="$APP/Contents/Info.plist"
 
 # 3. the ROM: the stock image with HostFS and its filer appended to the
-#    module chain -- rom.zsh's splice, done once here instead of at launch
+#    module chain -- rom.py's splice, done once here instead of at launch
 #    -- and the boot screen: BootFX's Raspberry Pi splash, logo and bar
 #    replaced in place by ours (app/bootfx, built by tools/mkbootfx.py)
 BOOTFX="$ROOT/riscos-pi4/app/bootfx"

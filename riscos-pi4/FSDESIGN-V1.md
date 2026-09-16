@@ -1108,7 +1108,7 @@ it ran.
 ### R2 — present when the machine starts
 
 - **Done: the Mac launchers splice HostFS whenever there is a share.**
-  `tools/rom.zsh`, sourced by `run-macos.sh` and `run-app.sh` (and so by
+  `tools/rom.py`, called by `run-macos.sh` and `run-app.sh` (and so by
   `instance.sh`), puts `hostfs/dde/HostFS,ffa` ahead of `RISCOS_MODULES`
   when `RISCOS_HOSTFS` is set. `RISCOS_HOSTFS_MODULE` names another build,
   or empty for none; a module titled HostFS already in `RISCOS_MODULES`

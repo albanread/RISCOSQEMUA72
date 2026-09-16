@@ -41,9 +41,11 @@ overlay and let `run.py` mint a fresh one from the pristine image.
 
 ## rom.py — which ROM and CMOS a launch boots
 
-The Python half of `rom.zsh`, so a Windows machine and the farm start the
-same way a Mac does, off the same `mkrom.py` and `mkcmos.py`.  `run.py`
-and `farm.py` import it; nothing else needs to know it is there.
+The one builder of a bootable ROM and CMOS, so a Windows machine, the
+farm, and the Mac launchers (`run-macos.sh`, `run-app.sh`, via
+`rom.py boot` / `rom.py cmos`) all start the same way, off the same
+`mkrom.py` and `mkcmos.py`.  The zsh half it was ported from is retired;
+there is no second implementation to drift.
 
     run.py --hostfs DIR              a share brings HostFS and its
                                      icon-bar filer into the ROM
@@ -252,7 +254,7 @@ exactly the stream the ROM's own `Bar24` turns out to be:
 `mkrom.py -r NAME=FILE` writes a file over a ResourceFS block in place
 (the length words updated, the rest zeroed, the type taken from a `,xxx`
 suffix), so the three fit where ROOL's were and nothing else in the
-image moves. `rom.zsh` splices them into every launch by default
+image moves. `rom.py boot` splices them into every launch by default
 (`RISCOS_BOOTFX=` boots with ROOL's), and `make-release.sh` into the
 app's ROM.
 

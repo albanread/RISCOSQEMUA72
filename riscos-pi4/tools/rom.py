@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Which ROM image and CMOS a launcher boots — the portable half.
+"""Which ROM image and CMOS a launcher boots.
 
-The Python port of rom.zsh, which run-macos.sh and run-app.sh source.
-run.py and farm.py import this, so a Windows machine and the farm start
-the same way a Mac does, off the same mkrom.py and mkcmos.py.
+run.py and farm.py import this; run-macos.sh and run-app.sh call it as a
+program (`rom.py boot`, `rom.py cmos`), all off the same mkrom.py and
+mkcmos.py.  There is no second implementation: the zsh this was ported
+from is retired.
 
     rom_to_boot(kernel, ...)   -> the image to pass to -kernel
     cmos_to_boot(cmos, ...)    -> the blob to pass to the loader
 
-Kept deliberately close to rom.zsh: same defaults, same rule that a share
-brings HostFS and its filer with it, same "remade every launch" for the
-CMOS and same content-addressed cache for the ROM.  The one difference is
-where output lands.  rom.zsh writes beside the stock image because a Mac
-keeps both in one images directory; here the ROM, the CMOS and a farm
-instance are three different places, so both functions take an explicit
-out_dir.  That is not tidiness — four farm machines share one roms
-directory, and a per-instance CMOS written to a shared path would be four
-machines racing to write one file.
+Same defaults, same rule that a share brings HostFS and its filer with
+it, same "remade every launch" for the CMOS and same content-addressed
+cache for the ROM.  The one difference from the zsh is where output
+lands.  The zsh wrote beside the stock image because a Mac keeps both in
+one images directory; here the ROM, the CMOS and a farm instance are
+three different places, so both functions take an explicit out_dir.
+That is not tidiness — four farm machines share one roms directory, and
+a per-instance CMOS written to a shared path would be four machines
+racing to write one file.
 """
 
 import hashlib
@@ -29,7 +30,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 RISCOS_PI4 = os.path.dirname(HERE)
 
-# The builds committed beside their sources, as rom.zsh defaults to.
+# The builds beside their sources, where the launchers look first.
 DEFAULT_HOSTFS_MODULES = [
     os.path.join(RISCOS_PI4, "hostfs", "dde", "HostFS,ffa"),
     os.path.join(RISCOS_PI4, "hostfs", "filer", "HostFSFiler,ffa"),
@@ -73,8 +74,8 @@ HOSTNET_UNPLUG = [98, 106, 107, 108]
 
 # The boot screen.  BootFX keeps three files in ResourceFS, and mkrom.py -r
 # overwrites them in place; app/bootfx holds the Acorn set that replaces
-# ROOL's Raspberry Pi one.  Same defaults as rom.zsh, so a Windows machine
-# and a Mac boot the same picture.
+# ROOL's Raspberry Pi one.  One default, so a Windows machine and a Mac
+# boot the same picture.
 DEFAULT_BOOTFX = os.path.join(RISCOS_PI4, "app", "bootfx")
 BOOTFX_FILES = ("1920x1080,c85", "Logo,c85", "Bar24,fca")
 
@@ -250,3 +251,63 @@ def cmos_to_boot(cmos, boot=None, hostfs=None, out_dir=None, log=print,
         shutil.copyfile(out, os.path.join(hostfs, "CMOS,ff2"))
         log("cmos: FileSystem HostFS; the share now keeps it, as CMOS,ff2")
     return out
+
+
+# ------------------------------------------------------------- launcher CLI
+
+def _env_list(name):
+    """A space-separated list variable: unset is None (the default), an
+    empty value is an empty list (none at all)."""
+    return None if name not in os.environ else os.environ[name].split()
+
+
+def _log(msg):
+    # stderr: the launchers capture stdout for the path itself
+    print(msg, file=sys.stderr)
+
+
+def _main(argv):
+    """The shell launchers' half: rom.zsh's environment contract, on the
+    one implementation.  `boot` prints the image for -kernel, `cmos` the
+    blob for the loader; progress goes to stderr so $() captures only the
+    answer."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="which ROM and CMOS a launcher boots")
+    ap.add_argument("what", choices=("boot", "cmos"))
+    ap.add_argument("images", help="the images directory: RISCOS.IMG, "
+                                    "cmos.bin")
+    ap.add_argument("--hostnet", action="store_true",
+                    help="splice HostNet and unplug the ROM's own stack")
+    a = ap.parse_args(argv)
+
+    hostfs = os.environ.get("RISCOS_HOSTFS") or None
+    try:
+        if a.what == "boot":
+            print(rom_to_boot(
+                os.path.join(a.images, "RISCOS.IMG"),
+                modules=os.environ.get("RISCOS_MODULES", "").split(),
+                hostfs=hostfs,
+                hostfs_modules=_env_list("RISCOS_HOSTFS_MODULES"),
+                out_dir=a.images,
+                log=_log,
+                bootfx=(os.environ["RISCOS_BOOTFX"]
+                        if "RISCOS_BOOTFX" in os.environ else None),
+                hostnet=a.hostnet,
+            ))
+        else:
+            print(cmos_to_boot(
+                os.path.join(a.images, "cmos.bin"),
+                boot=os.environ.get("RISCOS_BOOT") or None,
+                hostfs=hostfs,
+                out_dir=a.images,
+                log=_log,
+                hostnet=a.hostnet,
+            ))
+    except RomError as e:
+        raise SystemExit(f"rom: {e}")
+
+
+if __name__ == "__main__":
+    _main(sys.argv[1:])

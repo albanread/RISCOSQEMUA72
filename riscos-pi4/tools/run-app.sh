@@ -19,8 +19,8 @@
 #   RISCOS_HOSTFS  a host directory to serve as HostFS: inside the
 #                  guest (FSDESIGN.md); unset leaves the doorbell
 #                  device present but file commands off.  A share also
-#                  puts the HostFS module in the ROM (rom.zsh)
-#   RISCOS_MODULES further modules for the ROM (rom.zsh)
+#                  puts the HostFS module in the ROM (rom.py boot)
+#   RISCOS_MODULES further modules for the ROM (rom.py boot)
 #   RISCOS_BOOT    "hostfs" boots from the share instead of the card
 #
 # Anything after the options is passed on as further QEMU arguments.
@@ -36,9 +36,11 @@ for f in "$APP" "$IMAGES/RISCOS.IMG" "$IMAGES/cmos.bin"; do
 done
 
 # The same ROM the developer's launch boots: HostFS in it with a share
-source "$HERE/rom.zsh"
-rom_to_boot "$IMAGES"
-cmos_to_boot "$IMAGES"
+# rom.py, not a zsh twin: one implementation, and the same one the
+# Windows launch and the farm use.  Progress goes to stderr; stdout is
+# the path, captured here.
+ROM=$(python3 "$HERE/rom.py" boot "$IMAGES") || exit 1
+CMOS=$(python3 "$HERE/rom.py" cmos "$IMAGES") || exit 1
 
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off
