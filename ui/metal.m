@@ -1621,7 +1621,11 @@ static bool metal_render_frame(void)
     [enc endEncoding];
 
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        (void)done;
+        if (done.error) {
+            metal_log("gpu: command buffer failed: %ld (%s)",
+                      (long)done.error.code,
+                      done.error.localizedDescription.UTF8String ?: "");
+        }
         dispatch_semaphore_signal(m.inflight);
     }];
     [cb presentDrawable:drawable];

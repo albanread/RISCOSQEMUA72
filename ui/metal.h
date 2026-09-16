@@ -1,7 +1,7 @@
 /*
  * metal.h — the boundary between the Cocoa/Metal front end (ui/metal.m)
  * and QEMU's C world (ui/metal.c).  The macOS twin of ui/dx11.h: the
- * same eleven calls, so the two front ends stay recognisably one design.
+ * same calls, so the two front ends stay recognisably one design.
  *
  * Objective-C is C, so this boundary is not forced on us the way the C++
  * one is on Windows.  It is kept anyway: it is the whole contract, and
