@@ -27,7 +27,8 @@
 
 /*
  * poll() and its POLL* flags live in <poll.h>, which qemu/osdep.h does not
- * pull in on macOS.
+ * pull in on macOS.  FIONREAD lives in <sys/ioctl.h> on POSIX hosts and in
+ * the winsock headers on Windows.
  *
  * Every socket here comes from qemu_socket()/qemu_accept(), which on
  * Windows return a C runtime descriptor wrapping the SOCKET
@@ -36,12 +37,17 @@
  * qemu_close_wrap(): it frees the descriptor and closes the SOCKET
  * beneath it.  Winsock's own closesocket() would take the descriptor for
  * a SOCKET, fail, and leak both.  So closesocket() is close() on every
- * host.
+ * host, and ioctlsocket() is ioctl() by the same argument: os-win32.h
+ * maps it to a wrapper that unwraps the descriptor itself.
  */
 #ifndef _WIN32
 #include <poll.h>
+#include <sys/ioctl.h>
 #endif
 #define closesocket close
+#ifndef _WIN32
+#define ioctlsocket ioctl
+#endif
 
 /*
  * RISC OS's errno values are 4.4BSD's (Lib/TCPIPLibs/headers/sys/h/errno,
@@ -371,11 +377,6 @@ static uint32_t hn_ready(int fd, uint32_t want)
         got |= HN_X;
     }
     return got & (want | HN_X);
-}
-
-static bool hn_readable(int fd)
-{
-    return (hn_ready(fd, HN_R) & HN_R) != 0;
 }
 
 /*
@@ -723,6 +724,7 @@ static void hn_rwv(HostNetState *s, uint32_t *R, HNReply *r, bool sending)
     uint32_t iovcnt = R[2];
     g_autofree uint32_t *iov = NULL;
     g_autofree uint8_t *buf = NULL;
+    uint64_t sum = 0;
     uint32_t total = 0, off = 0, i;
     ssize_t n;
 
@@ -739,12 +741,12 @@ static void hn_rwv(HostNetState *s, uint32_t *R, HNReply *r, bool sending)
         r->rc = HN_RC_BADADDR;
         return;
     }
+    /* gather in 64 bits: the lengths are the guest's, and a 32-bit sum
+     * that wraps is a transfer size nobody asked for */
     for (i = 0; i < iovcnt; i++) {
-        total += iov[i * 2 + 1];
+        sum += iov[i * 2 + 1];
     }
-    if (total > HN_MAX_XFER) {
-        total = HN_MAX_XFER;
-    }
+    total = sum > HN_MAX_XFER ? HN_MAX_XFER : (uint32_t)sum;
     buf = g_malloc(total ? total : 1);
 
     if (sending) {
@@ -870,6 +872,7 @@ static void hn_msg(HostNetState *s, uint32_t *R, HNReply *r,
     socklen_t sl = sizeof(sin);
     g_autofree uint32_t *iov = NULL;
     g_autofree uint8_t *buf = NULL;
+    uint64_t sum = 0;
     uint32_t total = 0, off = 0, i;
     int fl;
     ssize_t n;
@@ -898,12 +901,12 @@ static void hn_msg(HostNetState *s, uint32_t *R, HNReply *r,
         r->rc = HN_RC_BADADDR;
         return;
     }
+    /* 64-bit gather, as in hn_rwv: a wrapped 32-bit sum is not a size
+     * the guest asked to move */
     for (i = 0; i < iovcnt; i++) {
-        total += iov[i * 2 + 1];
+        sum += iov[i * 2 + 1];
     }
-    if (total > HN_MAX_XFER) {
-        total = HN_MAX_XFER;
-    }
+    total = sum > HN_MAX_XFER ? HN_MAX_XFER : (uint32_t)sum;
     buf = g_malloc(total ? total : 1);
     memset(&sin, 0, sizeof(sin));
 
@@ -1174,10 +1177,19 @@ static void hn_ioctl(HostNetState *s, uint32_t *R, HNReply *r)
         s->nonblock[R[0]] = hn_ld32(R[2]) != 0;
         hn_ok(r, 0);
         break;
-    case HN_FIONREAD:
-        hn_st32(R[2], hn_readable(fd) ? 1 : 0);
+    case HN_FIONREAD: {
+        unsigned long navail = 0;
+
+        /* the byte count, as the Internet module reports it: callers
+         * size their buffers from this answer */
+        if (ioctlsocket(fd, FIONREAD, &navail) < 0) {
+            hn_fail(r);
+            return;
+        }
+        hn_st32(R[2], (uint32_t)navail);
         hn_ok(r, 0);
         break;
+    }
 
     /*
      * FIOASYNC: deliver Internet Event 19 when this socket wakes.  The
