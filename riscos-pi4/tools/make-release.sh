@@ -351,7 +351,7 @@ PY
 
 # the app needs the newest macOS any of its binaries was built for
 minos=$(
-    for f in "$APP/Contents/MacOS/qemu-system-aarch64" "$APP"/Contents/Frameworks/*.dylib; do
+    for f in "$APP/Contents/MacOS/qemu-system-aarch64" "$APP"/Contents/Frameworks/*.dylib(N); do
         otool -l "$f" | awk '$1=="minos"{print $2} /LC_VERSION_MIN_MACOSX/{f=1} f&&$1=="version"{print $2; f=0}'
     done | sort -t. -k1,1n -k2,2n | tail -1
 )
@@ -463,7 +463,7 @@ sign() {   # codesign, quiet unless it fails: "replacing existing signature" is 
 signopts=()
 [[ "$SIGN_ID" != "-" ]] && signopts=(--options runtime --timestamp)
 xattr -cr "$APP"
-for f in "$APP"/Contents/Frameworks/*.dylib; do
+for f in "$APP"/Contents/Frameworks/*.dylib(N); do
     sign -f -s "$SIGN_ID" "${signopts[@]}" "$f"
 done
 sign -f -s "$SIGN_ID" "${signopts[@]}" --entitlements "$ENTS" "$APP/Contents/MacOS/qemu-system-aarch64"
