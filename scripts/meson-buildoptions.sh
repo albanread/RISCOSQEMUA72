@@ -114,6 +114,7 @@ meson_options_help() {
   printf "%s\n" '  curses          curses UI'
   printf "%s\n" '  dbus-display    -display dbus support'
   printf "%s\n" '  dmg             dmg image format support'
+  printf "%s\n" '  dx11            Direct3D 11 windowed display (Windows only)'
   printf "%s\n" '  docs            Documentations build support'
   printf "%s\n" '  dsound          DirectSound sound support'
   printf "%s\n" '  fuse            FUSE block device export'
@@ -150,6 +151,7 @@ meson_options_help() {
   printf "%s\n" '  lzo             lzo compression support'
   printf "%s\n" '  malloc-trim     enable libc malloc_trim() for memory optimization'
   printf "%s\n" '  membarrier      membarrier system call (for Linux 4.14+ or Windows'
+  printf "%s\n" '  metal           Metal windowed display (macOS only)'
   printf "%s\n" '  modules         modules support (non Windows)'
   printf "%s\n" '  mpath           Multipath persistent reservation passthrough'
   printf "%s\n" '  mshv            MSHV acceleration support'
@@ -313,6 +315,8 @@ _meson_option_parse() {
     --disable-docs) printf "%s" -Ddocs=disabled ;;
     --enable-dsound) printf "%s" -Ddsound=enabled ;;
     --disable-dsound) printf "%s" -Ddsound=disabled ;;
+    --enable-dx11) printf "%s" -Ddx11=enabled ;;
+    --disable-dx11) printf "%s" -Ddx11=disabled ;;
     --enable-fdt) printf "%s" -Dfdt=enabled ;;
     --disable-fdt) printf "%s" -Dfdt=disabled ;;
     --enable-fdt=*) quote_sh "-Dfdt=$2" ;;
@@ -400,6 +404,8 @@ _meson_option_parse() {
     --mandir=*) quote_sh "-Dmandir=$2" ;;
     --enable-membarrier) printf "%s" -Dmembarrier=enabled ;;
     --disable-membarrier) printf "%s" -Dmembarrier=disabled ;;
+    --enable-metal) printf "%s" -Dmetal=enabled ;;
+    --disable-metal) printf "%s" -Dmetal=disabled ;;
     --enable-module-upgrades) printf "%s" -Dmodule_upgrades=true ;;
     --disable-module-upgrades) printf "%s" -Dmodule_upgrades=false ;;
     --enable-modules) printf "%s" -Dmodules=enabled ;;
