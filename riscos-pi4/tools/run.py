@@ -29,17 +29,18 @@ import subprocess
 import sys
 import time
 
+import devpaths
 import qmpunix
 import rom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-QEMU = r"F:\RISCOSDEV\qemu\build\qemu-system-aarch64.exe"
-QEMU_IMG = r"F:\RISCOSDEV\qemu\build\qemu-img.exe"
-KERNEL = r"F:\RISCOSDEV\roms\pi\v530\RISCOS.IMG"
-CMOS = r"F:\RISCOSDEV\roms\pi\rool-cmos-unplug.bin"
-IMAGE = r"F:\RISCOSDEV\roms\sdimg\ro530-1875M.img"
+QEMU = devpaths.QEMU
+QEMU_IMG = devpaths.QEMU_IMG
+KERNEL = devpaths.KERNEL
+CMOS = devpaths.CMOS
+IMAGE = devpaths.IMAGE
 # The build's executables link the MinGW runtime DLLs.
-MINGW_BIN = r"F:\RISCOSDEV\msys64\mingw64\bin"
+MINGW_BIN = devpaths.MINGW_BIN
 
 
 def child_env():

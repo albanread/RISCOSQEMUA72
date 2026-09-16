@@ -14,6 +14,18 @@ re-run.
   `RISCOS.IMG`.
 - clang and ld.lld (the installed LLVM) to build the benchmarks.
 
+## The dev tree: RISCOS_* variables
+
+Every tool's default for "where is the emulator / the ROM / the farm"
+is one particular Windows box, because that is where the tree grew up.
+The defaults live in `devpaths.py`, one environment variable per path
+(`RISCOS_BUILD`, `RISCOS_QEMU`, `RISCOS_KERNEL`, `RISCOS_CMOS`,
+`RISCOS_BASE_IMAGE`, `RISCOS_IMAGE`, `RISCOS_FS_ZIP`, `RISCOS_FARM`,
+`RISCOS_MINGW_BIN`, `RISCOS_BASH`), so a different machine sets
+variables instead of editing sources.  `RISCOS_BUILD` alone moves the
+emulator — the binaries default inside it.  Unset, every path is
+exactly what it was.
+
 ## run.py — the launch, and snapshots
 
 `run.py` is the canonical launch wrapped up: it creates a qcow2 overlay

@@ -52,6 +52,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import devpaths                                        # noqa: E402
 import rom                                             # noqa: E402
 
 ROOT = os.path.dirname(HERE)                           # riscos-pi4/
@@ -60,10 +61,10 @@ REPO = os.path.dirname(ROOT)
 DEFAULTS = {
     "name": "RISCOSQEA72",
     "qemu": os.path.join(REPO, "build", "qemu-system-aarch64.exe"),
-    "rom": r"F:\RISCOSDEV\roms\pi\v530\RISCOS.IMG",
-    "fs_zip": r"F:\RISCOSDEV\ROS_PRIVATE\dist\end_user_fs.zip",
+    "rom": devpaths.KERNEL,
+    "fs_zip": devpaths.FS_ZIP,
     "out": os.path.join(REPO, "build", "release"),
-    "mingw": r"F:\RISCOSDEV\msys64\mingw64\bin",
+    "mingw": devpaths.MINGW_BIN,
 }
 
 # What to leave off the disc.  Kept in step with make-release.sh's
@@ -434,7 +435,7 @@ def build_app(args, app_dir):
 
 def mingw_dlls(exe, mingw_bin):
     """Every MinGW DLL the emulator links, found with ldd under MSYS2."""
-    bash = r"F:\RISCOSDEV\msys64\usr\bin\bash.exe"
+    bash = devpaths.BASH
     if not os.path.exists(bash):
         raise SystemExit("make-release: MSYS2 bash not found, cannot list DLLs")
     posix = exe.replace("\\", "/")

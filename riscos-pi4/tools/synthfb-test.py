@@ -31,9 +31,10 @@ import sys
 import time
 import zlib
 
+import devpaths
 import qmpunix
 
-BUILD = r"F:\RISCOSDEV\qemu\build"
+BUILD = devpaths.BUILD
 SOCK = os.path.join(BUILD, "run-qmp.sock")   # run.py's QMP endpoint
 MODE = 640, 480          # synthetic size: not one the desktop uses
 

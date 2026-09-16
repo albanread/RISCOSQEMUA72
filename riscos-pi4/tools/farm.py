@@ -41,28 +41,31 @@ import subprocess
 import sys
 import time
 
+import devpaths
 import qmpunix
 import rom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-QEMU = r"F:\RISCOSDEV\qemu\build\qemu-system-aarch64.exe"
-QEMU_IMG = r"F:\RISCOSDEV\qemu\build\qemu-img.exe"
-KERNEL = r"F:\RISCOSDEV\roms\pi\v530\RISCOS.IMG"
-CMOS = r"F:\RISCOSDEV\roms\pi\rool-cmos-unplug.bin"
+# Where the emulator and the licensed blobs are: devpaths, so every
+# machine sets RISCOS_* variables instead of editing this file.
+QEMU = devpaths.QEMU
+QEMU_IMG = devpaths.QEMU_IMG
+KERNEL = devpaths.KERNEL
+CMOS = devpaths.CMOS
 
 # The turnkey DDE image: after a cold boot `cc -o hi c.hello` compiles,
 # links and runs with no setup.  Held read-only; every instance writes to
 # its own overlay.
-BASE_IMAGE = r"F:\RISCOSDEV\roms\sdimg\dde_dev.img"
+BASE_IMAGE = devpaths.BASE_IMAGE
 
 # Outside both repositories: this is machine state, not source, and a
 # 2 GiB-backed overlay has no business in git.
-FARM = r"F:\RISCOSDEV\qemu-farm"
+FARM = devpaths.FARM
 
 # The build's executables link the MinGW runtime DLLs and die silently
 # without them on PATH.
-MINGW_BIN = r"F:\RISCOSDEV\msys64\mingw64\bin"
+MINGW_BIN = devpaths.MINGW_BIN
 
 # Named rather than numbered, because "charlie is wedged" is a sentence and
 # "instance 2 is wedged" is a lookup.

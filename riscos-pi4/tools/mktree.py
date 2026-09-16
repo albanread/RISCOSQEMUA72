@@ -40,10 +40,12 @@ sys.path.insert(0, HERE)
 import keys                                            # noqa: E402
 import rom                                             # noqa: E402
 
-QEMU = r"F:\RISCOSDEV\qemu\build\qemu-system-aarch64.exe"
-KERNEL = r"F:\RISCOSDEV\roms\pi\v530\RISCOS.IMG"
-CMOS = r"F:\RISCOSDEV\roms\pi\rool-cmos-unplug.bin"
-MINGW_BIN = r"F:\RISCOSDEV\msys64\mingw64\bin"
+import devpaths
+
+QEMU = devpaths.QEMU
+KERNEL = devpaths.KERNEL
+CMOS = devpaths.CMOS
+MINGW_BIN = devpaths.MINGW_BIN
 
 OUT = "___mktree"          # scratch file in the share, for guest output
 OUT_NAMES = (OUT + ",ffd", OUT + ",fff", OUT)

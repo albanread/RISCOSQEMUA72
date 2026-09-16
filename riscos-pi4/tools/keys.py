@@ -24,9 +24,10 @@ import os
 import sys
 import time
 
+import devpaths
 import qmpunix
 
-FARM = r"F:\RISCOSDEV\qemu-farm"
+FARM = devpaths.FARM
 MACHINES = ("alpha", "bravo", "charlie", "delta")
 
 HOLD = 0.06          # how long a key stays down
