@@ -11,20 +11,27 @@ so it needs nothing running in the guest and survives the guest being
 slow -- which is the thing being measured.
 
 Run it once with --kill and once with --load to compare.
+
+QMP is the run socket beside the emulator (run-qmp.sock, as run.py
+opens it): a unix socket, because a loopback port is guest-reachable
+and QMP has no authentication.  --sock or RISCOS_QMP_SOCK points it
+somewhere else.
 """
-import argparse, json, os, socket, sys, tempfile, time
+import argparse, json, os, sys, tempfile, time
+
+import qmpunix
 
 class Q:
-    def __init__(self, port=4455):
-        self.s = socket.create_connection(("127.0.0.1", port), timeout=120)
-        self.f = self.s.makefile("rw")
+    def __init__(self, sock=None):
+        self.f = qmpunix.connect(
+            sock or os.environ.get("RISCOS_QMP_SOCK", "run-qmp.sock"),
+            timeout=120)
         self.f.readline()
         self.cmd("qmp_capabilities")
 
     def cmd(self, ex, **args):
-        self.f.write(json.dumps({"execute": ex, "arguments": args} if args
-                                else {"execute": ex}) + "\n")
-        self.f.flush()
+        self.f.write((json.dumps({"execute": ex, "arguments": args} if args
+                                 else {"execute": ex}) + "\n").encode())
         while True:
             r = json.loads(self.f.readline())
             if "return" in r or "error" in r:
@@ -108,9 +115,11 @@ def main():
                          "no page layout, so the blit cost is not buried")
     ap.add_argument("--dragx", type=int, default=200)
     ap.add_argument("--dragy", type=int, default=651)
+    ap.add_argument("--sock",
+                    help="QMP socket (default: RISCOS_QMP_SOCK or run-qmp.sock)")
     a = ap.parse_args()
 
-    q = Q()
+    q = Q(a.sock)
     tmp = os.path.join(tempfile.gettempdir(), "redrawbench.ppm")
 
     if a.load or a.kill:

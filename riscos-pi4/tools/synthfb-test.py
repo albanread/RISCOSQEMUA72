@@ -16,8 +16,9 @@ decoders implement, and compares the two pixel by pixel.
 
 Usage: synthfb-test.py [bpp ...]      (default: 24 4 2 1 8 16 32)
 
-Talks to the canonical launch: QMP on 127.0.0.1:4461, window class
-"qemu-dx11".  The window's screenshots land in the emulator's CWD as
+Talks to the canonical launch: QMP on the run socket beside the
+emulator (run-qmp.sock, as run.py opens it), window class "qemu-dx11".
+The window's screenshots land in the emulator's CWD as
 dx11-screenshot-NNN.png; the newest one is read each time.
 """
 
@@ -25,40 +26,42 @@ import ctypes
 import glob
 import json
 import os
-import socket
 import struct
 import sys
 import time
 import zlib
 
-QMP = ("127.0.0.1", 4461)
+import qmpunix
+
 BUILD = r"F:\RISCOSDEV\qemu\build"
+SOCK = os.path.join(BUILD, "run-qmp.sock")   # run.py's QMP endpoint
 MODE = 640, 480          # synthetic size: not one the desktop uses
 
 
 def hmp(cmd):
-    s = socket.create_connection(QMP, timeout=20)
-    f = s.makefile("rb")
-    f.readline()
-    s.sendall(b'{"execute":"qmp_capabilities"}\n')
-    f.readline()
-    s.sendall(json.dumps({"execute": "human-monitor-command",
-                          "arguments": {"command-line": cmd}}).encode() + b"\n")
-    r = json.loads(f.readline())["return"]
-    s.close()
-    return r
+    f = qmpunix.connect(SOCK, timeout=20)
+    try:
+        f.readline()
+        f.write(b'{"execute":"qmp_capabilities"}\n')
+        f.readline()
+        f.write(json.dumps({"execute": "human-monitor-command",
+                            "arguments": {"command-line": cmd}}).encode()
+                + b"\n")
+        return json.loads(f.readline())["return"]
+    finally:
+        f.close()
 
 
 def qmp(cmd):
-    s = socket.create_connection(QMP, timeout=20)
-    f = s.makefile("rb")
-    f.readline()
-    s.sendall(b'{"execute":"qmp_capabilities"}\n')
-    f.readline()
-    s.sendall(json.dumps({"execute": cmd}).encode() + b"\n")
-    r = json.loads(f.readline())
-    s.close()
-    return r
+    f = qmpunix.connect(SOCK, timeout=20)
+    try:
+        f.readline()
+        f.write(b'{"execute":"qmp_capabilities"}\n')
+        f.readline()
+        f.write(json.dumps({"execute": cmd}).encode() + b"\n")
+        return json.loads(f.readline())
+    finally:
+        f.close()
 
 
 def window_shot():
