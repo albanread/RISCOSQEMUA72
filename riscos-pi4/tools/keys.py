@@ -12,17 +12,22 @@ The guest keymap is UK, so the shifted punctuation is not the US
 arrangement - `"` is shift-2, `@` is shift-apostrophe, `#` is the backslash
 key. Only the characters a command line actually needs are mapped; anything
 else raises rather than silently typing something else.
+
+The QMP connection is the farm's unix socket (ROS_PRIVATE#34): QMP has no
+authentication and a loopback port is guest-reachable, so the TCP ports
+this tool once dialled are gone.
 """
 
 import argparse
 import json
 import os
-import socket
 import sys
 import time
 
+import qmpunix
+
 FARM = r"F:\RISCOSDEV\qemu-farm"
-PORTS = {"alpha": 4471, "bravo": 4472, "charlie": 4473, "delta": 4474}
+MACHINES = ("alpha", "bravo", "charlie", "delta")
 
 HOLD = 0.06          # how long a key stays down
 GAP = 0.06           # and the pause before the next one
@@ -105,10 +110,10 @@ def split_chord(spec):
 
 
 class Qmp:
-    def __init__(self, port, timeout=20.0):
+    def __init__(self, machine, timeout=20.0):
         self.timeout = timeout
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-        self.file = self.sock.makefile("rb")
+        self.file = qmpunix.connect(os.path.join(FARM, machine, "qmp.sock"),
+                                    timeout=timeout)
         self.file.readline()
         self.execute("qmp_capabilities")
 
@@ -116,10 +121,10 @@ class Qmp:
         request = {"execute": command}
         if arguments:
             request["arguments"] = arguments
-        self.sock.sendall(json.dumps(request).encode() + b"\n")
+        self.file.write(json.dumps(request).encode() + b"\n")
         deadline = time.time() + self.timeout
         while time.time() < deadline:
-            self.sock.settimeout(max(0.1, deadline - time.time()))
+            self.file.settimeout(max(0.1, deadline - time.time()))
             line = self.file.readline()
             if not line:
                 raise RuntimeError("QMP closed")
@@ -171,7 +176,7 @@ class Qmp:
 
     def close(self):
         try:
-            self.sock.close()
+            self.file.close()
         except OSError:
             pass
 
@@ -196,7 +201,7 @@ class Ordered(argparse.Action):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("machine", choices=sorted(PORTS))
+    ap.add_argument("machine", choices=MACHINES)
     ap.add_argument("--f12", action=Ordered, nargs=0,
                     help="press F12, for the single-line * prompt")
     ap.add_argument("--taskwindow", action=Ordered, nargs=0,
@@ -216,7 +221,7 @@ def main():
                     help="screendump afterwards")
     args = ap.parse_args()
 
-    q = Qmp(PORTS[args.machine])
+    q = Qmp(args.machine)
     try:
         for what, value in getattr(args, "script", []):
             if what == "f12":
