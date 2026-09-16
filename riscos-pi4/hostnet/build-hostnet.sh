@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the HostNet module: Internet 6.00, the guest half of host-side
-# sockets.  Same toolchain and runtime as build-hostfs.sh next door --
+# sockets.  The toolchain and runtime the retired v0 HostFS build used --
 # roscc's module linker, clang for ARM, the rostrt runtime -- because the
 # module has to run from ROM, and cmhg's header and the C stubs both write
 # into the module image at initialisation, which from ROM is a data abort.

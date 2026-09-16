@@ -504,7 +504,7 @@ known-good state, and so four builds can run without waiting for each other.
 
     python riscos-pi4/tools/farm.py create      make or repair all four
     python riscos-pi4/tools/farm.py up all      start them (headless)
-    python riscos-pi4/tools/farm.py status      who is running, on what port
+    python riscos-pi4/tools/farm.py status      who is running, on what socket
     python riscos-pi4/tools/farm.py shot alpha  screendump
     python riscos-pi4/tools/farm.py hmp alpha "info registers"
     python riscos-pi4/tools/farm.py down bravo
