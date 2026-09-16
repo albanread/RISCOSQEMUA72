@@ -275,8 +275,12 @@ infrastructure:
   permission — a local Windows workaround, **not** for upstream
 
 The guest side of the newest work is RISC OS modules kept in
-`riscos-pi4/`: `hostfs/` builds `HostFS,ffa` and its filer, `blitter/`
-builds `GVFill,ffa` — soft-loaded, `*RMKill`-able, no ROM splice.
+`riscos-pi4/`: `hostfs/dde/` builds `HostFS,ffa` and `hostfs/filer/`
+its filer (the v0 shell-script build is retired), `blitter/` builds
+`GVFill,ffa` — soft-loaded, `*RMKill`-able, no ROM splice.  The module
+binaries are built, not tracked: a fresh clone boots the stock ROM
+until someone runs the builds (`hostfs/dde/Build,feb`,
+`hostfs/filer/Build,feb`, `blitter/build.sh`).
 
 ## The design principle
 
