@@ -380,6 +380,30 @@ static _kernel_oserror *hn_call(uint32_t swi, unsigned *regs)
  * R0 nd, R1 read set, R2 write, R3 except, R4 struct timeval * (0 means
  * wait for ever).  The result is the number of ready descriptors.
  */
+
+/* Zero the caller's fd sets: BSD select returns them cleared on a
+ * timeout, and the host leaves them alone so the loop below can ask
+ * again with them intact -- so the clearing happens here, where the
+ * caller is about to look. */
+static void zero_sets(const unsigned *regs)
+{
+    uint32_t bytes = (regs[0] + 7u) >> 3;
+    uint32_t k;
+
+    for (k = 1; k <= 3; k++) {
+        volatile uint8_t *p;
+        uint32_t i;
+
+        if (!regs[k]) {
+            continue;
+        }
+        p = (volatile uint8_t *)regs[k];
+        for (i = 0; i < bytes; i++) {
+            p[i] = 0;
+        }
+    }
+}
+
 static _kernel_oserror *hn_select(unsigned *regs)
 {
     uint32_t rc, deadline = 0, timed = 0;
@@ -411,6 +435,7 @@ static _kernel_oserror *hn_select(unsigned *regs)
          * a short wait into a very long one. */
         if (timed && (int32_t)(os_monotonic() - deadline) >= 0) {
             regs[0] = 0;                   /* timed out: not an error */
+            zero_sets(regs);
             return 0;
         }
         if (os_escape()) {
@@ -463,6 +488,19 @@ static void os_add_callback(uint32_t code, uint32_t r12)
     register uint32_t a1 __asm("r1") = r12;
 
     __asm volatile("swi 0x20054"
+                   : "+r"(a0), "+r"(a1)
+                   :
+                   : "r2", "r3", "r12", "lr", "cc", "memory");
+}
+
+/* OS_RemoveCallBack (R0 = code, R1 = R12 value).  Harmless when nothing
+ * is queued: it simply does not find one. */
+static void os_remove_callback(uint32_t code, uint32_t r12)
+{
+    register uint32_t a0 __asm("r0") = code;
+    register uint32_t a1 __asm("r1") = r12;
+
+    __asm volatile("swi 0x20055"
                    : "+r"(a0), "+r"(a1)
                    :
                    : "r2", "r3", "r12", "lr", "cc", "memory");
@@ -647,9 +685,11 @@ int hostnet_final(unsigned fatal, void *ws)
     (void)fatal;
     (void)ws;
     if (live) {
-        /* Before anything else: a ticker pointing into a module that is
-         * about to be unplugged is a branch into free memory. */
+        /* Before anything else: a ticker or a queued callback pointing
+         * into a module that is about to be unplugged is a branch into
+         * free memory, and RISC OS purges neither on finalisation. */
         os_remove_ticker((uint32_t)hostnet_tick, static_base());
+        os_remove_callback((uint32_t)hostnet_callback, static_base());
     }
     live = 0;
     return 0;
