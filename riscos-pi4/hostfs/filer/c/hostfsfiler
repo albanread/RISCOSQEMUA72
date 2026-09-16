@@ -395,8 +395,12 @@ static void data_save(struct filerws *ws)
     int i;
 
     /* the proposed leaf name is at +44; keep a copy, then write the full
-     * path over it (PRM 3-253) */
-    for (i = 0; i < 211 && ((char *)m)[44 + i] >= ' '; i++) {
+     * path over it (PRM 3-253).  The path has to fit the message: the
+     * block is 256 bytes, the path starts at +44, and the root and the
+     * dot take 17 of them, so the leaf may use 194 characters -- a
+     * longer proposal is cut short, as the Filer does, rather than
+     * written past the end of the block. */
+    for (i = 0; i < 194 && ((char *)m)[44 + i] >= ' '; i++) {
         leaf[i] = ((char *)m)[44 + i];
     }
     leaf[i] = 0;
