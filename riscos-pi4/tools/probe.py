@@ -12,18 +12,21 @@ unimplemented-device and guest-error reporting) lands in probe-<machine>.log.
 
 See docs/PI4-QEMU.md. QEMU dir overridable with the QEMU_DIR environment
 variable; default is the user-local install used in that document.
+
+QMP is a unix socket beside the log, as every launch in this tree uses:
+a loopback port is guest-reachable and QMP has no authentication.
 """
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
 
+import qmpunix
+
 QEMU_DIR = os.environ.get(
     "QEMU_DIR", os.path.expandvars(r"%LOCALAPPDATA%\Programs\qemu"))
-PORT = int(os.environ.get("QEMU_QMP_PORT", "4460"))
 # 32-bit-only machines live in qemu-system-arm; the rest need the aarch64 binary
 ARM32_MACHINES = ("raspi0", "raspi1ap", "raspi2b")
 
@@ -43,25 +46,24 @@ def main():
     binary = ("qemu-system-arm.exe" if mach in ARM32_MACHINES
               else "qemu-system-aarch64.exe")
     log = os.path.join(out, f"probe-{mach}.log")
+    sock = os.path.join(out, f"probe-{mach}.qmp")
     cmd = [os.path.join(QEMU_DIR, binary), "-M", mach, "-kernel", rom,
            "-display", "none", "-serial", "null",
-           "-qmp", f"tcp:127.0.0.1:{PORT},server,nowait",
+           "-qmp", f"unix:{sock},server,nowait",
            "-d", "unimp,guest_errors", "-D", log] + extra
     print(" ".join(cmd), flush=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True)
     try:
         time.sleep(2)
-        s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
-        f = s.makefile("rw", encoding="utf-8", newline="\n")
+        f = qmpunix.connect(sock, timeout=10)
         f.readline()                                   # QMP greeting
 
         def qmp(name, **args):
             req = {"execute": name}
             if args:
                 req["arguments"] = args
-            f.write(json.dumps(req) + "\n")
-            f.flush()
+            f.write((json.dumps(req) + "\n").encode())
             while True:
                 line = f.readline()
                 if not line:
