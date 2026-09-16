@@ -960,13 +960,15 @@ _kernel_oserror *fsentry_args_handler(_kernel_swi_regs *r, void *pw)
         return NULL;
     case 3: {                          /* SetEXT: real truncate/extend */
         uint32_t ne = (uint32_t)r->r[2];
+        uint32_t rc;
 
         req->cmd = C_SETSIZE;
         req->handle = h;
         req->arglen = 0;
         REQW(0) = ne;
-        if (vmch_go(ws) != RC_OK) {
-            return &err_access;
+        rc = vmch_go(ws);
+        if (rc != RC_OK) {
+            return rc_to_error(ws, rc);
         }
         hext[idx] = ne;
         if (hptr[idx] > ne) {
@@ -1069,8 +1071,7 @@ _kernel_oserror *fsentry_file_handler(_kernel_swi_regs *r, void *pw)
                 load = exec = 0;
                 size = 0;
                 attr = 3;
-            } else {
-                        }
+            }
             r->r[2] = (int)load;
             r->r[3] = (int)exec;
             r->r[4] = (int)size;
