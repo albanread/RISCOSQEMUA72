@@ -1916,12 +1916,14 @@ static bool fb_build_pipeline(const Dx11FbView *v)
             if (FAILED(hr)) {
                 dx11_log("raw buffer %u %ux%u failed: %#x", i, v->pitch,
                          v->rows, (unsigned)hr);
+                fb_release_pipeline();
                 return false;
             }
             hr = dx11.device->CreateShaderResourceView(fb.raw[i], &sd,
                                                        &fb.raw_srv[i]);
             if (FAILED(hr)) {
                 dx11_log("raw SRV %u failed: %#x", i, (unsigned)hr);
+                fb_release_pipeline();
                 return false;
             }
         }
@@ -1944,11 +1946,13 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     hr = dx11.device->CreateTexture2D(&pd, nullptr, &fb.palette);
     if (FAILED(hr)) {
         dx11_log("palette texture failed: %#x", (unsigned)hr);
+        fb_release_pipeline();
         return false;
     }
     hr = dx11.device->CreateShaderResourceView(fb.palette, nullptr, &fb.pal_srv);
     if (FAILED(hr)) {
         dx11_log("palette SRV failed: %#x", (unsigned)hr);
+        fb_release_pipeline();
         return false;
     }
 
@@ -1976,16 +1980,19 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     hr = dx11.device->CreateTexture2D(&dd, nullptr, &fb.decoded);
     if (FAILED(hr)) {
         dx11_log("decoded texture %ux%u failed: %#x", v->xres, v->yres, (unsigned)hr);
+        fb_release_pipeline();
         return false;
     }
     hr = dx11.device->CreateRenderTargetView(fb.decoded, nullptr, &fb.dec_rtv);
     if (FAILED(hr)) {
         dx11_log("decoded RTV failed: %#x", (unsigned)hr);
+        fb_release_pipeline();
         return false;
     }
     hr = dx11.device->CreateShaderResourceView(fb.decoded, nullptr, &fb.dec_srv);
     if (FAILED(hr)) {
         dx11_log("decoded SRV failed: %#x", (unsigned)hr);
+        fb_release_pipeline();
         return false;
     }
 
@@ -1998,10 +2005,12 @@ static bool fb_build_pipeline(const Dx11FbView *v)
     }
     if (i == sizeof(FB_BPPS) / sizeof(FB_BPPS[0])) {
         dx11_log("no decoder for bpp=%u", v->bpp);
+        fb_release_pipeline();
         return false;
     }
     if (!fb_ps_all[i]) {
         dx11_log("decoder for bpp=%u did not compile (see log)", v->bpp);
+        fb_release_pipeline();
         return false;                   /* logged clear-screen, never a call */
     }
     fb.ps = fb_ps_all[i];
@@ -2028,6 +2037,7 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         hr = dx11.device->CreateBuffer(&bd, nullptr, &fb.cbuf);
         if (FAILED(hr)) {
             dx11_log("constant buffer failed: %#x", (unsigned)hr);
+            fb_release_pipeline();
             return false;
         }
         dx11.context->UpdateSubresource(fb.cbuf, 0, nullptr, &cb, 0, 0);
@@ -2044,6 +2054,7 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         hr = dx11.device->CreateSamplerState(&sd, &fb.linear);
         if (FAILED(hr)) {
             dx11_log("sampler failed: %#x", (unsigned)hr);
+            fb_release_pipeline();
             return false;
         }
         /* The same filtering, wrapping: a backdrop tile repeats from the
@@ -2052,6 +2063,7 @@ static bool fb_build_pipeline(const Dx11FbView *v)
         hr = dx11.device->CreateSamplerState(&sd, &fb.wrap);
         if (FAILED(hr)) {
             dx11_log("wrap sampler failed: %#x", (unsigned)hr);
+            fb_release_pipeline();
             return false;
         }
     }
