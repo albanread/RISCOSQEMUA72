@@ -789,7 +789,8 @@ _kernel_oserror *fsentry_open_handler(_kernel_swi_regs *r, void *pw)
     uint32_t mode = (uint32_t)r->r[0];
     const char *name = (const char *)r->r[1];
     uint32_t flags = O_READ;
-    uint32_t rc, h, idx, load, exec;
+    uint32_t rc, h, idx;
+    uint32_t load = 0, exec = 0;
     uint32_t size = 0, type = 0xFFF, attr = 0, cs_lo = 0, cs_hi = 0;
 
 
