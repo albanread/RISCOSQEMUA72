@@ -68,9 +68,10 @@ static id g_handler;
             out ? out
                : "{\"ok\":false,\"error\":{\"code\":\"not-capable\","
                   "\"number\":5,\"message\":\"no reply\"}}"]];
+    size_t outlen = out ? strlen(out) : 0;
     g_free(out);
     [reply setDescriptor:result forKeyword:keyDirectObject];
-    metal_log("apple event: replied %zu bytes", strlen(out ?: ""));
+    metal_log("apple event: replied %zu bytes", outlen);
 }
 
 @end
