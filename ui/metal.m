@@ -977,10 +977,23 @@ static bool fb_build_pipeline(const MetalFbView *v)
         return false;
     }
 
-    /* One decoder per format.  Anything not 32, 24 or 16 bpp is
-     * palettised, and the shader takes the exact width from the
-     * constants -- 8 bpp is the one RISC OS actually asks for. */
-    shader_bpp = (v->bpp == 32 || v->bpp == 24 || v->bpp == 16) ? v->bpp : 8;
+    /* One decoder per format: 32/24/16 bpp direct, and the palettised
+     * decoder, which reads the true depth from the constants and covers
+     * 8/4/2/1 -- 8 bpp is the one RISC OS actually asks for.  Anything
+     * else is refused as dx11 refuses it: a logged clear screen, not a
+     * guess at what the bits mean. */
+    switch (v->bpp) {
+    case 32: case 24: case 16:
+        shader_bpp = v->bpp;
+        break;
+    case 8: case 4: case 2: case 1:
+        shader_bpp = 8;
+        break;
+    default:
+        metal_log("no decoder for bpp=%u", v->bpp);
+        fb_release_pipeline();
+        return false;
+    }
     cv = [[MTLFunctionConstantValues alloc] init];
     [cv setConstantValue:&shader_bpp type:MTLDataTypeUInt atIndex:0];
     fb.decode = metal_pipeline(@"ps_decode", cv, MTLPixelFormatRGBA8Unorm);
