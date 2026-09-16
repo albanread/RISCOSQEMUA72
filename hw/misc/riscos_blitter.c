@@ -249,8 +249,10 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
         while (total) {
             uint32_t n = MIN(total, chunk);
 
-            dma_memory_write(&address_space_memory, dest, row, n,
-                             MEMTXATTRS_UNSPECIFIED);
+            if (dma_memory_write(&address_space_memory, dest, row, n,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
             dest = (uint64_t)(dest + n) & 0xffffffffULL;
             total -= n;
         }
@@ -264,8 +266,10 @@ static uint32_t blit_fill(RISCOSBlitterState *s)
             }
         }
         for (uint32_t y = 0; y < s->height; y++) {
-            dma_memory_write(&address_space_memory, dest, row, s->width,
-                             MEMTXATTRS_UNSPECIFIED);
+            if (dma_memory_write(&address_space_memory, dest, row, s->width,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
             dest = (uint64_t)((int64_t)dest + s->dstride) & 0xffffffffULL;
         }
     }
@@ -370,10 +374,14 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
         while (total) {
             uint32_t n = MIN(total, chunk);
 
-            dma_memory_read(&address_space_memory, src, row, n,
-                            MEMTXATTRS_UNSPECIFIED);
-            dma_memory_write(&address_space_memory, dest, row, n,
-                             MEMTXATTRS_UNSPECIFIED);
+            if (dma_memory_read(&address_space_memory, src, row, n,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
+            if (dma_memory_write(&address_space_memory, dest, row, n,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
             src = (uint64_t)(src + n) & 0xffffffffULL;
             dest = (uint64_t)(dest + n) & 0xffffffffULL;
             total -= n;
@@ -381,10 +389,14 @@ static uint32_t blit_copy(RISCOSBlitterState *s)
     } else {
         row = blit_scratch(s, s->width);
         for (uint32_t y = 0; y < s->height; y++) {
-            dma_memory_read(&address_space_memory, src, row, s->width,
-                            MEMTXATTRS_UNSPECIFIED);
-            dma_memory_write(&address_space_memory, dest, row, s->width,
-                             MEMTXATTRS_UNSPECIFIED);
+            if (dma_memory_read(&address_space_memory, src, row, s->width,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
+            if (dma_memory_write(&address_space_memory, dest, row, s->width,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return BLIT_RC_FAULT;
+            }
             src = (uint64_t)((int64_t)src + s->sstride) & 0xffffffffULL;
             dest = (uint64_t)((int64_t)dest + s->dstride) & 0xffffffffULL;
         }
@@ -710,8 +722,13 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
                 memcpy(row, srchost + (int64_t)sy * s->sstride
                                 + (int64_t)skip_x * bpp, w * bpp);
             } else {
-                dma_memory_read(&address_space_memory, src, row, w * bpp,
-                                MEMTXATTRS_UNSPECIFIED);
+                /* a source the emulator cannot read is SpriteExtend's
+                 * to complain about, not ours to plot as garbage */
+                if (dma_memory_read(&address_space_memory, src, row, w * bpp,
+                                    MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                    rc = BLIT_RC_FAULT;
+                    break;
+                }
             }
             dest = cfg.base + first + (uint64_t)j * pitch;
 
@@ -730,20 +747,31 @@ static uint32_t blit_sprite(RISCOSBlitterState *s)
                 if (fbhost) {
                     target = fbhost + (uint64_t)j * pitch;
                 } else {
-                    dma_memory_read(&address_space_memory, dest, drow,
-                                    w * bpp, MEMTXATTRS_UNSPECIFIED);
+                    if (dma_memory_read(&address_space_memory, dest, drow,
+                                        w * bpp,
+                                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                        rc = BLIT_RC_FAULT;
+                        break;
+                    }
                     target = drow;
                 }
                 blit_merge(target, row, mrow, skip_x & 31, w, bpp);
                 if (!fbhost) {
-                    dma_memory_write(&address_space_memory, dest, drow,
-                                     w * bpp, MEMTXATTRS_UNSPECIFIED);
+                    if (dma_memory_write(&address_space_memory, dest, drow,
+                                         w * bpp,
+                                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                        rc = BLIT_RC_FAULT;
+                        break;
+                    }
                 }
             } else if (fbhost) {
                 memcpy(fbhost + (uint64_t)j * pitch, row, w * bpp);
             } else {
-                dma_memory_write(&address_space_memory, dest, row, w * bpp,
-                                 MEMTXATTRS_UNSPECIFIED);
+                if (dma_memory_write(&address_space_memory, dest, row, w * bpp,
+                                     MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                    rc = BLIT_RC_FAULT;
+                    break;
+                }
             }
         }
 
