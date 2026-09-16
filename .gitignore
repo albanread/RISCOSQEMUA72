@@ -34,3 +34,6 @@ GTAGS
 # GVFill build intermediates (the module image itself is kept:
 # it loads without needing the Mac toolchain)
 riscos-pi4/blitter/*.o
+
+# CI gate build trees (riscos-pi4/tools/ci/)
+/ci-build-*/

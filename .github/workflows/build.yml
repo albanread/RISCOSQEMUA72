@@ -1,0 +1,56 @@
+# The compile gate, one leg per front end:
+#   macos   -- the Metal front end, the POSIX sockets, the zsh launchers
+#   windows -- the D3D11 front end, the only leg that compiles dx11
+#   linux   -- the GTK front end and the generic POSIX surface
+# Each leg runs the script beside this file's cousins under
+# riscos-pi4/tools/ci/, which are the same scripts by hand.
+#
+# The class it exists to catch is cross-platform: code committed having
+# compiled on one OS only, which the week of 9-15 September 2026 landed
+# more than once.  Guest modules built by the DDE and the licensed ROM
+# stay outside it: neither may ride a public runner.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: riscos-pi4/tools/ci/build-macos.sh
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            base-devel git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-capstone
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-libslirp
+      - shell: msys2 {0}
+        run: riscos-pi4/tools/ci/build-windows.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: riscos-pi4/tools/ci/build-linux.sh
