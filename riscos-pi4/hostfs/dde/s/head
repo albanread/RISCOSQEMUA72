@@ -217,7 +217,7 @@ hostfs_register
 
 ; Filing system information word (PRM 2-532, LowFSI):
 ;   220        filing system number (not yet allocated by ROOL)
-;   16 << 8    maximum open files
+;   255 << 8   maximum open files (VMCH_MAX_OPEN, both sides agree)
 ;   bit 26     fsinfo_fsfilereadinfonolen: File 9 is supported
 ;   bit 23     fsinfo_multifsextensions: FSControl dispatches ReadFreeSpace
 ;              and StampImage only to a filing system with this set; it also
@@ -225,7 +225,7 @@ hostfs_register
 ;   bit 20     fsinfo_dontuseload: FileSwitch does *Load with Open, GetBytes,
 ;   bit 19     fsinfo_dontusesave: Close, and *Save likewise — one data path,
 ;              not a whole-file one beside the streams that can disagree
-FSInfoWord      *       220 :OR: (16 :SHL: 8) :OR: (1 :SHL: 26) :OR: (1 :SHL: 23) :OR: (1 :SHL: 20) :OR: (1 :SHL: 19)
+FSInfoWord      *       220 :OR: (255 :SHL: 8) :OR: (1 :SHL: 26) :OR: (1 :SHL: 23) :OR: (1 :SHL: 20) :OR: (1 :SHL: 19)
 
 FSInfo
         DCD     FSName - Module_Base
