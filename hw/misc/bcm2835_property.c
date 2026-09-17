@@ -516,7 +516,8 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
             uint32_t length = ldl_le_phys(&s->dma_as, value + 16);
             int resp;
 
-            if (offset > 255 || length < 1 || length > 256) {
+            if (offset > 255 || length < 1 || length > 256
+                || offset + length > 256) {
                 resp = 1; /* invalid request */
             } else {
                 for (uint32_t e = 0; e < length; e++) {
