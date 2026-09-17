@@ -649,11 +649,19 @@ static int script_screendump(const char *name, const char *prefix,
 
     raw = g_malloc_n(cfg.yres, rowlen = cfg.xres * bypp);
     for (uint32_t y = 0; y < cfg.yres; y++) {
-        address_space_read(&script_fb->dma_as,
-                           cfg.base + ((uint64_t)(yo + y) * pitch
-                                       + (uint64_t)xo * bypp),
-                           MEMTXATTRS_UNSPECIFIED,
-                           raw + (uint64_t)y * rowlen, rowlen);
+        if (address_space_read(&script_fb->dma_as,
+                               cfg.base + ((uint64_t)(yo + y) * pitch
+                                           + (uint64_t)xo * bypp),
+                               MEMTXATTRS_UNSPECIFIED,
+                               raw + (uint64_t)y * rowlen, rowlen)
+            != MEMTX_OK) {
+            /* A mode change between the config snapshot and the read
+             * leaves the buffer holding heap that was never the guest's
+             * -- encoding it would put host memory into the PNG. */
+            g_free(raw);
+            *errmsg = g_strdup("framebuffer read failed");
+            return SCRIPT_E_NOT_CAPABLE;
+        }
     }
     if (cfg.bpp <= 8) {
         pal = g_malloc(256 * 4);
