@@ -208,6 +208,15 @@ def command_line(name, display, audiodev, kernel, cmos, card=True):
     argv = [
         QEMU,
         "-name", f"riscos-{name}",
+        # TCG plugins via RISCOS_PLUGINS, space-separated, each one a
+        # -plugin argument (path plus optional ,key=value args).  The
+        # reports need -d plugin or they are discarded, and they land
+        # in the instance's own logs directory.
+        *(sum((["-plugin", p] for p in
+               os.environ.get("RISCOS_PLUGINS", "").split() if p),
+              start=[])
+          + (["-d", "plugin", "-D", os.path.join(d, "logs", "plugin.log")]
+             if os.environ.get("RISCOS_PLUGINS", "").strip() else [])),
         # see run.py: the walk wants one TCG thread
         "-accel", "tcg,thread=single",
         "-M", "raspi4b",

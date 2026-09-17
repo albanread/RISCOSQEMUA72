@@ -78,6 +78,14 @@ def command_line(args, overlay):
 
     argv = [
         args.qemu,
+        # TCG plugins, and the -d plugin gate their reports pass through
+        # (see riscos-pi4/tcg-profiling.md: without it the reports are
+        # silently discarded).  plugin.log lands beside the emulator,
+        # where run-qmp.sock already lives.
+        *sum((["-plugin", p] for p in args.plugin), start=[]),
+        *(["-d", "plugin", "-D", os.path.join(
+            os.path.dirname(os.path.abspath(args.qemu)), "plugin.log")]
+          if args.plugin else []),
         # One TCG thread: the doorbell walks the guest's page tables, and
         # under MTTCG a secondary core could rewrite them mid-walk.  The
         # guest is single-scheduled, so this costs nothing (the parked
@@ -249,6 +257,11 @@ def main():
                          "(default) on Windows, coreaudio on macOS, "
                          "wav,path=FILE to capture it, none for silence")
     ap.add_argument("--qemu", default=QEMU)
+    ap.add_argument("--plugin", action="append", default=[],
+                    metavar="LIB[,ARG=V...]",
+                    help="load a TCG plugin (repeatable); the report "
+                         "needs -d plugin, so pass logfile= via "
+                         "RISCOS_PLUGINS too or read tcg-profiling.md")
     ap.add_argument("--qemu-img", default=QEMU_IMG)
     ap.add_argument("--kernel", default=KERNEL)
     ap.add_argument("--cmos", default=CMOS)

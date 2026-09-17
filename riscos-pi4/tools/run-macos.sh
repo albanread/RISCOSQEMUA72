@@ -75,6 +75,15 @@ args=(
     -display "$DISPLAY_OPT"
     -qmp "${RISCOS_QMP:-unix:${TMPDIR:-/tmp}/riscos-qmp.sock,server,nowait}"
 )
+
+# TCG plugins: RISCOS_PLUGINS, space-separated, each "path[,key=value]".
+# -d plugin is the gate their reports pass through; without it they are
+# discarded (tcg-profiling.md).
+for p in ${=RISCOS_PLUGINS:-}; do
+    args+=(-plugin "$p")
+done
+[[ -n "${RISCOS_PLUGINS:-}" ]] && \
+    args+=(-d plugin -D "${TMPDIR:-/tmp}/riscos-plugin.log")
 [[ -n "${RISCOS_NAME:-}" ]] && args+=(-name "$RISCOS_NAME")
 [[ -n "${RISCOS_PIDFILE:-}" ]] && args+=(-pidfile "$RISCOS_PIDFILE")
 # Without a card it boots to the desktop from ROM alone, with nothing

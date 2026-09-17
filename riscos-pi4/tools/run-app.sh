@@ -58,6 +58,16 @@ args=(
     -global bcm2835-vchiq.audiodev=snd0
     -display metal,vsync=30
 )
+
+# TCG plugins: RISCOS_PLUGINS, space-separated, each "path[,key=value]".
+# -d plugin is the gate their reports pass through; without it they are
+# discarded (tcg-profiling.md).
+for p in ${=RISCOS_PLUGINS:-}; do
+    args+=(-plugin "$p")
+done
+[[ -n "${RISCOS_PLUGINS:-}" ]] && \
+    args+=(-d plugin -D "${TMPDIR:-/tmp}/riscos-plugin.log")
+
 # Without a card it boots to the desktop from ROM alone.  snapshot=on
 # keeps the image pristine across runs.
 [[ -e "$IMAGES/card.img" ]] && \
