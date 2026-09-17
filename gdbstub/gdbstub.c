@@ -2315,7 +2315,19 @@ static int gdb_handle_packet(const char *line_buf)
 
 void gdb_set_stop_cpu(CPUState *cpu)
 {
-    GDBProcess *p = gdb_get_cpu_process(cpu);
+    GDBProcess *p;
+
+    /*
+     * A debug exit can arrive with no gdb attached: the rdb monitor
+     * commands set breakpoints without one, and a guest BKPT is the
+     * same shape.  There is no process table until gdbserver_start,
+     * so gdb_get_cpu_process would read one entry below it.
+     */
+    if (!gdbserver_state.init) {
+        return;
+    }
+
+    p = gdb_get_cpu_process(cpu);
 
     if (!p->attached) {
         /*
