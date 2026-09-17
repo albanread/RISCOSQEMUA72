@@ -1,6 +1,8 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
 # helper.c
+arm_a32_data_abort(int cpu, uint32_t pc, uint32_t cpsr, uint32_t fsr, uint32_t far) "cpu %d pc 0x%08x cpsr 0x%08x DFSR 0x%x DFAR 0x%08x"
+arm_a32_prefetch_abort(int cpu, uint32_t pc, uint32_t cpsr, uint32_t fsr, uint32_t far) "cpu %d pc 0x%08x cpsr 0x%08x IFSR 0x%x IFAR 0x%08x"
 arm_gt_recalc(int timer, uint64_t nexttick) "gt recalc: timer %d next tick 0x%" PRIx64
 arm_gt_recalc_disabled(int timer) "gt recalc: timer %d timer disabled"
 arm_gt_cval_write(int timer, uint64_t value) "gt_cval_write: timer %d value 0x%" PRIx64

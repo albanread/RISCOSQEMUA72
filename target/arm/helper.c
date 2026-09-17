@@ -9107,6 +9107,9 @@ static void arm_cpu_do_interrupt_aarch32(CPUState *cs)
         A32_BANKED_CURRENT_REG_SET(env, ifar, env->exception.vaddress);
         qemu_log_mask(CPU_LOG_INT, "...with IFSR 0x%x IFAR 0x%x\n",
                       env->exception.fsr, (uint32_t)env->exception.vaddress);
+        trace_arm_a32_prefetch_abort(cs->cpu_index, env->regs[15],
+                                     env->uncached_cpsr, env->exception.fsr,
+                                     (uint32_t)env->exception.vaddress);
         new_mode = ARM_CPU_MODE_ABT;
         addr = 0x0c;
         mask = CPSR_A | CPSR_I;
@@ -9118,6 +9121,12 @@ static void arm_cpu_do_interrupt_aarch32(CPUState *cs)
         qemu_log_mask(CPU_LOG_INT, "...with DFSR 0x%x DFAR 0x%x\n",
                       env->exception.fsr,
                       (uint32_t)env->exception.vaddress);
+        /* The PC and mode of the instruction that faulted, which the log
+         * line above leaves out: what tells a demand-paging fault the
+         * guest handled from one it could not. */
+        trace_arm_a32_data_abort(cs->cpu_index, env->regs[15],
+                                 env->uncached_cpsr, env->exception.fsr,
+                                 (uint32_t)env->exception.vaddress);
         new_mode = ARM_CPU_MODE_ABT;
         addr = 0x10;
         mask = CPSR_A | CPSR_I;
