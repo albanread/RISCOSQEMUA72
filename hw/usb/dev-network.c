@@ -1162,27 +1162,6 @@ static void usb_net_handle_control(USBDevice *dev, USBPacket *p,
         }
         break;
 
-    /*
-     * The two standard endpoint requests.  usb_desc_handle_control() answers
-     * the device-directed forms but not the endpoint-directed ones, so
-     * without these a driver asking about an endpoint gets a STALL.  RISC
-     * OS's EtherUSB driver asks about both bulk endpoints while bringing the
-     * interface up, and logged six stalls per boot.  dev-storage.c,
-     * dev-serial.c and dev-hub.c all accept the clear the same way; nothing
-     * here ever halts an endpoint, so there is never a halt to clear.
-     */
-    case EndpointRequest | USB_REQ_GET_STATUS:
-        if (length != 2) {
-            goto fail;
-        }
-        data[0] = 0;                    /* bit 0 would be "halted" */
-        data[1] = 0;
-        p->actual_length = 2;
-        break;
-
-    case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
-        break;
-
     default:
     fail:
         fprintf(stderr, "usbnet: failed control transaction: "
