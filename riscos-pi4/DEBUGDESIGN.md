@@ -166,6 +166,12 @@ Sprint order, each with its acceptance test:
    bp/wp live over QMP and Apple Events; an agent script stops the
    machine, sets a breakpoint in RMA, resumes, and reports the hit.
    No window.  Everything is testable headless on the farm.
+   **Done** -- the thirteen `rdb-*` monitor commands (QMP via
+   human-monitor-command), verified end to end against a bare-metal
+   AArch32 loop: breakpoint hit at the exact address, single step
+   through a taken branch, register and memory writes read back.  The
+   Apple Events half of the exposure is still owed; the commands it
+   will call are not.
 2. **The metal window.**  renders exactly those commands; acceptance
    is a human breaking on a module SWI and stepping it while watching
    registers and stack — the session SCRIPTING.md's E-sprints were
