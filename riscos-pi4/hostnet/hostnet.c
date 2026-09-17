@@ -29,6 +29,7 @@
  * the host cannot call in.  See hn_wait_ring and hostnet_c_tick.
  */
 
+typedef unsigned char   uint8_t;
 typedef unsigned int   uint32_t;
 typedef int            int32_t;
 

@@ -95,6 +95,41 @@ exactly the `BootHostFS` above, which would shadow it anyway.  `--boot
 hostfs` turns it on by itself, since reaching the share needs the module
 in the ROM to get there.
 
+## build-modules.sh — every module the release ships, one command
+
+`build-modules.sh` builds all four and puts each where `make-release.sh`
+looks for it.  Two are host cross-builds: GVFill (`blitter/build.sh`,
+clang + Homebrew's llvm-objcopy, found at `/opt/homebrew` or versioned
+under `/usr/local/opt/llvm@N` on Intel) and HostNet
+(`hostnet/build-hostnet.sh`, which wants the ROSCC repo beside this one).
+
+HostFS and HostFSFiler are guest builds — the Acorn DDE inside RISC OS —
+because that is how their sources are written (`hostfs/*/Build,feb`).
+The script boots a build machine: a share under `build-modules/` seeded
+from the dev machine (`!Boot`, `AcornC.C++`, `CMOS,ff2`, and
+`Documents` with `Apps`, which the stock `!Boot` reaches into for the
+backdrop and the pins — without them the desktop stops on a Wimp error
+box that waits for a click a headless machine never makes), with the
+sources rsynced in and a boot task that runs both `Build,feb`s and
+writes `BUILD_DONE` back through HostFS.  The machine boots on the
+*previous* HostFS spliced into the ROM — a module cannot build itself —
+which is the tree's own `hostfs/dde/HostFS,ffa` from the last run, or
+until there is one the module extracted from the newest release app's
+ROM.  Never a cmhg/stubs build: those patch their own image at
+initialisation, which from ROM is a data abort before the module does
+anything, and a headless machine then sits at the supervisor prompt
+looking hung (HostFS 1.01, 17 Sep 2026 — `mkrom.py` refuses such a
+module now, naming the offset).
+
+    build-modules.sh                    # all four
+    build-modules.sh --only gvfill,hostnet
+    build-modules.sh --fresh-share      # re-seed from DDE=
+    build-modules.sh --timeout 1800     # the DDE is slow under TCG
+
+`DDE=` points at the dev machine share to seed from, `BOOT_HOSTFS=` at
+the previous HostFS to boot on, and `--keep` leaves a failed machine
+running for its screen.
+
 ## A farm with no cards
 
 The SD images are being retired, so an instance's share can be the whole

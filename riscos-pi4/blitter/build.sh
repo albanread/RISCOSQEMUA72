@@ -10,8 +10,20 @@ set -e
 cd "$(dirname "$0")"
 
 CLANG=${CLANG:-clang}
-OBJCOPY=${OBJCOPY:-/opt/homebrew/opt/llvm/bin/llvm-objcopy}
-READOBJ=${READOBJ:-/opt/homebrew/opt/llvm/bin/llvm-readobj}
+# llvm-objcopy and llvm-readobj come from Homebrew's LLVM, which lives at
+# /opt/homebrew on Apple silicon and versioned (/usr/local/opt/llvm@N) on
+# Intel; OBJCOPY/READOBJ in the environment beat any of it.
+llvmbin=""
+for d in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin \
+         /usr/local/opt/llvm@21/bin /usr/local/opt/llvm@20/bin; do
+    [[ -x "$d/llvm-objcopy" && -x "$d/llvm-readobj" ]] && llvmbin="$d" && break
+done
+OBJCOPY=${OBJCOPY:-${llvmbin:+$llvmbin/llvm-objcopy}}
+READOBJ=${READOBJ:-${llvmbin:+$llvmbin/llvm-readobj}}
+if [ -z "$OBJCOPY" ] || [ -z "$READOBJ" ]; then
+    echo "need llvm-objcopy and llvm-readobj (brew install llvm), or set OBJCOPY/READOBJ" >&2
+    exit 1
+fi
 
 rm -f blitmod.o 'GVFill,ffa'
 "$CLANG" --target=arm-none-eabi -mcpu=cortex-a72 -mfloat-abi=soft \

@@ -124,6 +124,32 @@ def module_title(body):
     return s.decode()
 
 
+# The self-relocation code a Norcroft build carries when it has absolute
+# relocations (link -rmf with cmhg's header or the C stubs): at
+# initialisation it walks its table and patches its own image in place.
+# RMLoaded that is fine; from ROM the first store is a data abort before
+# the module has done anything, and a headless machine then sits at the
+# supervisor prompt looking hung (HostFS 1.01 in a ROM: "Abort on data
+# transfer at &FC4BFC84", 17 Sep 2026).  The preamble is fixed enough to
+# recognise:
+#     SUB   R11, PC, #16          E24FB010
+#     ADD   R0, PC, #table        E28F0xxx
+#     SUBS  R1, R11, R1           E05B1001
+#     MOVEQ PC, LR                01A0F00E
+RELOC_SUB_R11 = b'\x10\xb0\x4f\xe2'
+RELOC_SUBS_MOVEQ = b'\x01\x10\x5b\xe0\x0e\xf0\xa0\x01'
+
+
+def self_relocates(body):
+    """Offset of the module's self-relocation preamble, or None."""
+    at = body.find(RELOC_SUB_R11)
+    while at >= 0:
+        if at % 4 == 0 and body[at + 8:at + 16] == RELOC_SUBS_MOVEQ:
+            return at
+        at = body.find(RELOC_SUB_R11, at + 1)
+    return None
+
+
 def find_resource(data, name):
     """Locate a ResourceFS file block in the image by its full name, e.g.
     'Resources.BootFX.1920x1080'.  A block is a 5-word header (offset to
@@ -205,6 +231,14 @@ def splice(base, module_paths):
         title = module_title(body)
         if title is None:
             raise SystemExit(f'{p}: not a relocatable module')
+        at = self_relocates(body)
+        if at is not None:
+            raise SystemExit(
+                f'{p}: {title} patches its own image at initialisation '
+                f'(self-relocation code at +{at:#x}), which from ROM is a '
+                f'data abort at the first store.  RMLoad it instead, or '
+                f'build it without absolute relocations -- no cmhg, no '
+                f'stubs, as hostfs/dde/Build,feb does')
         print(f'mkrom: + {title} ({len(body)} bytes) from {p}')
         bodies.append((title, body))
 

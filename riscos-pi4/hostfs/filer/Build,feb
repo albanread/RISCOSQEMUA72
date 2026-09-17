@@ -3,6 +3,12 @@
 | well as from the RMA.  Obey halts at the first failing command, so any
 | error below is the one to read.  The o directory must exist already.
 |
+| The output is named HostFSFiler, not HostFSFiler,ffa, for the reason
+| ../dde/Build gives: link -rmf types it Module itself, which a host share
+| stores as HostFSFiler,ffa.  Asked for HostFSFiler,ffa on HostFS 2.x the
+| comma is part of the leafname, and what lands on the host is
+| HostFSFilerffa,ffa — which the build then cannot find.
+|
 | Built as HostFS is (../dde/Build): no cmhg and no C:o.stubs, which both
 | write into the module image at initialisation.  o.relocs must hold only
 | PC-relative relocations.
@@ -10,6 +16,6 @@ Set HFiler$Dir <Obey$Dir>
 Dir <Obey$Dir>
 objasm -o o.head s.head
 cc -c -zps1 -ffah -o o.hostfsfiler c.hostfsfiler
-link -rmf -o HostFSFiler,ffa o.head o.hostfsfiler
+link -rmf -o HostFSFiler o.head o.hostfsfiler
 decaof -r o.head o.hostfsfiler { > o.relocs }
-Echo Built <HFiler$Dir>.HostFSFiler,ffa
+Echo Built <HFiler$Dir>.HostFSFiler
