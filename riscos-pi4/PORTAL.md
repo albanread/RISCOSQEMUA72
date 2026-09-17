@@ -56,23 +56,31 @@ doorbell waiting for it.
 
 ## Phase 1: touch, ring, retry
 
-**Host:** one new return code, `RC_NOTMAPPED`, in place of today's
-collapse of a walk failure into `BADADDR` or a generic fault.  The
-diagnostic page-table dump stays — it earned its keep once already.
+**HostFS's GBPB path already has this, end to end** — written during
+the lazy-mapping week and measured there (`dde/c/hostfs`: `touch_pages`,
+one read byte per page including the final partial page; the host's
+`guest_rw_counted` short count with R3 progress; and the
+touch-the-tail-and-retry-once loop around `xfer_once`).  The host
+answers a partly-mapped buffer with `RC_BADADDR` and how far the
+translation got, not a new `RC_NOTMAPPED` — that half of the protocol
+exists too.  The diagnostic page-table dump stays; it earned its keep
+once already.
 
-**Guest, in every module that hands the host a buffer** (HostFS's
-transfers, HostNet's iovecs and sockaddrs, GVFill's sprite paths):
-before ringing, touch one byte per page of the range, in the mode the
-buffer belongs to, so the fault handler that maps the page is the one
-the OS would have used anyway.  It costs an `LDRB` a page.  It is also
-the correct semantics, not a workaround: the buffer is about to be read,
-and making it present first is what the OS's own DMA-using code does.
-An `RC_NOTMAPPED` that survives the touch (a race the touch missed) is
-answered by touching again and retrying once — the address and length
-are in hand.
+**What remains is the other two modules.**  HostNet's iovecs, sockaddrs
+and message headers reach the host untouched, so an in-slot-but-untouched
+buffer fails a socket call that real hardware would have served.  And
+GVFill's sprite paths reach the blitter untouched, so a lazy sprite
+falls back to SpriteExtend — correct pixels, silently un-accelerated
+(`blitmod.s` gets the touch as an `LDRB` loop before `BLIT_GO`).  The
+discipline is the same one each time, in the buffer's own mode, so the
+fault handler that maps the page is the one the OS would have used
+anyway.  A buffer that is *invalid* rather than lazy is different, and
+must not be touched blind: the module's own comment on `touch_pages`
+records the PRM's warning for FSEntry_Func 9/10/11, whose buffers
+arrive unvalidated — those entries validate for themselves when they
+are written.
 
-Rough size: ~30 lines a module, ~10 host-side, and no protocol beyond
-the one return code.
+Rough size: ~30 lines a module, no wire change at all.
 
 ## Phase 2: the shape
 
