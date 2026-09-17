@@ -25,6 +25,7 @@
 #include "hw/core/cpu.h"
 #include "target/arm/cpu.h"
 #include "qemu/error-report.h"
+#include "system/tcg.h"
 #include <glib/gstdio.h>
 #include <utime.h>
 #ifndef _WIN32
@@ -223,6 +224,11 @@ static void vmch_dump_walk(CPUState *cs, uint64_t addr)
 
 bool vmch_guest_rw(uint64_t addr, void *buf, uint32_t len, bool is_write)
 {
+    /* In doorbell context this is the ringing CPU, whose tables are the
+     * ones to walk; from host threads it is core 0 -- RISC OS 5.30 keeps
+     * one address space and one scheduling core, so core 0's tables are
+     * canonical.  If either ever stops being true, this line starts
+     * lying, and the caller reads the wrong guest. */
     CPUState *cpu = current_cpu ? current_cpu : first_cpu;
     uint8_t *p = buf;
 
@@ -2456,6 +2462,21 @@ static const MemoryRegionOps vmchannel_ops = {
 static void vmchannel_realize(DeviceState *dev, Error **errp)
 {
     VMChannelState *s = VMCHANNEL(dev);
+
+    /*
+     * The doorbell walks the guest's page tables as they stand.  Under
+     * MTTCG the secondary cores execute while a walk is in flight, and a
+     * descriptor rewritten under it can translate to the wrong physical
+     * page -- not a fault, corruption.  RISC OS 5.30 keeps the secondaries
+     * quiescent, so this is a property of the guest, not of the emulator;
+     * the launchers pin thread=single to make it one of the emulator too,
+     * and anything that re-enables MTTCG gets told, here, first.
+     */
+    if (tcg_enabled() && qemu_tcg_mttcg_enabled()) {
+        warn_report("vmchannel: MTTCG is on; the doorbell's page-table "
+                    "walks are safe only while the secondary cores stay "
+                    "quiescent.  Launch with -accel tcg,thread=single.");
+    }
 
     if (s->root && !g_file_test(s->root, G_FILE_TEST_IS_DIR)) {
         error_setg(errp, "vmchannel: root is not a directory: %s", s->root);

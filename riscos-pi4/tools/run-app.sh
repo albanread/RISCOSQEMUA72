@@ -43,6 +43,9 @@ ROM=$(python3 "$HERE/rom.py" boot "$IMAGES") || exit 1
 CMOS=$(python3 "$HERE/rom.py" cmos "$IMAGES") || exit 1
 
 args=(
+    # one TCG thread: the doorbell walks the guest's page tables -- tools/run.py
+    # has the whole argument
+    -accel tcg,thread=single
     -M raspi4b -cpu cortex-a72,aarch64=off
     -kernel "$ROM"
     -device loader,file="$CMOS",addr=0x510000,force-raw=on

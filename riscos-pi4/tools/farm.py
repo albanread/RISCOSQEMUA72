@@ -208,6 +208,8 @@ def command_line(name, display, audiodev, kernel, cmos, card=True):
     argv = [
         QEMU,
         "-name", f"riscos-{name}",
+        # see run.py: the walk wants one TCG thread
+        "-accel", "tcg,thread=single",
         "-M", "raspi4b",
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", kernel,

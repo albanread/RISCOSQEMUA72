@@ -78,6 +78,11 @@ def command_line(args, overlay):
 
     argv = [
         args.qemu,
+        # One TCG thread: the doorbell walks the guest's page tables, and
+        # under MTTCG a secondary core could rewrite them mid-walk.  The
+        # guest is single-scheduled, so this costs nothing (the parked
+        # cores block anyway) and makes the walk safe by construction.
+        "-accel", "tcg,thread=single",
         "-M", "raspi4b",
         "-cpu", "cortex-a72,aarch64=off",
         "-kernel", args.kernel,
