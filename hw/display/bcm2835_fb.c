@@ -269,9 +269,11 @@ void bcm2835_fb_reconfigure(BCM2835FBState *s, BCM2835FBConfig *newconfig)
 
     s->lock = true;
 
-    s->generation++;                     /* odd: write in flight */
+    qatomic_inc(&s->generation);         /* odd: write in flight */
+    smp_wmb();
     s->config = *newconfig;
-    s->generation++;                     /* even: committed */
+    smp_wmb();
+    qatomic_inc(&s->generation);         /* even: committed */
 
     if (fresh) {
         /*
@@ -297,15 +299,27 @@ uint32_t bcm2835_fb_get_config(BCM2835FBState *s, BCM2835FBConfig *out)
 {
     uint32_t gen;
 
-    do {
-        gen = s->generation;
+    /*
+     * The read half, as the vchiq cursor twin does it: atomic loads,
+     * barriers around the copy, and a loop that goes around again.
+     * `continue` in a do-while jumps to the condition, so the shape
+     * this replaced could return having copied nothing at all -- a
+     * reader that arrived between a writer's two increments took the
+     * odd generation straight past the test and handed the caller an
+     * uninitialised config.
+     */
+    for (;;) {
+        gen = qatomic_read(&s->generation);
         if (gen & 1) {
             continue;                    /* write in flight */
         }
+        smp_rmb();
         *out = s->config;
-    } while (gen != s->generation);
-
-    return gen;
+        smp_rmb();
+        if (qatomic_read(&s->generation) == gen) {
+            return gen;
+        }
+    }
 }
 
 static void bcm2835_fb_mbox_push(BCM2835FBState *s, uint32_t value)
@@ -451,6 +465,22 @@ static const MemoryRegionOps bcm2835_fb_ops = {
     .valid.max_access_size = 4,
 };
 
+static int bcm2835_fb_pre_load(void *opaque)
+{
+    /*
+     * The fields load one at a time straight into config, and the UI
+     * thread reads config on the other side throughout.  Odd from the
+     * first field to post_load, so a reader retries through the whole
+     * load instead of accepting a half-loaded config under a number
+     * that never moved.
+     */
+    BCM2835FBState *s = opaque;
+
+    qatomic_inc(&s->generation);       /* odd: load in flight */
+
+    return 0;
+}
+
 static int bcm2835_fb_post_load(void *opaque, int version_id)
 {
     /*
@@ -466,7 +496,9 @@ static int bcm2835_fb_post_load(void *opaque, int version_id)
      */
     BCM2835FBState *s = opaque;
 
-    s->generation += 2;
+    qatomic_inc(&s->generation);       /* even again: the load is
+                                        * committed, and it moved, so
+                                        * every cached config is stale */
     s->invalidate = true;
     /*
      * A restored machine never passes through bcm2835_fb_reconfigure, so
@@ -484,6 +516,7 @@ static const VMStateDescription vmstate_bcm2835_fb = {
     .name = TYPE_BCM2835_FB,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = bcm2835_fb_pre_load,
     .post_load = bcm2835_fb_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(lock, BCM2835FBState),
@@ -525,8 +558,13 @@ static void bcm2835_fb_reset(DeviceState *dev)
 
     s->pending = false;
 
+    /* A reset is a writer like any other, and the UI thread renders
+     * through resets: the protocol applies, not just the arithmetic. */
+    qatomic_inc(&s->generation);      /* odd: write in flight */
+    smp_wmb();
     s->config = s->initial_config;
-    s->generation += 2;               /* keep it even, but moved */
+    smp_wmb();
+    qatomic_inc(&s->generation);      /* even: committed */
 
     s->invalidate = true;
     s->lock = false;
