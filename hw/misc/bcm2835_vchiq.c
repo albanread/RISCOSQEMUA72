@@ -779,7 +779,8 @@ static void disp_commit(BCM2835VchiqState *s)
     trace_bcm2835_vchiq_disp_pointer(s->ptr_visible, s->ptr_x, s->ptr_y,
                                          s->ptr_w, s->ptr_h);
     }
-    s->ptr_gen++;
+    smp_wmb();
+    qatomic_inc(&s->ptr_gen);
 }
 
 static void disp_reset(BCM2835VchiqState *s)

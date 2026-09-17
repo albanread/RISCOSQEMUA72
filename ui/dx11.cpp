@@ -2296,6 +2296,7 @@ static void dx11_cursor_sync(bool sprite_visible)
 static void dx11_draw_pointer(const Dx11FbView *v)
 {
     Dx11CursorView cv;
+    bool torn = false;
 
     if (!ptr.up && !ptr_build()) {
         dx11_cursor_sync(false);
@@ -2318,6 +2319,15 @@ static void dx11_draw_pointer(const Dx11FbView *v)
             D3D11_BOX box = { 0, 0, 0, bw, bh, 1 };
             dx11.context->UpdateSubresource(ptr.image, 0, &box,
                                             cv.argb, sw * 4, 0);
+        }
+        /* A commit that landed mid-upload tears what was just
+         * uploaded: take nothing from this read, draw nothing, and the
+         * next frame's read has the whole sprite. */
+        {
+            Dx11CursorView again;
+
+            torn = !dx11_glue_cursor_view(&again) || again.stale
+                   || again.generation != cv.generation;
         }
         /* Watch the peer's numbers: the sprite is drawn stretched to the
          * rect it names, from a 64x64 texture it also sizes, so a bad
@@ -2346,22 +2356,24 @@ static void dx11_draw_pointer(const Dx11FbView *v)
                 seen++;
             }
         }
-        ptr.generation = cv.generation;
-        ptr.visible = cv.visible != 0;
-        ptr.x = cv.x;
-        ptr.y = cv.y;
-        ptr.w = cv.w;
-        ptr.h = cv.h;
-        /* dim drives the shader's Load, so it must name what actually
-         * reached the texture, never more than it holds */
-        ptr.img_w = (int32_t)bw;
-        ptr.img_h = (int32_t)bh;
-        ptr.disp_w = cv.disp_w;
-        ptr.disp_h = cv.disp_h;
+        if (!torn) {
+            ptr.generation = cv.generation;
+            ptr.visible = cv.visible != 0;
+            ptr.x = cv.x;
+            ptr.y = cv.y;
+            ptr.w = cv.w;
+            ptr.h = cv.h;
+            /* dim drives the shader's Load, so it must name what
+             * actually reached the texture, never more than it holds */
+            ptr.img_w = (int32_t)bw;
+            ptr.img_h = (int32_t)bh;
+            ptr.disp_w = cv.disp_w;
+            ptr.disp_h = cv.disp_h;
+        }
     }
     dx11_cursor_sync(ptr.visible);
 
-    if (!ptr.visible || ptr.w <= 0 || ptr.h <= 0
+    if (torn || !ptr.visible || ptr.w <= 0 || ptr.h <= 0
         || ptr.img_w <= 0 || ptr.img_h <= 0) {
         return;
     }

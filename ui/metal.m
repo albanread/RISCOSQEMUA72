@@ -1569,23 +1569,34 @@ static bool metal_render_frame(void)
      * one is reported stale and the previous frame's is kept. */
     {
         MetalCursorView cv;
+        bool torn = false;
 
         if (ptr.pipe && metal_glue_cursor_view(&cv) && !cv.stale
             && cv.generation != ptr.generation) {
+            MetalCursorView again;
+
             memcpy([ptr.image contents], cv.argb,
                    METAL_CURSOR_TEXELS * METAL_CURSOR_TEXELS * 4);
-            ptr.generation = cv.generation;
-            ptr.visible = cv.visible;
-            ptr.x = cv.x;
-            ptr.y = cv.y;
-            ptr.w = cv.w;
-            ptr.h = cv.h;
-            ptr.img_w = cv.img_w;
-            ptr.img_h = cv.img_h;
-            ptr.disp_w = cv.disp_w;
-            ptr.disp_h = cv.disp_h;
+            /* A commit that landed mid-copy tears what was just
+             * uploaded: take nothing from this read, draw nothing,
+             * and the next frame's read has the whole sprite. */
+            torn = !metal_glue_cursor_view(&again) || again.stale
+                   || again.generation != cv.generation;
+            if (!torn) {
+                ptr.generation = cv.generation;
+                ptr.visible = cv.visible;
+                ptr.x = cv.x;
+                ptr.y = cv.y;
+                ptr.w = cv.w;
+                ptr.h = cv.h;
+                ptr.img_w = cv.img_w;
+                ptr.img_h = cv.img_h;
+                ptr.disp_w = cv.disp_w;
+                ptr.disp_h = cv.disp_h;
+            }
         }
-        if (have_fb && ptr.pipe && ptr.visible && ptr.w > 0 && ptr.h > 0
+        if (have_fb && ptr.pipe && !torn && ptr.visible
+            && ptr.w > 0 && ptr.h > 0
             && ptr.img_w > 0 && ptr.img_h > 0) {
             float rect[4];
             uint32_t dim[2];
