@@ -470,7 +470,10 @@ closing the window shuts the emulator down cleanly. Failures land in
 `dx11-debug.txt` next to the process; `DX11_DEBUG=1` in the environment
 asks for the D3D11 debug layer.
 
-`-cpu cortex-a72,aarch64=off` is the load-bearing part. `-M raspi4b` hard-codes
+`-cpu cortex-a72,aarch64=off` is the load-bearing part — and the one
+CPU feature that moves at all; what the rest of the feature set is,
+which knobs exist and which do not, and the plan any change to it must
+pass is [`riscos-pi4/cpu-features.md`](cpu-features.md). `-M raspi4b` hard-codes
 its CPU, so it is widely assumed `-cpu` does nothing there — but the *property*
 still lands, and without it the ROM's ARM32 vector table is decoded as AArch64
 and executed as garbage.
