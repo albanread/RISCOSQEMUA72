@@ -12,10 +12,26 @@
 set -e
 cd "$(dirname "$0")"
 
-LLVM="/c/Program Files/LLVM/bin"
-ROSCC="/f/RISCOSDEV/compiler/target/debug/roscc.exe"
-GEN="/f/RISCOSDEV/compiler/tools/gen_module.py"
-RTRT="/f/RISCOSDEV/compiler/rostrt"
+# The toolchain.  The Windows rig keeps it under F:\RISCOSDEV; on a Mac the
+# ROSCC repo sits beside this one (../../../ROSCC from here) and Xcode's
+# clang cross-compiles the ARM code.  CLANG, ROSCC, GEN and RTRT can each be
+# set in the environment instead.
+case "$(uname -s)" in
+Darwin)
+    CLANG="${CLANG:-clang}"
+    ROSCC="${ROSCC:-$PWD/../../../ROSCC/target/debug/roscc}"
+    GEN="${GEN:-$PWD/../../../ROSCC/tools/gen_module.py}"
+    RTRT="${RTRT:-$PWD/../../../ROSCC/rostrt}"
+    PY=python3
+    ;;
+*)
+    CLANG="${CLANG:-/c/Program Files/LLVM/bin/clang.exe}"
+    ROSCC="${ROSCC:-/f/RISCOSDEV/compiler/target/debug/roscc.exe}"
+    GEN="${GEN:-/f/RISCOSDEV/compiler/tools/gen_module.py}"
+    RTRT="${RTRT:-/f/RISCOSDEV/compiler/rostrt}"
+    PY=python
+    ;;
+esac
 TRIPLE=armv8a-none-eabi
 CPU=cortex-a72
 OUT=build
@@ -35,7 +51,7 @@ CC_FLAGS="--target=$TRIPLE -mcpu=$CPU -mfloat-abi=soft -ffreestanding \
 mkdir -p "$OUT"
 
 echo "== SWI list -> header arguments and C entry points"
-python - <<'PY'
+"$PY" - <<'PY'
 names = [n for n in open('swis.txt').read().split() if n]
 nl = chr(10)
 open('hostnet_swis.inc', 'w').write(
@@ -52,8 +68,9 @@ PY
 
 echo "== header + module veneers"
 # Title "Internet", so that every RMEnsure Internet on the disc is
-# satisfied without a single edit; the ROM's 5.67 is unplugged in CMOS.
-eval python "$GEN" \
+# satisfied without a single edit.  Loading it replaces the ROM's 5.67 (the
+# release); a dev machine unplugs 5.67 in CMOS instead (rom.py --hostnet).
+eval "$PY" "$GEN" \
     --title Internet \
     --help-text "'HostNet\\t$VERSION ($DATE)'" \
     --rwpi \
@@ -65,19 +82,19 @@ eval python "$GEN" \
     --arch armv8a \
     -o "$OUT/module_head.s"
 
-"$LLVM/clang.exe" $CC_FLAGS -c "$OUT/module_head.s" -o "$OUT/module_head.o"
+"$CLANG" $CC_FLAGS -c "$OUT/module_head.s" -o "$OUT/module_head.o"
 
 echo "== module body"
-"$LLVM/clang.exe" $CC_FLAGS -c hostnet_entries.s -o "$OUT/entries.o"
-"$LLVM/clang.exe" $CC_FLAGS -c hostnet.c -o "$OUT/hostnet.o"
+"$CLANG" $CC_FLAGS -c hostnet_entries.s -o "$OUT/entries.o"
+"$CLANG" $CC_FLAGS -c hostnet.c -o "$OUT/hostnet.o"
 
 echo "== runtime"
 for src in rostrt.c swis_os.c modrt.c; do
-    "$LLVM/clang.exe" $CC_FLAGS -c "$RTRT/$src" -o "$OUT/${src%.c}.o"
+    "$CLANG" $CC_FLAGS -c "$RTRT/$src" -o "$OUT/${src%.c}.o"
 done
-"$LLVM/clang.exe" --target=$TRIPLE -mcpu=$CPU -mfloat-abi=soft \
+"$CLANG" --target=$TRIPLE -mcpu=$CPU -mfloat-abi=soft \
     -c "$RTRT/aeabi.s" -o "$OUT/aeabi.o"
-"$LLVM/clang.exe" --target=$TRIPLE -mcpu=$CPU -mfloat-abi=soft \
+"$CLANG" --target=$TRIPLE -mcpu=$CPU -mfloat-abi=soft \
     -c "$RTRT/atomics_swp.s" -o "$OUT/atomics.o"
 
 echo "== link"

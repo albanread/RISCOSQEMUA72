@@ -29,6 +29,7 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -110,6 +111,11 @@ static struct {
     CFAbsoluteTime t0;                  /* acorn-live's clock */
     NSMenuItem *menu_item;              /* Machine > Backdrop, hidden when gated off */
 } backdrop = { false, METAL_BACKDROP_OFF, nil, 1.0, nil, 0, nil };
+
+/* Machine > HostNet, the doorbell switch: shown when this machine has
+ * the device, ticked when the doorbell is open.  Kept, not released,
+ * like the Backdrop item: menuNeedsUpdate reaches for it on every open. */
+static NSMenuItem *hostnet_item;
 
 /* The per-mode pipeline: everything that depends on the fb config. */
 static struct {
@@ -2280,6 +2286,17 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
     NSString *dir = backdrop_folder();
     NSMenuItem *sub;
 
+    if ([[menu title] isEqualToString:@"Machine"]) {
+        /* The doorbell switch: shown only where the device exists, and
+         * ticked from what the device says rather than what was last
+         * clicked, so a script's change is reflected too. */
+        int sockets = metal_glue_sockets();
+
+        [hostnet_item setHidden:sockets < 0];
+        [hostnet_item setState:sockets > 0 ? NSControlStateValueOn
+                                           : NSControlStateValueOff];
+        return;
+    }
     if (![[menu title] isEqualToString:@"Backdrop"] || !backdrop.enabled) {
         return;
     }
@@ -2333,6 +2350,51 @@ static NSMenu *backdrop_list(NSString *title, NSString *kind, NSArray *groups,
         backdrop_set_scene([spec UTF8String]);
         [[NSUserDefaults standardUserDefaults] setObject:backdrop.spec forKey:@"backdrop"];
     }
+}
+
+/* Machine > HostNet: the network mode.  One stack or the other, never
+ * both, and switching reboots RISC OS into the other -- the module moves,
+ * the doorbell follows it, and the boot takes its form from the Internet
+ * module it finds.  The confirmation is because a reboot loses the
+ * running desktop, as Load Snapshot does. */
+- (void)hostnetAction:(NSMenuItem *)sender
+{
+    bool toHostNet = metal_glue_sockets() <= 0;
+    NSAlert *a = [[[NSAlert alloc] init] autorelease];
+    NSString *to = toHostNet ? @"HostNet"
+                             : @"the RISC OS network stack";
+
+    [a setMessageText:[NSString stringWithFormat:
+        @"Switch networking to %@?", to]];
+    [a setInformativeText:[NSString stringWithFormat:
+        @"HostNet has your Mac serve RISC OS's sockets; the RISC OS stack "
+         @"runs its own networking over an emulated card. The machine will "
+         @"restart in the new mode."]];
+    [a addButtonWithTitle:@"Switch and Restart"];
+    [a addButtonWithTitle:@"Cancel"];
+    if ([a runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+    metal_ui_hostnet_switch(toHostNet);
+}
+
+/* Switch the network mode in place: record the choice so the next app
+ * launch comes up in it, then hand off to the backend, which moves the
+ * guest's HostNet module in or out of the load path, flips the doorbell to
+ * match and reboots RISC OS.  No app relaunch -- the earlier fork/open of
+ * the whole bundle was unreliable, and there is no need: qemu carries both
+ * the doorbell and the emulated card, so a guest reboot lands in whichever
+ * mode the module now selects. */
+void metal_ui_hostnet_switch(bool on)
+{
+    NSBundle *b = [NSBundle mainBundle];
+
+    if (b && b.bundleIdentifier) {
+        [[NSUserDefaults standardUserDefaults] setObject:(on ? @"on" : @"off")
+                                                  forKey:@"hostnet"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+    metal_glue_hostnet_apply(on);
 }
 
 - (void)openBackdropsFolderAction:(id)sender
@@ -2422,9 +2484,25 @@ static void metal_build_menu(void)
         [machine addItem:bdItem];
         [bd release];
     }
+    {
+        NSMenuItem *hn = [[NSMenuItem alloc] initWithTitle:@"HostNet"
+                                                    action:@selector(hostnetAction:)
+                                             keyEquivalent:@""];
+
+        [hn setTarget:delegate];
+        /* Hidden until menuNeedsUpdate finds the doorbell in this
+         * machine, and ticked from the device on every open.  Kept, not
+         * released, like the Backdrop item above. */
+        [hn setHidden:YES];
+        [machine addItem:hn];
+        hostnet_item = hn;
+    }
     metal_add_item(machine, @"Toggle Full Screen",
                    @selector(fullScreenAction:), @"f",
                    NSEventModifierFlagCommand | NSEventModifierFlagControl);
+    /* menuNeedsUpdate ticks Machine > HostNet from the device on every
+     * open; the Backdrop submenu keeps its own delegate above. */
+    [machine setDelegate:delegate];
     [machineItem setSubmenu:machine];
     [bar addItem:machineItem];
 

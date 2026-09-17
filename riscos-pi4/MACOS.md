@@ -444,6 +444,55 @@ rebuilt, so `scaling=` and `scanlines=` did not reach the shader — the v1
 release binary with `scanlines=on` shows uniform rows. The pipeline is now
 released whenever an option changes and rebuilt by the next frame.
 
+## 7b. HostNet in the release: Machine > HostNet
+
+HostNet (ROS_PRIVATE `docs/hostnet.md`) ships on the disc as a module, and
+the switch between it and the ROM's own stack is a menu in the emulator.
+One stack or the other, never both:
+
+- **On.** `Modules/HostNet,ffa`. `PreDesk.HostModules` RMLoads every `,ffa`
+  at the top of `Modules/`, and HostNet, titled Internet, replaces the
+  ROM's stack as it loads. The doorbell is lit, and the Mac makes the
+  guest's connections.
+- **Off.** `Modules/Disabled/HostNet,ffa`. HostModules neither descends into
+  a folder nor loads one, so the ROM's Internet 5.67 runs, the doorbell is
+  dark, and the stack sets itself up by DHCP on the emulated card — usb-net
+  on slirp, attached either way.
+
+**Machine > HostNet** (`ui/metal.m`) is ticked from the doorbell. Choosing
+it asks first — a reboot loses the running desktop — then records the
+choice as `hostnet` in the app's defaults, moves the module, sets the
+doorbell from where the module now is, and resets the machine
+(`metal_glue_hostnet_apply`, the global lock held for the doorbell and the
+reset request). The scripting surface has the same switch as the `hostnet`
+command: no argument reports the mode, `on` switches, gated behind
+`dangerous` because it reboots. `app/launcher.zsh` puts the module where
+`hostnet` says at every start — the build's `RISCOSHostNet` until the first
+switch — and lights the doorbell only when the module is in `Modules/`:
+dark, the module would replace the ROM's Internet module, decline for want
+of a host, and leave none.
+
+One disc boots either way, because `make-release.sh` makes
+`Choices:Internet.Startup` ask which Internet module it has. HostNet (6.00)
+runs `HostNetBoot`, which only names the host: there is no interface to
+configure, and the stock Startup's `IfConfig` would fail and its
+`CheckError` stop `!Internet` before `User` names the resolvers. The ROM's
+stack (5.67) runs `StackBoot`, the disc's own `!InetSetup` Startup, DHCP
+and all, untouched. `User` names the OpenDNS resolvers for both. Nothing is
+spliced into the ROM and nothing unplugged in CMOS.
+
+**Why stack mode had no network on the Mac.** `75980f8cf8` taught usb-net
+to answer the endpoint-directed `GET_STATUS` and `CLEAR_FEATURE` that
+EtherUSB sends while bringing `ej0` up, instead of stalling them. After
+that the guest sent frames but took in none: a capture showed it asking
+for 10.0.2.2's address every fifteen seconds and slirp answering each
+time, with the guest's ARP table still empty and not one DNS query sent —
+and no DHCP lease ever accepted. With the two requests stalling again, as
+before, the same boot takes slirp's lease in about 2.5 s, resolves names
+and completes a TCP exchange. Why an answered `CLEAR_FEATURE` stops
+EtherUSB receiving has not been traced; the six "failed control
+transaction" lines per boot are back.
+
 ## 8. Speed, measured
 
 Best of three for the benchmarks, and one run of the boot, all on an M4

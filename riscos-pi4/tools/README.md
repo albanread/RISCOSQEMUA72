@@ -192,6 +192,21 @@ commit, ROM and disc hashes, module versions, minimum macOS, signing, the
 libraries. The minimum macOS is whatever the newest binary demands — 26.0
 with today's Homebrew bottles, on Apple silicon and on Intel alike.
 
+**The disc's modules and network.** HostFS is in the ROM and only there:
+the build refuses a disc that carries a HostFS file, or whose boot would
+`RMLoad` one over the ROM's. `Modules/GVFill,ffa` is replaced by this tree's
+`blitter/GVFill,ffa`. HostNet is a module on the disc: in `Modules/` it
+replaces the ROM's network stack, in `Modules/Disabled/` the ROM's stack
+boots with DHCP, and the app's **Machine > HostNet** switches between them
+by moving the module, setting the doorbell and rebooting RISC OS
+(`MACOS.md` 7b). `HOSTNET=on` (the default) or `off` sets where a new
+machine starts. The disc's `Choices:Internet.Startup` runs `HostNetBoot`
+under HostNet and `StackBoot` — the disc's own DHCP Startup — under the
+ROM's stack, and `User` names the OpenDNS resolvers for both.
+`make-release.sh` builds HostNet (`hostnet/build-hostnet.sh`, which needs
+the ROSCC repo beside this one) along with the emulator, unless
+`NO_BUILD=1`.
+
 **Signing.** With the default `SIGN_ID=-` the app is ad-hoc signed, which
 is enough for local use. A Developer ID in `SIGN_ID` signs every Mach-O
 inside-out — the libraries, the emulator with `app/entitlements.plist`

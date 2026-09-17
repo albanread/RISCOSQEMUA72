@@ -171,8 +171,10 @@ struct HostNetState {
 
     uint32_t seq;               /* last sequence number seen */
     bool enabled;               /* sockets served: the -global switch, or
-                                 * lit mid-session by the window menu's
-                                 * HostNet item (ui/dx11.c), never darkened */
+                                 * the window menu's HostNet item -- lit
+                                 * mid-session on Windows (ui/dx11.c), lit
+                                 * or darkened with a reboot on the Mac
+                                 * (ui/metal.c, hostnet_set_sockets) */
     bool rung;                  /* the module has rung since the last reset:
                                  * HostNet is what this boot is running */
 
@@ -214,5 +216,21 @@ struct HostNetState {
      * whether it worked. */
     bool connecting[HN_MAX_SOCKETS];
 };
+
+/*
+ * The doorbell's state, for the Machine menu and the scripting surface
+ * (ui/metal.c calls this; ui/metal.m ticks the menu item): 1 the doorbell
+ * is open (this launch is in HostNet mode), 0 closed (the RISC OS stack
+ * instead), -1 this machine has no hostnet at all.  A racy bool read for
+ * display.  Closing the doorbell under a running HostNet would leave the
+ * machine with no stack at all, so the Mac's switch only ever does it
+ * together with moving the module out of Modules/ and rebooting RISC OS.
+ */
+int hostnet_sockets_state(void);
+
+/* Open (on) or close (off) the doorbell at runtime.  The Machine > HostNet
+ * switch pairs this with moving the guest's module in/out of the load path
+ * and a RISC OS reboot, so the machine comes back on the other stack. */
+void hostnet_set_sockets(bool on);
 
 #endif /* HW_MISC_HOSTNET_H */

@@ -205,5 +205,13 @@
 				<type type="text" description="The JSON reply envelope."/>
 			</result>
 		</command>
+		<command name="hostnet" code="MQemHstN" description="The network mode: hostnet (the Mac serves the sockets) or the RISC OS stack. With no on, report; with on, switch and restart the machine.">
+			<direct-parameter>
+				<type type="text" optional="yes" description="A JSON command object; omitted means ping."/>
+			</direct-parameter>
+			<result>
+				<type type="text" description="The JSON reply envelope."/>
+			</result>
+		</command>
 	</suite>
 </dictionary>

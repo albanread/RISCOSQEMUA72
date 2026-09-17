@@ -170,6 +170,13 @@
       "help": "One coherent observation: pause, PC and registers, screendump, counters, then back to the prior state.",
       "args": "name str, core int, waiting int s",
       "class": "bottom"
+    },
+    {
+      "name": "hostnet",
+      "code": "MQemHstN",
+      "help": "The network mode: hostnet (the Mac serves the sockets) or the RISC OS stack. With no on, report; with on, switch and restart the machine.",
+      "args": "on bool, dangerous bool",
+      "class": "fast"
     }
   ]
 }

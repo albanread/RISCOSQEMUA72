@@ -30,8 +30,17 @@
 #                 image, no Ghostscript, no unused themes, no manuals, no
 #                 games.  Whatever is left off is also unpinned from the
 #                 Pinboard.  STRIP="" ships the zip as it is.
-#   NO_BUILD=1    do not run ninja first
-#   SIGN_ID       the codesign identity.  Default "-": ad-hoc, enough for
+#   HOSTNET       how a new machine's network starts: on (default) or off.
+#                 HostNet (ROS_PRIVATE docs/hostnet.md) is a module on the
+#                 disc -- Modules/HostNet,ffa, where the boot loads it and
+#                 it replaces the ROM's stack, or Modules/Disabled/, where
+#                 the ROM's stack boots with DHCP -- and Machine > HostNet
+#                 in the app switches between them (MACOS.md 7b).  This
+#                 sets where the module starts and the app's default
+#                 (RISCOSHostNet in Info.plist).
+#   NO_BUILD=1    do not build the emulator (ninja) or HostNet
+#                 (riscos-pi4/hostnet/build-hostnet.sh) first
+#   SIGN_ID      the codesign identity.  Default "-": ad-hoc, enough for
 #                 local use and for testers who use "Open Anyway".  A
 #                 "Developer ID Application: ..." identity signs every
 #                 Mach-O with the hardened runtime and a timestamp, the
@@ -51,6 +60,11 @@
 #                 holder).  With it, and a Developer ID, the app and then
 #                 the disk image are submitted to Apple, waited for, and
 #                 stapled; the build fails if Apple declines.
+#
+# The disc's modules: Modules/GVFill,ffa is replaced by this tree's
+# riscos-pi4/blitter/GVFill,ffa, and HostNet placed as HOSTNET says.  HostFS
+# is in the ROM and nowhere else: the build refuses a disc that carries a
+# HostFS file or boots anything that would RMLoad one.
 #
 # The libraries: Homebrew's dylibs are copied into Contents/Frameworks and
 # every load command that named them -- in the emulator and in each other
@@ -72,7 +86,7 @@ BIN="${QEMU_BIN:-$ROOT/build-macos/qemu-system-aarch64}"
 OUT="${OUT:-$ROOT/build-macos/release}"
 SIGN_ID="${SIGN_ID:--}"
 BACKDROP="${BACKDROP:-acorn}"
-[[ "$BACKDROP" == (acorn|acorn-live|off) ]] || die "BACKDROP must be acorn, acorn-live or off, not '$BACKDROP'"
+HOSTNET="${HOSTNET:-on}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 ENTS="$ROOT/riscos-pi4/app/entitlements.plist"
 STRIP_DEFAULT=(
@@ -92,6 +106,8 @@ DMG="$OUT/$NAME.dmg"
 STAGE="$OUT/stage"
 PB=/usr/libexec/PlistBuddy
 HOSTFS_MODS=( "$ROOT/riscos-pi4/hostfs/dde/HostFS,ffa" "$ROOT/riscos-pi4/hostfs/filer/HostFSFiler,ffa" )
+HOSTNET_MOD="$ROOT/riscos-pi4/hostnet/build/HostNet,ffa"   # riscos-pi4/hostnet/build-hostnet.sh
+GVFILL_MOD="$ROOT/riscos-pi4/blitter/GVFill,ffa"
 
 die()  { print -u2 "make-release.sh: $*"; exit 1 }
 step() { print -- "\n== $*" }
@@ -101,24 +117,33 @@ modver() { strings -n 6 "$1" | grep -m1 -oE '[0-9]+\.[0-9]{2} \([0-9]{2} [A-Za-z
 # Set a plist key, adding it if the template lacks it
 pbset() { "$PB" -c "Set :$1 $3" "$PLIST" 2>/dev/null || "$PB" -c "Add :$1 $2 $3" "$PLIST" }
 
+[[ "$BACKDROP" == (acorn|acorn-live|off) ]] || die "BACKDROP must be acorn, acorn-live or off, not '$BACKDROP'"
+[[ "$HOSTNET" == (on|off) ]] || die "HOSTNET must be on or off, not '$HOSTNET'"
 for t in python3 ninja codesign hdiutil install_name_tool otool unzip zip xattr ditto strings; do
     command -v "$t" >/dev/null || die "need $t on the PATH"
 done
 [[ -x "$PB" ]] || die "need $PB"
 [[ -r "$ROM" ]]    || die "no stock ROM at $ROM (ROM=...)"
 [[ -r "$FS_ZIP" ]] || die "no end-user disc zip at $FS_ZIP (FS_ZIP=...)"
-for m in $HOSTFS_MODS; do [[ -r "$m" ]] || die "missing module $m"; done
+for m in $HOSTFS_MODS $GVFILL_MOD; do [[ -r "$m" ]] || die "missing module $m"; done
 for f in launcher.zsh launcher.c entitlements.plist Info.plist AppIcon.icns; do
     [[ -r "$ROOT/riscos-pi4/app/$f" ]] || die "missing riscos-pi4/app/$f"
 done
 [[ -n "$NOTARY_PROFILE" && "$SIGN_ID" == "-" ]] && die "NOTARY_PROFILE needs a Developer ID in SIGN_ID"
 
-# 1. the emulator, and its scripting dictionary from the command table
+# 1. the emulator and HostNet, and the scripting dictionary from the
+#    command table.  A failed build stops the release rather than shipping
+#    whatever was built last.
 if [[ -z "${NO_BUILD:-}" ]]; then
     step "building the emulator"
     ninja -C "$ROOT/build-macos" | tail -2
+    (( pipestatus[1] == 0 )) || die "the emulator did not build (ninja -C build-macos)"
+    step "building HostNet"
+    sh "$ROOT/riscos-pi4/hostnet/build-hostnet.sh" 2>&1 | tail -1
+    (( pipestatus[1] == 0 )) || die "HostNet did not build (riscos-pi4/hostnet/build-hostnet.sh)"
 fi
 [[ -x "$BIN" ]] || die "no emulator at $BIN"
+[[ -r "$HOSTNET_MOD" ]] || die "no HostNet at $HOSTNET_MOD: run riscos-pi4/hostnet/build-hostnet.sh"
 # which Macs this copy is for: the emulator's own architecture
 if lipo -archs "$BIN" 2>/dev/null | grep -q x86_64; then
     ARCH_DESC="Intel"
@@ -214,6 +239,88 @@ PY
     print "backdrop: $BACKDROP; the disc tiles the tagged sprite"
 fi
 
+# The network, the Mac way (MACOS.md 7b).  HostNet is a module on the disc,
+# switched by Machine > HostNet: in Modules/, PreDesk.HostModules loads it
+# and, titled Internet, it replaces the ROM's stack; in Modules/Disabled/
+# the ROM's stack boots, with DHCP.  One disc boots either way, because
+# Choices:Internet's Startup asks which Internet module it has.  HostNet
+# (6.00) runs HostNetBoot: there is no interface to configure, and the
+# stock Startup's IfConfig would fail and its CheckError stop !Internet
+# before User names the resolvers.  The ROM's stack (5.67) runs StackBoot,
+# which is the disc's own !InetSetup Startup -- DHCP and all -- untouched.
+inet="$STAGE/disc/!Boot/Choices/Internet"
+step "disc: network, HostNet $HOSTNET for a new machine"
+[[ -f "$inet/Startup,feb" && -f "$inet/User,feb" ]] || die "the disc has no Choices:Internet Startup and User"
+[[ -f "$STAGE/disc/!Boot/Choices/Boot/PreDesk/HostModules,feb" ]] || die "the disc has no PreDesk.HostModules to load HostNet"
+grep -q '^DHCPExecute ' "$inet/Startup,feb" || die "the disc's Internet Startup is not the DHCP one StackBoot should keep"
+mv "$inet/Startup,feb" "$inet/StackBoot,feb"
+cat > "$inet/Startup,feb" <<'OBEY'
+|================================================================|
+| Startup file for !Internet, written by the release             |
+|                                                                |
+| One network stack, never both, and the Internet module present |
+| decides which: HostNet (6.00, loaded from $.Modules) or the    |
+| ROM's own stack (5.67), which StackBoot sets up by DHCP.       |
+| Machine > HostNet in the app moves the module and reboots.     |
+| Saving from !InetSetup replaces this file with one that knows  |
+| nothing of HostNet.                                            |
+|================================================================|
+
+SetEval Inet$HostNet 1
+RMEnsure Internet 6.00 SetEval Inet$HostNet 0
+If Inet$HostNet Then Run Choices:Internet.HostNetBoot Else Run Choices:Internet.StackBoot
+Unset Inet$HostNet
+OBEY
+cat > "$inet/HostNetBoot,feb" <<'OBEY'
+| HostNet: the Mac makes the connections.  There is no interface, DHCP
+| or routing table to set up, because none of them exist here; the
+| resolvers are in User.
+Set Inet$HostName RISCOSpi
+OBEY
+# The resolvers, for both stacks: HostNet has no DHCP lease to name them,
+# and OpenDNS is reachable through either (as the Windows release sets).
+python3 - "$inet/User,feb" <<'PY' || die "the disc's Choices:Internet.User has no 'Set Inet\$ResolverRetries 3' to place the resolvers after"
+import sys
+path = sys.argv[1]
+lines = open(path, encoding="latin-1", newline="").read().split("\n")
+lines = [l for l in lines if not l.startswith(("Set Inet$Resolvers ", "Set Inet$LocalDomain "))]
+anchor = "Set Inet$ResolverRetries 3"
+if anchor not in lines:
+    sys.exit(1)
+at = lines.index(anchor) + 1
+lines[at:at] = ["Set Inet$Resolvers 208.67.222.222 208.67.220.220", "Set Inet$LocalDomain lan"]
+open(path, "w", encoding="latin-1", newline="").write("\n".join(lines))
+PY
+hostnet_dir=Modules; [[ "$HOSTNET" == off ]] && hostnet_dir=Modules/Disabled
+[[ -d "$STAGE/disc/Modules" ]] || die "the disc has no Modules folder for HostNet and GVFill"
+mkdir -p "$STAGE/disc/Modules/Disabled"
+rm -f "$STAGE/disc/Modules/HostNet,ffa" "$STAGE/disc/Modules/Disabled/HostNet,ffa"
+cp "$HOSTNET_MOD" "$STAGE/disc/$hostnet_dir/HostNet,ffa"
+print "   Startup asks which Internet module it has: HostNetBoot, or StackBoot (the disc's DHCP Startup)"
+print "   resolvers 208.67.222.222 208.67.220.220 in User"
+print "   $hostnet_dir/HostNet,ffa $(modver "$HOSTNET_MOD")"
+
+# GVFill: the disc runs the one this tree built, whatever the zip carried.
+[[ -d "$STAGE/disc/Modules" ]] || die "the disc has no Modules folder for GVFill"
+gv_zip=none
+[[ -f "$STAGE/disc/Modules/GVFill,ffa" ]] && gv_zip=$(modver "$STAGE/disc/Modules/GVFill,ffa")
+cp "$GVFILL_MOD" "$STAGE/disc/Modules/GVFill,ffa"
+gv_note=""
+[[ "$gv_zip" != "$(modver "$GVFILL_MOD")" ]] && gv_note=" (the zip had $gv_zip)"
+print "   Modules/GVFill,ffa $(modver "$GVFILL_MOD")$gv_note"
+
+# HostFS is in the ROM and nowhere else: no HostFS file on the disc, and
+# nothing in its boot that would RMLoad one over the ROM's -- which RMLoad
+# does, replacing a ROM module of the same name (the card-era
+# PreDesk.BootHostFS did exactly that).
+# (|| true: an assignment takes its command's status, and grep finding
+# nothing is status 1, which set -e would take for a failure.)
+hostfs_files=( ${(f)"$(cd "$STAGE/disc" && find . -iname '*hostfs*')"} )
+(( ${#hostfs_files} == 0 )) || die "HostFS belongs in the ROM, but the disc carries ${(j:, :)hostfs_files}"
+hostfs_loads=( ${(f)"$(grep -r -l -I -i -E 'RMLoad[[:space:]]+([^[:space:]]*[.:$])?hostfs(,ffa)?([[:space:]]|$)' "$STAGE/disc/!Boot" 2>/dev/null || true)"} )
+(( ${#hostfs_loads} == 0 )) || die "HostFS belongs in the ROM, but the disc's boot loads one: ${(j:, :)hostfs_loads}"
+print "   no HostFS on the disc: the ROM's HostFS $(modver "${HOSTFS_MODS[1]}") is the only one"
+
 # The CMOS: the disc's own, with FileSystem HostFS forced so the app
 # boots from the disc whatever the snapshot last said.  The same blob
 # ships as cmos.bin, to seed a disc that has lost its CMOS,ff2.
@@ -257,6 +364,7 @@ pbset CFBundleVersion string "$N"
 pbset NSHighResolutionCapable bool true
 pbset NSHumanReadableCopyright string "Built on QEMU (GPL v2). RISC OS is copyright RISC OS Open Ltd."
 pbset RISCOSBackdrop string "$BACKDROP"
+pbset RISCOSHostNet string "$HOSTNET"
 for k in NSDocumentsFolderUsageDescription NSDesktopFolderUsageDescription NSDownloadsFolderUsageDescription NSRemovableVolumesUsageDescription NSNetworkVolumesUsageDescription; do
     pbset $k string "RISC OS keeps its disc in the folder you chose for it."
 done
@@ -375,6 +483,8 @@ dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
     print "           ${resargs:+Acorn boot screen (app/bootfx) spliced in; }spliced sha256 $(sha "$RES/RISCOS.IMG")"
     print "disc       ${FS_ZIP:t} sha256 $(sha "$FS_ZIP")"
     print "           $disc_files files${stripped:+; left off:$stripped}; CMOS forced to FileSystem HostFS"
+    print "modules    Modules/GVFill,ffa $(modver "$GVFILL_MOD"); $hostnet_dir/HostNet,ffa $(modver "$HOSTNET_MOD"); no HostFS on the disc"
+    print "network    HostNet $HOSTNET for a new machine; Machine > HostNet moves the module and reboots; the ROM's stack by DHCP on the card"
     print "minimum    macOS $minos, $ARCH_DESC"
     print "backdrop   $backdrop_note"
     print "signing    $SIGN_ID${NOTARY_PROFILE:+; notarized and stapled}"
@@ -429,6 +539,20 @@ USING IT
   The desktop starts at 800x600; pick another size in RISC OS's own
   Display Manager and the window follows.  Resize the window freely --
   the picture scales.
+
+NETWORKING
+  RISC OS reaches the internet through your Mac with nothing to set up.
+$(if [[ "$HOSTNET" == on ]]; then cat <<EON
+  To begin with the Mac itself makes RISC OS's connections (HostNet),
+  so NetSurf browses the web straight away.
+EON
+else cat <<EON
+  To begin with RISC OS runs its own network stack, which sets itself
+  up by DHCP on an emulated network card.
+EON
+fi)
+  Machine > HostNet switches between HostNet and RISC OS's own stack;
+  each switch restarts RISC OS, and the app remembers the choice.
 
 SETTINGS (optional, in Terminal)
   defaults write $ID mode 1920x1200    start the desktop at that size

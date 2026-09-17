@@ -27,6 +27,8 @@
 #include "hw/display/bcm2835_fb.h"
 #include "hw/misc/bcm2835_vchiq.h"
 #include "hw/misc/bcm2835_vsyncgen.h"
+#include "hw/misc/hostnet.h"
+#include "hw/misc/vmchannel.h"
 #include "migration/snapshot.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -289,6 +291,9 @@ static const ScriptCmd script_cmds[] = {
     { "capture", "MQemCapr",
       "One coherent observation: pause, PC and registers, screendump, counters, then back to the prior state.",
       "name str, core int, waiting int s", 'b' },
+    { "hostnet", "MQemHstN",
+      "The network mode: hostnet (the Mac serves the sockets) or the RISC OS stack. With no on, report; with on, switch and restart the machine.",
+      "on bool, dangerous bool", 'f' },
 };
 /* SCRIPT-TABLE-END */
 
@@ -1526,6 +1531,30 @@ bool metal_glue_script(uint32_t event_class, uint32_t event_id,
         data = script_describe();
     } else if (!strcmp(cmd->name, "state")) {
         data = cmd_state();
+    } else if (!strcmp(cmd->name, "hostnet")) {
+        /* The mode this machine is in (the doorbell's state), or a
+         * switch to the other one -- which reboots RISC OS, so it is
+         * dangerous-gated like any other reset.  The switch runs on this
+         * (UI) thread, as the menu's does: it writes the preference, moves
+         * the module and requests the reset (MACOS.md 7b). */
+        int state = hostnet_sockets_state();
+
+        if (state < 0) {
+            err = SCRIPT_E_NOT_CAPABLE;
+            errmsg = "this machine has no hostnet doorbell";
+        } else if (qdict && qdict_haskey(qdict, "on")) {
+            if (!arg_bool(qdict, "dangerous", false)) {
+                err = SCRIPT_E_DENIED;
+                errmsg = "switching restarts the machine; set dangerous true";
+            } else {
+                metal_ui_hostnet_switch(arg_bool(qdict, "on", false));
+                data = g_strdup("{\"restarting\":true}");
+            }
+        } else {
+            data = g_strdup_printf("{\"mode\":\"%s\",\"doorbell\":\"%s\"}",
+                                   state > 0 ? "hostnet" : "riscos-stack",
+                                   state > 0 ? "open" : "closed");
+        }
     } else if (!strcmp(cmd->name, "video")) {
         data = cmd_video(qdict, &err, &errmsg);
     } else if (!strcmp(cmd->name, "screenshot")) {
@@ -1791,6 +1820,63 @@ void metal_glue_load_snapshot(void)
         metal_loadvm_bh = qemu_bh_new(metal_loadvm_bh_fn, NULL);
     }
     qemu_bh_schedule(metal_loadvm_bh);
+}
+
+int metal_glue_sockets(void)
+{
+    return hostnet_sockets_state();
+}
+
+/* Machine > HostNet, done in place: move the guest's HostNet module in or
+ * out of the load path, open or close the doorbell to match, and reboot
+ * RISC OS -- no app relaunch.  HostModules (Repeat RMLoad HostFS:$.Modules
+ * -Type &FFA) scans only the top of Modules/, so a module parked in the
+ * Disabled/ subfolder is not loaded and the ROM's own Internet stack (with
+ * DHCP) runs; brought back into Modules/, it loads and serves the sockets.
+ * The reboot re-runs the boot, which dispatches on the module it now finds. */
+void metal_glue_hostnet_apply(bool on)
+{
+    const char *root = vmchannel_root();
+    bool live = false;
+
+    if (root && *root) {
+        char *mod = g_build_filename(root, "Modules", "HostNet,ffa", NULL);
+        char *offdir = g_build_filename(root, "Modules", "Disabled", NULL);
+        char *off = g_build_filename(offdir, "HostNet,ffa", NULL);
+
+        if (on) {
+            if (!g_file_test(mod, G_FILE_TEST_EXISTS) &&
+                g_file_test(off, G_FILE_TEST_EXISTS) &&
+                g_rename(off, mod) != 0) {
+                metal_log("hostnet: could not enable the module: %s",
+                          strerror(errno));
+            }
+        } else if (g_file_test(mod, G_FILE_TEST_EXISTS)) {
+            g_mkdir_with_parents(offdir, 0755);
+            if (g_rename(mod, off) != 0) {
+                metal_log("hostnet: could not disable the module: %s",
+                          strerror(errno));
+            }
+        }
+        /* The doorbell follows where the module is now, not what was
+         * asked: lit with no module, the ROM's stack would boot beneath a
+         * tick saying HostNet; dark with one, HostNet would replace the
+         * ROM's Internet module, decline, and leave the machine none. */
+        live = g_file_test(mod, G_FILE_TEST_IS_REGULAR);
+        g_free(mod);
+        g_free(offdir);
+        g_free(off);
+    } else {
+        metal_log("hostnet: no disc root; the module was not moved");
+    }
+
+    metal_log("hostnet: switched to %s; rebooting RISC OS",
+              live ? "HostNet" : "the RISC OS stack");
+    /* Called on the UI thread: the core wants the lock, as input does. */
+    bql_lock();
+    hostnet_set_sockets(live);
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
+    bql_unlock();
 }
 
 static void metal_display_init(DisplayState *ds, DisplayOptions *opts)

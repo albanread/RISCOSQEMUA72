@@ -1589,6 +1589,32 @@ static void hostnet_reset(DeviceState *dev)
     s->rung = false;
 }
 
+/* The menu's tick, and a script's question.  Racy by design: a bool
+ * read for display, where the worst case is a tick one toggle behind. */
+int hostnet_sockets_state(void)
+{
+    HostNetState *s = HOSTNET(object_resolve_path_type("", TYPE_HOSTNET,
+                                                        NULL));
+
+    return s ? (s->enabled ? 1 : 0) : -1;
+}
+
+/* Open or close the doorbell at runtime.  The Machine > HostNet switch
+ * moves the guest's HostNet module in or out of the load path and reboots
+ * RISC OS into the other mode without relaunching the app; the doorbell
+ * follows the module -- open for HostNet, closed for the RISC OS stack, so
+ * a machine on the stack cannot reach it (issue: the dormant module must
+ * not shadow the ROM's Internet). */
+void hostnet_set_sockets(bool on)
+{
+    HostNetState *s = HOSTNET(object_resolve_path_type("", TYPE_HOSTNET,
+                                                        NULL));
+
+    if (s) {
+        s->enabled = on;
+    }
+}
+
 static void hostnet_realize(DeviceState *dev, Error **errp)
 {
     HostNetState *s = HOSTNET(dev);

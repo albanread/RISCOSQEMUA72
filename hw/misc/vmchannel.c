@@ -2459,6 +2459,17 @@ static const MemoryRegionOps vmchannel_ops = {
     .impl.max_access_size = 4,
 };
 
+/* The disc's host directory (root=), for code outside the device that must
+ * reach files on the share -- the Machine > HostNet switch moves the guest's
+ * HostNet module within Modules/.  NULL when no share is configured. */
+const char *vmchannel_root(void)
+{
+    VMChannelState *s = VMCHANNEL(object_resolve_path_type("", TYPE_VMCHANNEL,
+                                                           NULL));
+
+    return s ? s->root : NULL;
+}
+
 static void vmchannel_realize(DeviceState *dev, Error **errp)
 {
     VMChannelState *s = VMCHANNEL(dev);
@@ -2493,15 +2504,16 @@ static void vmchannel_realize(DeviceState *dev, Error **errp)
 }
 
 /*
- * A machine reset -- Ctrl-Break, or a device reset -- starts the guest's
- * filing system afresh: every file the old session held open is, as far as
- * the guest is now concerned, closed.  Close the host fds to match and clear
- * the handle table.  Without this the device kept the old fds open across
- * the reboot and their slots stayed taken; the leak accumulated reboot on
- * reboot until an FSEntry_Open ran out of the 255 slots and failed "too many
- * open files" -- which surfaced as HostFS "cannot open scrap" a few reboots
- * in, since the scrap and Wimp temporaries are opened constantly.  realize()
- * cannot stand in for this: it runs once, at cold start, not on a warm reset.
+ * A machine reset -- Ctrl-Break, or the Machine > HostNet switch, which
+ * reboots RISC OS in place -- starts the guest's filing system afresh:
+ * every file the old session held open is, as far as the guest is now
+ * concerned, closed.  Close the host fds to match and clear the handle
+ * table.  Without this the device kept the old fds open across the reboot
+ * and their slots stayed taken; the leak accumulated reboot on reboot until
+ * an FSEntry_Open ran out of the 255 slots and failed "too many open files"
+ * -- which surfaced as HostFS "cannot open scrap" a few reboots in, since
+ * the scrap and Wimp temporaries are opened constantly.  realize() cannot
+ * stand in for this: it runs once, at cold start, not on a warm reset.
  */
 static void vmchannel_reset(DeviceState *dev)
 {
@@ -2509,9 +2521,10 @@ static void vmchannel_reset(DeviceState *dev)
 
     for (int i = 0; i < VMCH_MAX_OPEN; i++) {
         if (s->fds[i] != -1) {
-            /* Flush a writer to disk before releasing it: on an abrupt reboot
-             * the guest never got to close its files, and every write reached
-             * the host but may still be in the OS cache.  Readers need none. */
+            /* Flush a writer to disk before releasing it: on an abrupt
+             * reboot (Ctrl-Break, or the HostNet switch) the guest never
+             * got to close its files, and every write reached the host but
+             * may still be in the OS cache.  Readers need no flush. */
             if (s->open_write[i]) {
 #ifdef _WIN32
                 _commit(s->fds[i]);

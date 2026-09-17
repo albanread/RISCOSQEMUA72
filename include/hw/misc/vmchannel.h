@@ -196,4 +196,7 @@ struct VMChannelState {
     bool open_write[VMCH_MAX_OPEN];
 };
 
+/* The disc's host directory (root=), or NULL if no share is configured. */
+const char *vmchannel_root(void);
+
 #endif /* HW_MISC_VMCHANNEL_H */

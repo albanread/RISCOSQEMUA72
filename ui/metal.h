@@ -172,4 +172,16 @@ bool metal_ui_screenshot(const char *path);
  * menu; the load itself runs as a bottom half on the main loop. */
 void metal_glue_load_snapshot(void);
 
+/* The HostNet mode, Machine > HostNet: which network RISC OS runs —
+ * hostnet (the Mac serves the guest's sockets through the doorbell) or
+ * the RISC OS stack over the emulated card.  metal_glue_sockets() reads
+ * the doorbell (1 open, 0 closed, -1 no device) for the menu's tick.
+ * metal_ui_hostnet_switch() records the choice (so the next app launch
+ * comes up in it) and calls metal_glue_hostnet_apply(), which moves the
+ * guest's module in/out of the load path, flips the doorbell to match and
+ * reboots RISC OS in place — no app relaunch, one stack or the other. */
+int metal_glue_sockets(void);
+void metal_glue_hostnet_apply(bool on);
+void metal_ui_hostnet_switch(bool on);
+
 #endif /* QEMU_UI_METAL_H */

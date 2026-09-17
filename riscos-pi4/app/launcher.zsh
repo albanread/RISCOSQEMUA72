@@ -35,6 +35,19 @@
 #               disc that does not, it never shows.
 #   the mode    `defaults write <bundle id> mode 1920x1200` opens the
 #               desktop at that size (README.md: the EDID timing).
+#   the network HostNet or the ROM's own stack, one or the other.  HostNet
+#               is a module on the disc: in Modules/ the boot loads it and,
+#               titled Internet, it replaces the ROM's stack; in
+#               Modules/Disabled/ the ROM's stack boots, with DHCP.
+#               Machine > HostNet switches in place -- moves the module,
+#               sets the doorbell, reboots RISC OS -- and keeps the choice
+#               as `hostnet` (on or off) in `defaults`; until the first
+#               switch, the build's RISCOSHostNet in Info.plist stands.
+#               Here the module is put where the choice says, the doorbell
+#               lit only when the module is in Modules/ (dark, the module
+#               would replace the ROM's Internet and decline, leaving none),
+#               and the emulated card attached either way, for the ROM's
+#               stack.
 #
 # Anything LaunchServices or `open --args` passes is handed on to QEMU,
 # which is how a developer adds a QMP socket to an installed app.
@@ -99,6 +112,9 @@ MODE="$(pref mode)"
 BACKDROP="$(pref backdrop)"
 [[ -n "$BACKDROP" ]] || BACKDROP="$(/usr/libexec/PlistBuddy -c 'Print :RISCOSBackdrop' "$CONTENTS/Info.plist" 2>/dev/null)"
 BACKDROP="${BACKDROP:-off}"
+HOSTNET="$(pref hostnet)"
+[[ -n "$HOSTNET" ]] || HOSTNET="$(/usr/libexec/PlistBuddy -c 'Print :RISCOSHostNet' "$CONTENTS/Info.plist" 2>/dev/null)"
+HOSTNET="${HOSTNET:-off}"
 if [[ -n "${RISCOS_CHOOSE_DISC:-}" ]]; then
     print -r -- "$APPNAME: Option held at launch: asking for the disc folder"
     choose_disc ""
@@ -130,15 +146,34 @@ fi
 CMOS="$STATE/cmos.bin"
 cp -f "$DISC/CMOS,ff2" "$CMOS" || fail "Cannot copy the CMOS settings to $CMOS"
 
+# The network: HostNet's module where the choice puts it -- Machine > HostNet
+# moves it too, so this only matters when the two have drifted -- and the
+# doorbell lit only where the module is.  A disc from before HostNet has
+# none, and boots the ROM's stack whatever the choice.
+MODS="$DISC/Modules"
+if [[ "$HOSTNET" == on ]]; then
+    [[ -f "$MODS/Disabled/HostNet,ffa" && ! -e "$MODS/HostNet,ffa" ]] &&
+        mv "$MODS/Disabled/HostNet,ffa" "$MODS/HostNet,ffa"
+elif [[ -f "$MODS/HostNet,ffa" ]]; then
+    mkdir -p "$MODS/Disabled" && mv -f "$MODS/HostNet,ffa" "$MODS/Disabled/HostNet,ffa"
+fi
+hostnet=()
+NETWORK="the RISC OS stack"
+if [[ -f "$MODS/HostNet,ffa" ]]; then
+    hostnet=( -global hostnet.sockets=on )
+    NETWORK="HostNet"
+fi
+
 args=(
     -M raspi4b -cpu cortex-a72,aarch64=off
     -kernel "$RES/RISCOS.IMG"
     -device "loader,file=$(q "$CMOS"),addr=0x510000,force-raw=on"
-    -netdev user,id=n0
+    -netdev user,id=n0,domainname=lan
     -device usb-hub,bus=usb-bus.0,port=1
     -device usb-kbd,bus=usb-bus.0,port=1.1
     -device usb-tablet,bus=usb-bus.0,port=1.2
     -device usb-net,netdev=n0,rndis=off,bus=usb-bus.0,port=1.3
+    "${hostnet[@]}"
     -audiodev coreaudio,id=snd0
     -global bcm2835-vchiq.audiodev=snd0
     -display "metal,vsync=30,backdrop=$(q "$BACKDROP")"
@@ -152,5 +187,5 @@ extra=()
 for a in "$@"; do
     [[ "$a" == -psn_* ]] || extra+=("$a")   # LaunchServices' process serial number, if it sends one
 done
-print -r -- "$APPNAME: disc $DISC${MODE:+, mode $MODE}, backdrop $BACKDROP"
+print -r -- "$APPNAME: disc $DISC${MODE:+, mode $MODE}, backdrop $BACKDROP, network $NETWORK"
 exec "$BIN" "${args[@]}" "${extra[@]}"
