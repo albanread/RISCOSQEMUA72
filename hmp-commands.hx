@@ -1866,6 +1866,181 @@ SRST
 ERST
 
     {
+        .name       = "rdb-stop",
+        .args_type  = "",
+        .params     = "",
+        .help       = "stop the machine for debugging",
+        .cmd        = hmp_rdb_stop,
+    },
+
+SRST
+``rdb-stop``
+  Stop the machine for debugging.  Machine-wide, like every rdb stop:
+  DEBUGDESIGN.md records why nothing narrower is honest.
+ERST
+
+    {
+        .name       = "rdb-cont",
+        .args_type  = "",
+        .params     = "",
+        .help       = "resume the machine, clearing any step",
+        .cmd        = hmp_rdb_cont,
+    },
+
+SRST
+``rdb-cont``
+  Resume the machine, clearing any single-step first.
+ERST
+
+    {
+        .name       = "rdb-step",
+        .args_type  = "",
+        .params     = "",
+        .help       = "execute one instruction on core 0, then stop again",
+        .cmd        = hmp_rdb_step,
+    },
+
+SRST
+``rdb-step``
+  Execute one instruction on core 0 and stop again.  The stop lands
+  asynchronously; the next ``rdb-regs`` shows where it landed.
+ERST
+
+    {
+        .name       = "rdb-regs",
+        .args_type  = "",
+        .params     = "",
+        .help       = "dump core 0 registers, all banks decoded",
+        .cmd        = hmp_rdb_regs,
+    },
+
+SRST
+``rdb-regs``
+  Dump core 0's registers: the monitor's own ``info registers``
+  dump, all banks and CPSR/SPSR decoded.
+ERST
+
+    {
+        .name       = "rdb-dis",
+        .args_type  = "addr:l,count:i?",
+        .params     = "addr [count]",
+        .help       = "disassemble count (default 8) instructions at guest addr",
+        .cmd        = hmp_rdb_dis,
+    },
+
+SRST
+``rdb-dis`` addr [count]
+  Disassemble *count* (default 8) instructions at guest virtual
+  address *addr*, through capstone.
+ERST
+
+    {
+        .name       = "rdb-mem",
+        .args_type  = "addr:l,len:i?",
+        .params     = "addr [len]",
+        .help       = "hex dump guest memory (default 64 bytes)",
+        .cmd        = hmp_rdb_mem,
+    },
+
+SRST
+``rdb-mem`` addr [len]
+  Hex dump *len* (default 64) bytes at guest virtual address *addr*.
+ERST
+
+    {
+        .name       = "rdb-memw",
+        .args_type  = "addr:l,val:l",
+        .params     = "addr val",
+        .help       = "write a word to guest memory",
+        .cmd        = hmp_rdb_memw,
+    },
+
+SRST
+``rdb-memw`` addr val
+  Write the word *val* at *addr*, printing the old value.
+ERST
+
+    {
+        .name       = "rdb-fill",
+        .args_type  = "addr:l,len:i,val:i",
+        .params     = "addr len val",
+        .help       = "fill guest memory with a byte (capped at 4096)",
+        .cmd        = hmp_rdb_fill,
+    },
+
+SRST
+``rdb-fill`` addr len val
+  Fill *len* bytes (capped at 4096) with byte *val*.
+ERST
+
+    {
+        .name       = "rdb-regw",
+        .args_type  = "idx:i,val:l",
+        .params     = "idx val",
+        .help       = "write core 0 register idx (0-15)",
+        .cmd        = hmp_rdb_regw,
+    },
+
+SRST
+``rdb-regw`` idx val
+  Write core 0 register *idx* (0-15).
+ERST
+
+    {
+        .name       = "rdb-bp",
+        .args_type  = "addr:l",
+        .params     = "addr",
+        .help       = "set a breakpoint at guest addr",
+        .cmd        = hmp_rdb_bp,
+    },
+
+SRST
+``rdb-bp`` addr
+  Breakpoint at guest address *addr*.  TB-invalidation, invisible to
+  the guest; machine-wide, and application space is shared between
+  tasks until the guest agent exists (DEBUGDESIGN.md).
+ERST
+
+    {
+        .name       = "rdb-bpc",
+        .args_type  = "addr:l",
+        .params     = "addr",
+        .help       = "clear the breakpoint at addr",
+        .cmd        = hmp_rdb_bpc,
+    },
+
+SRST
+``rdb-bpc`` addr
+  Clear the breakpoint at *addr*.
+ERST
+
+    {
+        .name       = "rdb-wp",
+        .args_type  = "addr:l,len:i?,kind:s?",
+        .params     = "addr [len] [r|w|rw]",
+        .help       = "watch guest memory (default len 4, kind rw)",
+        .cmd        = hmp_rdb_wp,
+    },
+
+SRST
+``rdb-wp`` addr [len] [r|w|rw]
+  Watch *len* (default 4) bytes at *addr* for the given access kind.
+ERST
+
+    {
+        .name       = "rdb-list",
+        .args_type  = "",
+        .params     = "",
+        .help       = "list breakpoints and watchpoints",
+        .cmd        = hmp_rdb_list,
+    },
+
+SRST
+``rdb-list``
+  List breakpoints and watchpoints.
+ERST
+
+    {
         .name       = "synthfb",
         .args_type  = "bpp:i,xres:i?,yres:i?",
         .params     = "bpp [xres [yres]]",

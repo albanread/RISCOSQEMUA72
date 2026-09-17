@@ -96,6 +96,12 @@ system_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'bcm2835_property.c',
   'vmchannel.c',
   'hostnet.c',
+  'rdb.c',
+))
+# rdb.c disassembles through capstone; the dependency carries the
+# include path, and is absent-aware: without capstone rdb-dis says so
+system_ss.add(when: capstone, if_true: capstone)
+system_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'riscos_blitter.c',
   'bcm2835_rng.c',
   'bcm2835_thermal.c',

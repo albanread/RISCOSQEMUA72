@@ -59,6 +59,21 @@ void hmp_quit(Monitor *mon, const QDict *qdict);
 void hmp_stop(Monitor *mon, const QDict *qdict);
 void hmp_synthfb(Monitor *mon, const QDict *qdict);
 void hmp_register_synthfb(int (*impl)(int bpp, int xres, int yres));
+
+/* rdb — the DEBUGDESIGN sprint-1 debugging surface (hw/misc/rdb.c) */
+void hmp_rdb_stop(Monitor *mon, const QDict *qdict);
+void hmp_rdb_cont(Monitor *mon, const QDict *qdict);
+void hmp_rdb_step(Monitor *mon, const QDict *qdict);
+void hmp_rdb_regs(Monitor *mon, const QDict *qdict);
+void hmp_rdb_dis(Monitor *mon, const QDict *qdict);
+void hmp_rdb_mem(Monitor *mon, const QDict *qdict);
+void hmp_rdb_memw(Monitor *mon, const QDict *qdict);
+void hmp_rdb_fill(Monitor *mon, const QDict *qdict);
+void hmp_rdb_regw(Monitor *mon, const QDict *qdict);
+void hmp_rdb_bp(Monitor *mon, const QDict *qdict);
+void hmp_rdb_bpc(Monitor *mon, const QDict *qdict);
+void hmp_rdb_wp(Monitor *mon, const QDict *qdict);
+void hmp_rdb_list(Monitor *mon, const QDict *qdict);
 void hmp_sync_profile(Monitor *mon, const QDict *qdict);
 void hmp_system_reset(Monitor *mon, const QDict *qdict);
 void hmp_system_powerdown(Monitor *mon, const QDict *qdict);
