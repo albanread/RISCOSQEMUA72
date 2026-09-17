@@ -76,11 +76,18 @@ before the stop is visible), the resume restores exactly the mode it
 found (`one-insn-per-tb` off, devices untouched), and the front end
 refuses a resume it did not pair with its own stop.  `rdb.regs` — all
 register banks per mode, plus CPSR/SPSR decoded.  `rdb.dis addr[,n]`
-— capstone around any PC.  `rdb.mem addr,len` / `rdb.memw addr,val` —
-dumps via the walk, writes gated behind the same confirmation the
-screendump capture path uses.  `rdb.bp ±addr[,task]` /
+— capstone around any PC.  `rdb.mem addr,len` / `rdb.memw
+addr,val` / `rdb.regw reg,val` / `rdb.fill addr,len,val` — dumps via
+the walk; every write lands in the patch journal (§5) and is gated
+behind the same confirmation the screendump capture path uses.
+`rdb.asm "add r0, r0, #4"` — one A32 instruction, assembled host-side,
+answered with its encoding and capstone's reading of it back (§5).
+`rdb.bp ±addr[,task][,action=...]` /
 `rdb.wp ±addr,len,kind` — breakpoints and r/w/x watchpoints over
-`cpu_{break,watch}point_insert`.  `rdb.tasks`, `rdb.das`,
+`cpu_{break,watch}point_insert`.  An action turns a breakpoint into a
+scripted trap — set a register, write memory, skip the instruction,
+fake a SWI's return — then continue, all at the stop, all
+deterministic (§5).  `rdb.tasks`, `rdb.das`,
 `rdb.heap area` — the analysers of §4.  Every command returns JSON
 shaped for the table, so `describe` advertises them and an agent can
 run a whole session headless the day they land.
@@ -105,7 +112,45 @@ run a whole session headless the day they land.
   heaps needs the guest agent (§2.3); the host-side walker works on
   any base it is pointed at from day one.
 
-## 5. The window, and the phasing
+## 5. The live side — assembling, patching, and scripting the traps
+
+Modifying RISC OS as it runs is the point of a monitor, and it is where
+the design earns its safety story:
+
+- **The assembler is one instruction at a time**, A32 only, host-side:
+  an encoder for the working set — data processing, loads/stores,
+  branches, `swi`, `bkpt`, `nop`, push/pop — the BBC BASIC heritage
+  shape, a mini-assembler with the disassembler as its checker.  Every
+  `rdb.asm` answer carries the encoding *and* capstone's reading of it
+  back; if the round trip does not agree, the answer is a refusal, not
+  a guess.  The window's disassembly view gets an inline patch field:
+  type the instruction, see the encoding and the confirmation, commit
+  into the journal.
+- **The monitor views are the hex and register editors**: memory with
+  an ASCII gutter and modified words starred, every register bank
+  editable through `rdb.regw`.  Writes into MMIO are marked as MMIO —
+  they do real device things — and writes aimed at ROM are *refused
+  with the explanation*: loader ROM is a read-only mapping, and deeper,
+  `rom_reset` restores the blobs, so a ROM "patch" would be a lie even
+  if the write landed.  Live patching belongs where it works:
+  application space, RMA and module code — and RMA is the delicate
+  one, which is why the module walker (§4) labels relocated words so
+  the editor can warn.  ROM changes go through `mkrom.py`, offline, by
+  design.
+- **Scripted traps** are the breakpoint actions: break on a SWI, fake
+  its return value and V flag, continue; break on a driver call and
+  skip it; break on an error path and force it.  The action runs at
+  the stop under the BQL with the machine quiescent — the exactness
+  the breakpoint itself has — and its writes land in the journal like
+  any other patch.
+- **The journal is the safety net.**  Every modification — memory,
+  register, fill, assemble, trap action — is recorded with before and
+  after, revertible singly or wholesale, and starred in every view that
+  shows the location.  Snapshots (already in the window menu) restore
+  the guest and thereby the patched memory with it; the journal is the
+  session's own record and revert, the snapshot is the machine's.
+
+## 6. The window, and the phasing
 
 The metal front end gains one `NSWindow` (debug panels: registers,
 disassembly with PC tracking, stack, memory, breakpoints, analysers)
@@ -125,19 +170,25 @@ Sprint order, each with its acceptance test:
    is a human breaking on a module SWI and stepping it while watching
    registers and stack — the session SCRIPTING.md's E-sprints were
    measured with.
-3. **Analysers.**  module walker, SWI namer, heap/stack views on
-   named areas; acceptance is walking the system heap's fragmentation
-   before and after a known allocation churn.
+3. **Analysers, and the live side.**  Module walker, SWI namer,
+   heap/stack views on named areas; the assembler with its round-trip
+   check; the patch journal with revert; breakpoint actions with
+   auto-continue.  Acceptance: assemble `mov r0, #0` over a live
+   instruction and watch capstone read it back; break on a SWI, fake
+   its return, continue, and see the caller take the fake; a write
+   aimed at ROM refused, explained, journaled as a refusal.
 4. **The guest agent** (with or after Portal): live task and DA
    enumeration, task-verified breakpoints (§2.3); acceptance is the
    two-task adversarial case — a breakpoint that would have fired on
    the wrong task, verified and skipped.
 
-## 6. Non-goals, written down
+## 7. Non-goals, written down
 
 No per-task stepping without a machine stop (TCG has no per-task
 scheduling to hang it on).  No source-level debugging — the DDE emits
 no DWARF worth trusting and the window will not pretend otherwise.
+No Thumb in the assembler (RISC OS 5.30 executes none in anger), no
+macros, and no live ROM patching — the splice path exists for that.
 No memory writes without the confirmation path.  No gdbstub
 replacement — the external gdb path stays exactly as it is; this
 window is for the human at the machine and the agent on the socket.
