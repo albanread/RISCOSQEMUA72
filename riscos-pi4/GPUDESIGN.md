@@ -4,12 +4,19 @@ Sprint 13 takes pieces of drawing RISC OS does in guest ARM code and
 moves them to the host. The tree-wide verification of §1 settled the
 scope: **the sprite plots are the real work** — the bulk of desktop
 pixels, pure ARM on every Pi that shipped — and they ride RISC OS's own
-extension point, `SpriteV`, with no redesign of the ROM's video stack.
-The pointer joins them as the one sprite request the ROM actually sends
-its GPU. The rectangle **fill** is deferred: claiming it today means a
-filter driver layered over the ROM's video stack, which is redesigning
-that stack in soft-load form — the project will do it properly in its
-own ROM instead (§5a).
+extension point, with no redesign of the ROM's video stack. The pointer
+joins them as the one sprite request the ROM actually sends its GPU.
+
+> **Status, 18 September.** The sprint shipped, and §5's design is
+> history: **the fill was claimed after all** (§5a's deferral reversed
+> by a route it had not considered — a vector claim, not driver
+> registration), the module is pure assembly called `GVFill`, not a
+> mojomod called FastSpr, and the sprite coverage is the narrow
+> same-format window the census earned, with masked plots declined
+> after a backout. §8b records what actually stands; `blitter/README.md`
+> is the operational document and `blitter/DEPTHS.md` the below-32bpp
+> design and its status. The receipts of §1 are untouched below — they
+> are why the shape is what it is.
 
 > The design principle, landed where it belongs: **there is no GPU in
 > QEMU — we are the GPU.** Everything the ROM asks its GPU, the host
@@ -18,7 +25,7 @@ own ROM instead (§5a).
 > for those, RISC OS's one sanctioned listener is a module on the
 > vector, which is the same thing SpriteExtend already is.
 
-Nothing here is started. The sources read for this are `Kernel/s/vdu/
+The sources read for this are `Kernel/s/vdu/
 {vdugrafd,vdugrafa,vduwrch,vdudriver,vduswis,vdupointer}`, `Kernel/hdr/
 KernelWS`, and `BCMVideo/s/{GraphicsV,HWPointer,Dispmanx}`; the
 tree-wide receipts of §1 come from ROOL's `BCM2835Dev` source tarball
@@ -150,10 +157,10 @@ sends a request across such a surface, the host answers it.**
   │ sprite plot ─▶ SpriteV ─▶ the module claims, doorbells ─▶ host blit
   │     (everything else passes to SpriteExtend, untouched)
   └──────────────────────────────────────────────────────────────┘
-                     deferred to the project's own ROM (§5a)
+                     shipped 12–13 Sep, by the vector route (§5a)
   ┌──────────────────────────────────────────────────────────────┐
-  │ kernel fill ─▶ GraphicsV FillRectangle ─▶ our ROM's driver ─▶
-  │                                   a real blitter device on the machine
+  │ kernel fill ─▶ GraphicsV FillRectangle ─▶ GVFill on the vector ─▶
+  │                          the riscos-blitter device, host-executed
   └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -227,10 +234,10 @@ inside the doorbell handler.
 
 | Function | Issued by | Today | Executor | Verdict |
 | --- | --- | --- | --- | --- |
-| **Sprite plots** | icons, buttons, every sprite redraw; the Wimp's whole icon vocabulary | SpriteV → SpriteExtend, ARM | module claims `SpriteV`, host CPU blit from guest RAM (§5); §6 async later | **the focus** — the bulk of desktop pixels, on the OS's own extension point |
-| **UpdatePointer + pointer palette** | pointer moves, shape changes | software pointer: save-under bracketing every plot, redraw per move | **the host answers `'DISP'` (§2); the ROM converts and clamps; Metal composites** | the other clean win — no guest code at all |
-| CopyRectangle | Wimp drag/scroll, block copy, text scroll | BCMVideo → DMA2D → host `memcpy` rows, synchronous | unchanged — already answered by the host | the existence proof for §2's rule |
-| FillRectangle | window backgrounds/borders, `CLG`/`CLS` | kernel ARM loop, per row | **deferred (§5a)** — a claim today is a filter driver over the ROM's stack; in our own ROM it becomes a real blitter device | right design, wrong era; the executor carries over unchanged |
+| **Sprite plots** | icons, buttons, every sprite redraw; the Wimp's whole icon vocabulary | SpriteV → SpriteExtend, ARM | **shipped, narrower than designed: `GVFill` claims `SpriteV` for same-format unmasked stores (§8b); everything else falls to SpriteExtend** | the bulk of desktop pixels, on the OS's own extension point |
+| **UpdatePointer + pointer palette** | pointer moves, shape changes | software pointer: save-under bracketing every plot, redraw per move | **shipped (§8a): the host answers `'DISP'`; the ROM converts and clamps; Metal and dx11 composite** | the other clean win — no guest code at all |
+| CopyRectangle | Wimp drag/scroll, block copy, text scroll | BCMVideo → DMA2D → host `memcpy` rows, synchronous | unchanged for BCMVideo; `GVFill` also answers the copy through the device when both ends map (§8b) | the existence proof for §2's rule |
+| FillRectangle | window backgrounds/borders, `CLG`/`CLS` | kernel ARM loop, per row | **shipped (§5a's postscript, §8b): `GVFill` claims the vector, the device fills — plain colours, whole-byte depths, the one-byte pattern a memset** | right design; the era arrived early |
 | NOP / sync | kernel before software plots | trivial | n/a for now | only meaningful once §6 exists |
 | VDU plotter: lines, circles, points, chars | `OS_Plot` internals, Font Manager | kernel ARM | — | not offloadable on a stock ROM; revisited when we build our own |
 | DMA2D engine (`hw/dma/bcm2835_dma.c`) | BCMVideo copies | host CPU, synchronous | unchanged | no change; copy sizes (~1.2 MB worst measured, DESIGN.md §14) are already at host `memcpy` speed |
@@ -271,7 +278,7 @@ hidden whenever the guest is drawing a pointer under it — except
 "drawing" now means "has a sprite up", which is whenever the guest
 pointer is enabled.
 
-## 5. The sprite module: the sprint's focus
+## 5. The sprite module: the sprint's focus (the design — superseded by §8b)
 
 `SpriteV` is the whole interface, and it is small. The module — call it
 `FastSpr` — is built on the mojomod pattern, soft-loaded from PreDesk so
@@ -360,6 +367,20 @@ the fill's executor was always `memset32` rows from
 `{dst, stride, width, height, pixel}` — and what changes is only who
 asks: our driver, on our machine, instead of a shim over BCMVideo's.
 
+**As it turned out, neither the wait nor the shim was needed.** The
+fill shipped on 12–13 September without becoming the current driver at
+all: `GVFill` claims the **GraphicsV vector** — the seat BCMVideo
+itself sits in — and answers reason 13's fill and copy for the cases it
+covers, passing everything else down. §5a's risk assessment was about
+`OS_ScreenMode` registration and a forwarding table for *addressed*
+calls; a vector claim ahead of BCMVideo takes only what it understands
+and the ROM's own driver answers the rest — the same fall-through
+correctness §5 demanded of the sprite claim. And the executor is a
+real device on the machine after all, `riscos-blitter`
+(`hw/misc/riscos_blitter.c`), built now rather than in an own-ROM era
+because the soft-loaded module made it reachable. §8b records what
+stands.
+
 ## 6. Asynchronous GPU blits, and the contract that permits them
 
 GraphicsV's sync flags (`GVRender_SyncIfComplete`,
@@ -391,7 +412,8 @@ noise is a measurement (§7), and this ships only if it does.
 
 ## 7. Measured, before and after
 
-The instruments exist; the numbers are the sprints' done-when:
+The instruments exist and have been used; the sprite numbers are
+written down in §8b and `blitter/README.md`. Still untaken:
 
 - **Guest cycles per plot**: the PC sampler (`tools/probe.py`) over a
   scripted icon redraw (open a directory window, drag a selection), a
@@ -423,21 +445,21 @@ chooses the work, and nothing touches the ROM's driver stack.
   sprint 13's first criterion holds — **the pointer is drawn by the UI
   and absent from the framebuffer** — on a boot from the card *and* from
   ROM alone, and a `screendump` has no arrow while the window does.
-- **G1 — the census (1 d).** Trace `SpriteV` on a desktop session: the
-  icon redraw, the NetSurf scroll, the textured-window drag; count
-  reason × format × size × caller. Done when the covered set for G2 is
-  a table in this file with counts beside it, not an expectation.
-- **G2 — the sprite module (3–4 d).** `FastSpr` on the mojomod pattern:
-  the `SpriteV` claim, coverage validation, the request block, the host
-  executor for the census's head, the fall-through for everything else,
-  and the pixel-compare harness. Done when the census cases blit
-  host-side, every fall-through produces exactly SpriteExtend's output,
-  and §7's first number is written down. Needs Sprint 6B's module build.
-- **G3 — async GPU (2–3 d, gated).** §6 for the sprite blits, shipped
-  only if §7's gate passes. Done when the fence contract holds under a
-  plot storm and the overlap number is in this file.
-- **G4 — the record (1 d).** Numbers into this document and `MACOS.md`;
-  SPRINTS 13 ticked with a pointer here.
+- **G1 — the census (1 d). *Done, as `*SprStats`.*** The counts are
+  `blitter/README.md`'s "where it stands": 98.2% of sprite pixels
+  taken on a 1920×1200 desktop (753,664 against 13,571 passed), and
+  the declines named by gate — leaving one open shape, the plot-action
+  bit (§10).
+- **G2 — the sprite module (3–4 d). *Built, differently — `GVFill`,
+  not FastSpr (§8b).*** Pure assembly, both vectors, the fall-through,
+  and the pixel-compare: **0 differing pixels of 2,304,000** against
+  the same scene with the module absent, re-checked after every change.
+- **G3 — async GPU (2–3 d, gated). *Not built; still gated.*** The
+  doorbell is synchronous and §6 remains a design. The gate's number
+  has not been taken — the 6.1× synchronous win (§8b) took the urgency.
+- **G4 — the record (1 d). *Done*** — the numbers live in
+  `blitter/README.md` and `blitter/DEPTHS.md`, and this document now
+  carries §8b.
 
 ## 8a. G0, as built
 
@@ -492,13 +514,108 @@ vmstate v3 carrying the committed sprite, and both services closing
 cleanly with the machine. What is not yet done from §10: the pointer
 -motion cost measurement (Q3) and the overlays-stay-inert trace (Q4).
 
+The September reliability pass tightened the same seams, front end and
+device together:
+
+- **A commit that lands mid-copy drops the frame, both front ends.**
+  The cursor metadata was snapshot-checked but the pixels were handed
+  out as a pointer and copied with no re-check, so a `disp_commit`
+  between check and copy tore the sprite for one frame. Both ends now
+  re-read after the copy and, if the generation moved, take nothing
+  from the read and draw nothing; the writer publishes the generation
+  with the barrier it always owed.
+- **The framebuffer config is a seqlock in fact as well as in name**
+  (`bcm2835_fb`, `efd305129b`): read and written like one, so a config
+  change under a reader is a retry, not a guess.
+- **The palette bound is offset plus length** (`bcm2835_property`):
+  the old bound checked the offset alone and a short trailing write
+  ran past the buffer.
+- **Linux builds refuse `'DISP'` again** — scoped to them, so the guest
+  draws its own software pointer where no compositor will; the Mac and
+  Windows builds still answer.
+- **A mode with no decoder is refused**: 1/2/4/8 bpp take the
+  palettised decoder, 16/24/32 the direct ones, and anything else is a
+  logged clear screen — as dx11 refuses it — not a guess at what the
+  bits mean.
+- **A screendump row that cannot be read fails the command**: a mode
+  change between config snapshot and read leaves the buffer holding
+  heap that was never the guest's, and encoding it would put host
+  memory into the PNG. dx11's twin says so too when it waited for
+  nothing, instead of returning the last frame.
+- **Failures say their names**: a failed Metal command buffer logs its
+  error, a failed dx11 pipeline build releases what it created, and
+  the scripting surface takes the reply's length before it frees the
+  reply.
+
+## 8b. The sprint, as built: `GVFill` and the `riscos-blitter` device
+
+What stands differs from §5 in three ways, each forced by the wire:
+
+- **The module is `GVFill`**, pure ARM assembly with no relocations
+  (`blitter/blitmod.s`; clang + `llvm-objcopy`, not the module linker —
+  the build refuses to emit a module with a relocation left, because
+  the RMA loads it nowhere in particular). It claims **two vectors**,
+  `GraphicsV` and `SpriteV`, answering what it covers and passing
+  everything else down — §5's fall-through rule, applied to a wider
+  surface than designed. Its writable state is a 172-byte block
+  claimed from the RMA at init; nothing in the module image is ever
+  written, which is what makes read-only ROM safe for it too.
+- **The executor is a device on the machine** — `hw/misc/riscos_blitter.c`
+  — fill, copy and sprite-plot registers reached through the Sprint 6
+  doorbell. The device is depth-generic by construction: it works in
+  bytes, the fill pattern is up to sixteen bytes with a repeat length
+  (a one-byte pattern is a `memset` — white and grey window
+  backgrounds exactly that), the copy maps both spans so disjoint ends
+  go as one `memcpy` and overlapping ends per row or one `memmove`
+  (BANKS.md's front-to-back copy), the sprite op carries a
+  bytes-per-pixel field plus a packed-source + wide-colour-table path
+  for 1/2/4/8bpp sources, and **a DMA fault is a fault** — a bad
+  address is not zero pixels quietly drawn. The device also publishes
+  a one-word damage flag, and **both front ends copy the guest's
+  screen only when it has drawn and then stopped** (metal since
+  11 September; dx11 ported to it and deleted its `fb_probe`
+  fingerprinting on 12 September).
+- **Sprite coverage is the census's head, not §5's menu.** Taken:
+  pointed-at, unmasked, the screen's own pixel format, a plain store,
+  whole-pixel at the left edge, only while output is the screen (the
+  six VDU constants are cached per output switch), no
+  palette-carrying 8bpp sprite, and a 5:6:5 16bpp screen declines old
+  type-5 sprites because a copy between the two 16bpp layouts re-tints.
+  Cross-depth plots pass to SpriteExtend, which really converts.
+  **Masked plots are declined** — the merge was implemented, loaded,
+  and drew the desktop wrong; it was backed out whole and stays out
+  until the plot-action semantics are understood.
+
+Measured (the instruments are `*SprStats`, `*SprBench`, `*BlitFill`;
+`blitter/README.md` carries the operational detail): on a 1920×1200
+desktop with NetSurf and a filer window, **98.2% of sprite pixels** on
+the host; **6.1× on the plot itself**, 490µs SpriteExtend against 80µs
+— 61.8µs of it the host blit, about 18µs guest-side; **0 differing
+pixels of 2,304,000** against the same scene with the module absent.
+Below 32bpp (v1.01, the Windows rig): fills byte-exact at 8bpp — a
+91×17 title-bar segment in 2µs, the 1920×1200 mode-change erase in
+303µs — the same code serving 16bpp unchanged; `DEPTHS.md` is the
+design and its status.
+
+Two placement facts the wire taught, both in `blitter/README.md`:
+**GVFill runs soft-loaded** from the share's `$.Modules` — only HostFS
+and its filer belong in the ROM (decided 13 September, BOOTDESIGN
+§3.7), and a ROM-spliced GVFill never sees a sprite plot anyway,
+because something later in the boot claims `SpriteV` in front of it
+(killing DitherExtend, GSpriteExtend, SpecialFX, GDraw,
+ArtworksRenderer, StrongTask, Fat32fs and NetTime changed nothing;
+`*RMReInit GVFill` puts it back in front). And `*RMKill GVFill` is
+the first thing to try whenever anything on screen looks wrong — the
+fall-through means the desktop works without it, just slower.
+
 ## 9. What we deliberately do not do
 
-- **No fill in this sprint.** Deferred by decision to the project's own
-  ROM (§5a). The filter-driver design was drawn and set aside: its risk
-  — every bug in the forwarding table breaks the display for everything
-  — buys one operation now, when the same work done in our own ROM buys
-  the blitter.
+- **No fill redesign.** §5a deferred the fill because a claim meant
+  becoming the current GraphicsV driver. The vector claim that shipped
+  (§5a's postscript) avoided that redesign, so the fill stands — but
+  the boundary holds: no `OS_ScreenMode` registration, no forwarding
+  table, nothing that must answer for every reason. The own-ROM blitter
+  device of §5a remains the destination for the rest.
 - **No full dispmanx.** §2's table is the whole implementation — the
   pointer's commands — and every other command is refused at the call
   level, so the overlay and snapshot machinery in `s/GVOverlay` stays
@@ -535,9 +652,16 @@ cleanly with the machine. What is not yet done from §10: the pointer
 4. **Overlays stay inert**: confirm nothing on a stock 5.30 desktop
    issues the refused dispmanx commands (a trace over a full session),
    and that GVOverlay's calls fail cleanly against the refusal replies.
-5. **The census's shape**: which reasons, formats and mask styles a real
-   desktop session issues — §5's expected set is expectation until G1
-   traces it, and the module implements the counts, not the expectation.
+5. **The census's shape**: *settled — and it left one shape behind.*
+   The Mac census (§8b) took 98.2% of pixels and named every decline
+   but one: counting each gate separately leaves the **plot action**
+   with 56 of 59 declines, all carrying bit 4 set, whose meaning the C
+   sources do not reveal — `putscaled_compiler()` reads `gcol & 7` and
+   `gcol & 8` and never looks higher, but accepting those calls changed
+   3468 pixels across a cluster of filer icons. The answer is in the
+   assembly veneer between `OS_SpriteOp` and that compiler, and until
+   it is read those plots stay declined. Below 32bpp the census columns
+   remain to be taken (`DEPTHS.md`).
 6. **SpriteV claim contexts**: plots are expected in foreground, but
    background claims (printing, filer threading) decide whether coverage
    validation must reject a context rather than queue it — settled by
@@ -548,14 +672,22 @@ cleanly with the machine. What is not yet done from §10: the pointer
 8. **Intel Macs**: `newBufferWithBytesNoCopy` over mapped guest RAM is
    unified-memory reasoning; on discrete-GPU Macs §6 may be a loss. The
    gate is measurement, and the CPU path is always present.
+9. **The 2688-byte difference**: the Windows rig's 2026-09-12 pixel
+   compare found 2,688 differing bytes of 6.9M where the Mac's figure
+   is zero — small, real, unexplained, and on exactly the path
+   `DEPTHS.md` extends. Understand it before more depths ride on it.
+10. **Masked sprites**: declined since the backout (§8b); taking them
+    again means understanding the plot-action semantics first — the
+    same reading as item 5, and the reason the two stand together.
 
 ## 11. Where it meets the rest of the plan
 
-Sprint 13 is this sprint, re-scoped: pointer and sprites now, fill when
-the project builds its own ROM (§5a). SPRINTS 15 (frame coherence) gets
-a free derivative — the pointer is committed transactionally at
+Sprint 13 is closed: the pointer and the sprites shipped (§8a, §8b),
+and the fill arrived early by the vector route (§5a's postscript) with
+its own-ROM destination unchanged. SPRINTS 15 (frame coherence) got
+its free derivative — the pointer is committed transactionally at
 `UpdateSubmit`, so it can never tear, and it is not in the framebuffer
-to be torn anyway. SCRIPTING's `screendump`/`screenshot` split documents
+to be torn anyway; the mid-copy drop of §8a closes the read side. SCRIPTING's `screendump`/`screenshot` split documents
 itself in §4. Sprint 6B carries the module build for G2 only; G0 needs
 nothing but the peer and the window. Sprint 9's speed work gets §7's
 instruments and numbers. The own-ROM era inherits §5a's blitter device
