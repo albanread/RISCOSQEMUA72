@@ -282,6 +282,28 @@ binaries are built, not tracked: a fresh clone boots the stock ROM
 until someone runs the builds (`hostfs/dde/Build,feb`,
 `hostfs/filer/Build,feb`, `blitter/build.sh`).
 
+HostFS has two builders over the same two source files, and they
+produce modules with identical headers:
+
+- **`hostfs/dde/Build,feb`** and **`hostfs/filer/Build,feb`** — objasm,
+  Norcroft `cc` and `link -rmf`, run *inside* RISC OS on a share.  This
+  is the build that has shipped.  `tools/build-modules.sh` drives it
+  headless on a machine it boots for the purpose.
+- **`hostfs/build-hostfs.sh`** — the same `s.head` and `c.hostfs` on the
+  host: `rosasm --elf` assembles the ObjAsm header, `clang` compiles the
+  C, and `roscc link --module` links them.  No DDE, no emulator, no
+  guest, and nothing licensed.
+
+Both must produce a module that runs **from ROM**, which means the image
+may hold no absolute address: a module on the ROM chain executes in
+place, so there is nowhere to relocate it to and the linker's fix-up code
+would fault on its first store.  The DDE build checks this by eye with
+`decaof -r`; `build-hostfs.sh` makes it a build failure, reading the
+relocations back and refusing to link if any is absolute.  `mkrom.py`
+refuses to splice such a module as a last line of defence — which is the
+fault that cost 17 September 2026, when HostFS 1.01 went into a ROM
+carrying exactly that code.
+
 ## The design principle
 
 > Rather than emulating VideoCore, emulate the functions needed by RISC OS. Be

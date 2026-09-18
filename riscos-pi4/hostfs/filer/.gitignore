@@ -1,2 +1,5 @@
-# Build outputs (DDE Build,feb)
+# Build outputs (Build,feb in the DDE, or build-hostfs.sh on the host)
 HostFSFiler,ffa
+
+# roscc writes an .elf sidecar beside the module, for symbols
+HostFSFiler.elf

@@ -1,3 +1,6 @@
-# Build outputs (DDE Build,feb); the module the launchers and the
-# release splice is built, not tracked
+# Build outputs (Build,feb in the DDE, or build-hostfs.sh on the host);
+# the module the launchers and the release splice is built, not tracked
 HostFS,ffa
+
+# roscc writes an .elf sidecar beside the module, for symbols
+HostFS.elf
